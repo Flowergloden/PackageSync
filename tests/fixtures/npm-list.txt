@@ -1,0 +1,9 @@
+﻿# npm package fixture (happy path).
+# Entries: 'name', 'name@version' or '@scope/name[@version]'.
+# Duplicates are de-duplicated by package name.
+
+lodash
+is-odd@3.0.1
+@babel/core@7.26.0
+@types/node
+lodash

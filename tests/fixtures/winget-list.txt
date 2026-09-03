@@ -1,0 +1,8 @@
+﻿# Winget whitelist fixture (happy path).
+# Entries: 'Id' or 'Id@version'. Duplicates are de-duplicated by Id.
+
+7zip.7zip@24.08
+Python.Python.3.12
+OpenJS.NodeJS.LTS@22.17.0
+Microsoft.PowerToys
+7zip.7zip@24.08
