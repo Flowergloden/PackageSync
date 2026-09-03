@@ -1,0 +1,4 @@
+# PakageSync winget whitelist - one package per line: Id or Id@version.
+# Lines starting with # are skipped. Versions are pinned so A and B stay in sync.
+# Pinned on 2026-09-03 via: winget show --id 7zip.7zip -e
+7zip.7zip@26.02

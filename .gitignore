@@ -1,0 +1,13 @@
+# Orchestrator / agent metadata (plans, evidence, notepads)
+.omo/
+
+# Node dependencies (A-side one-shot Verdaccio builds)
+node_modules/
+
+# Staging / temporary artifacts
+staging/
+*.tmp
+*.temp
+
+# Backups (state repair, npmrc backups, etc.)
+*.bak

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "role": "B",
+  "repoRoot": "C:\\OfflineRepo",
+  "stagingRoot": "C:\\PakageSync-staging",
+  "httpBind": "127.0.0.1",
+  "httpPort": 8788,
+  "verdaccioPort": 4873,
+  "npm": {
+    "aVerdaccioPort": 4874
+  },
+  "categories": {
+    "winget": true,
+    "pip": true,
+    "npm": true,
+    "dotfiles": true
+  },
+  "paths": {
+    "wingetWhitelist": "manifests\\winget-packages.txt",
+    "runtimeWhitelist": "manifests\\runtime-winget.txt",
+    "requirements": "manifests\\requirements.txt",
+    "npmList": "manifests\\npm-packages.txt",
+    "dotfilesSource": "manifests\\dotfiles"
+  },
+  "winget": {
+    "scope": "machine",
+    "architecture": "x64"
+  },
+  "pip": {
+    "downloadArgs": [
+      "--only-binary=:all:",
+      "--platform",
+      "win_amd64",
+      "--python-version",
+      "3.12",
+      "--implementation",
+      "cp",
+      "--abi",
+      "cp312"
+    ],
+    "upgradeOnApply": true,
+    "allowSdist": false
+  },
+  "stateDir": "C:\\ProgramData\\PakageSync",
+  "pins": {
+    "chezmoi": {
+      "version": "2.72.0",
+      "url": "https://github.com/twpayne/chezmoi/releases/download/v2.72.0/chezmoi_2.72.0_windows_amd64.zip",
+      "sha256": "PIN-ME"
+    },
+    "appInstaller": {
+      "msixbundleUrl": "https://aka.ms/getwinget",
+      "msixbundleSha256": "PIN-ME",
+      "vcLibsUrl": "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx",
+      "vcLibsSha256": "PIN-ME",
+      "uiXamlUrl": "https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.6",
+      "uiXamlSha256": "PIN-ME",
+      "vcRedistUrl": "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+      "vcRedistSha256": "PIN-ME"
+    },
+    "npm": {
+      "verdaccioVersion": "PIN-ME"
+    }
+  }
+}
