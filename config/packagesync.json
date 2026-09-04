@@ -46,7 +46,7 @@
     "chezmoi": {
       "version": "2.72.0",
       "url": "https://github.com/twpayne/chezmoi/releases/download/v2.72.0/chezmoi_2.72.0_windows_amd64.zip",
-      "sha256": "PIN-ME"
+      "sha256": "b01b6d449db1e4ca62694482d53ab8395c891cade237c404defc1701ebd2bf66"
     },
     "appInstaller": {
       "msixbundleUrl": "https://aka.ms/getwinget",
