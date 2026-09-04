@@ -50,13 +50,13 @@
     },
     "appInstaller": {
       "msixbundleUrl": "https://aka.ms/getwinget",
-      "msixbundleSha256": "PIN-ME",
+      "msixbundleSha256": "6824b6e9484ab24687d99a0c829d2bcbcc7849a70a4d0f596fc43c89d20dff15",
       "vcLibsUrl": "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx",
-      "vcLibsSha256": "PIN-ME",
+      "vcLibsSha256": "b56a9101f706f9d95f815f5b7fa6efbac972e86573d378b96a07cff5540c5961",
       "uiXamlUrl": "https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.6",
-      "uiXamlSha256": "PIN-ME",
+      "uiXamlSha256": "249d2afb41cc009494841372bd6dd2df46f87386d535ddf8d9f32c97226d2e46",
       "vcRedistUrl": "https://aka.ms/vs/17/release/vc_redist.x64.exe",
-      "vcRedistSha256": "PIN-ME"
+      "vcRedistSha256": "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
     },
     "npm": {
       "verdaccioVersion": "6.10.2"

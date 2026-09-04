@@ -11,3 +11,4 @@ staging/
 
 # Backups (state repair, npmrc backups, etc.)
 *.bak
+logs/
