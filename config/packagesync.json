@@ -59,7 +59,7 @@
       "vcRedistSha256": "PIN-ME"
     },
     "npm": {
-      "verdaccioVersion": "PIN-ME"
+      "verdaccioVersion": "6.10.2"
     }
   }
 }
