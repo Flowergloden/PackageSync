@@ -1,0 +1,175 @@
+PackageIdentifier: 7zip.7zip
+PackageVersion: 26.02
+Moniker: 7zip
+Documentations:
+- DocumentLabel: FAQ
+  DocumentUrl: https://7-zip.org/faq.html
+Icons:
+- IconUrl: https://cdn.winget.microsoft.com/icons/649c3c8780a116e625ee8124338642c2088b5153b4280bdf7a42b544fecf0730.ico
+  IconFileType: ico
+  IconResolution: custom
+  IconTheme: default
+  IconSha256: 649c3c8780a116e625ee8124338642c2088b5153b4280bdf7a42b544fecf0730
+Tags:
+- 7zfiles
+- archive
+- archiver
+- compress
+- compression
+- decompress
+- decompression
+- extract
+- extractor
+- rarfiles
+- targzfiles
+- unarchive
+- unarchiver
+- unzip
+- zip
+PackageLocale: en-US
+Author: Igor Pavlov
+Copyright: "Copyright \xA9 1999-2026 Igor Pavlov."
+ShortDescription: A file archiver with a high compression ratio.
+License: LGPL-2.1
+LicenseUrl: https://7-zip.org/license.txt
+PackageName: 7-Zip
+PackageUrl: https://7-zip.org/download.html
+Publisher: Igor Pavlov
+PublisherSupportUrl: https://7-zip.org/support.html
+PublisherUrl: https://7-zip.org/
+ReleaseNotes: '- Some bugs and vulnerabilities were fixed.'
+ReleaseNotesUrl: https://github.com/ip7z/7zip/releases/tag/26.02
+Localization:
+- Documentations:
+  - DocumentLabel: "\u5E38\u89C1\u95EE\u9898"
+    DocumentUrl: https://sparanoid.com/lab/7z/faq.html
+  Tags:
+  - "\u538B\u7F29"
+  - "\u5F52\u6863"
+  - "\u6253\u5305"
+  - "\u63D0\u53D6"
+  - "\u89E3\u5305"
+  - "\u89E3\u538B"
+  PackageLocale: zh-CN
+  Author: Igor Pavlov
+  Copyright: Copyright (C) 1999-2026 Igor Pavlov.
+  ShortDescription: "7-Zip \u662F\u4E00\u6B3E\u62E5\u6709\u6781\u9AD8\u538B\u7F29\u6BD4\u7684\u5F00\u6E90\u538B\u7F29\u8F6F\u4EF6\u3002"
+  License: LGPL-2.1
+  LicenseUrl: https://github.com/sparanoid/7z/blob/master/zh-cn/License.txt
+  PackageName: 7-Zip
+  PackageUrl: https://sparanoid.com/lab/7z/download.html
+  Publisher: Igor Pavlov
+  PublisherSupportUrl: https://sparanoid.com/lab/7z/support.html
+  PublisherUrl: https://sparanoid.com/lab/7z/
+  ReleaseNotesUrl: https://github.com/ip7z/7zip/releases/tag/26.02
+Installers:
+- Architecture: x64
+  InstallerType: wix
+  InstallerSha256: db407a4f6d4999e5c7bc00ce8a882be94717b56e7fa68140fe3f12605d91643e
+  InstallerUrl: https://github.com/ip7z/7zip/releases/download/26.02/7z2602-x64.msi
+  Scope: machine
+  ElevationRequirement: elevatesSelf
+  ReleaseDate: 2026-06-26
+  InstallerAbortsTerminal: false
+  InstallLocationRequired: false
+  RequireExplicitUpgrade: false
+  DisplayInstallWarnings: false
+  DownloadCommandProhibited: false
+  ArchiveBinariesDependOnPath: false
+  ProductCode: '{23170F69-40C1-2702-2602-000001000000}'
+  UpgradeBehavior: install
+  Commands:
+  - 7z
+  FileExtensions:
+  - 001
+  - 7z
+  - apfs
+  - arj
+  - bz2
+  - bzip2
+  - cab
+  - cpio
+  - deb
+  - dmg
+  - esd
+  - fat
+  - gz
+  - gzip
+  - hfs
+  - iso
+  - lha
+  - lzh
+  - lzma
+  - ntfs
+  - rar
+  - rpm
+  - squashfs
+  - swm
+  - tar
+  - taz
+  - tbz
+  - tbz2
+  - tgz
+  - tpz
+  - txz
+  - tzst
+  - vhd
+  - vhdx
+  - wim
+  - xar
+  - xz
+  - z
+  - zip
+  - zst
+  AppsAndFeaturesEntries:
+  - DisplayName: 7-Zip 26.02 (x64 edition)
+    ProductCode: '{23170F69-40C1-2702-2602-000001000000}'
+    UpgradeCode: '{23170F69-40C1-2702-0000-000004000000}'
+  ExpectedReturnCodes:
+  - InstallerReturnCode: 87
+    ReturnResponse: invalidParameter
+  - InstallerReturnCode: 112
+    ReturnResponse: diskFull
+  - InstallerReturnCode: 1601
+    ReturnResponse: contactSupport
+  - InstallerReturnCode: 1602
+    ReturnResponse: cancelledByUser
+  - InstallerReturnCode: 1618
+    ReturnResponse: installInProgress
+  - InstallerReturnCode: 1623
+    ReturnResponse: systemNotSupported
+  - InstallerReturnCode: 1625
+    ReturnResponse: blockedByPolicy
+  - InstallerReturnCode: 1628
+    ReturnResponse: invalidParameter
+  - InstallerReturnCode: 1633
+    ReturnResponse: systemNotSupported
+  - InstallerReturnCode: 1638
+    ReturnResponse: alreadyInstalled
+  - InstallerReturnCode: 1639
+    ReturnResponse: invalidParameter
+  - InstallerReturnCode: 1640
+    ReturnResponse: blockedByPolicy
+  - InstallerReturnCode: 1641
+    ReturnResponse: rebootInitiated
+  - InstallerReturnCode: 1643
+    ReturnResponse: blockedByPolicy
+  - InstallerReturnCode: 1644
+    ReturnResponse: blockedByPolicy
+  - InstallerReturnCode: 1649
+    ReturnResponse: blockedByPolicy
+  - InstallerReturnCode: 1650
+    ReturnResponse: invalidParameter
+  - InstallerReturnCode: 1654
+    ReturnResponse: systemNotSupported
+  - InstallerReturnCode: 3010
+    ReturnResponse: rebootRequiredToFinish
+  InstallerSwitches:
+    Silent: /quiet /norestart
+    SilentWithProgress: /passive /norestart
+    Log: /log "<LOGPATH>"
+    InstallLocation: INSTALLDIR="<INSTALLPATH>"
+  InstallationMetadata:
+    DefaultInstallLocation: '%ProgramFiles%\7-Zip'
+ManifestVersion: 1.12.0
+ManifestType: merged

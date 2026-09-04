@@ -1,0 +1,13 @@
+PackageIdentifier: synthetic.BrokenManifest
+PackageVersion: 9.9.9
+PackageLocale: en-US
+PackageName: Broken Manifest
+Publisher: PakageSync Fixtures
+Installers:
+- Architecture: x64
+  InstallerType: exe
+  InstallerUrl: https://cdn.example.com/files/Broken_9.9.9_Machine_X64_exe_en-US.exe
+  InstallerSha256: 5555555555555555555555555555555555555555555555555555555555555555
+  Scope: machine
+ManifestType: merged
+ManifestVersion: 1.12.0

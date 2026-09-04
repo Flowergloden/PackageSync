@@ -1,0 +1,26 @@
+PackageIdentifier: synthetic.SampleApp
+PackageVersion: 1.0.0
+PackageLocale: en-US
+PackageName: Sample App
+Publisher: PakageSync Fixtures
+Installers:
+- Architecture: x64
+  InstallerType: exe
+  InstallerUrl: https://cdn.example.com/files/Sample App_1.0.0_Machine_X64_exe_en-US.exe
+  InstallerSha256: 1111111111111111111111111111111111111111111111111111111111111111
+  Scope: machine
+- Architecture: x86
+  InstallerType: exe
+  InstallerUrl: https://cdn.example.com/mirror/Sample App_1.0.0_Machine_X86_exe_en-US.exe
+  InstallerFallbackUrls:
+  - https://fallback1.example.com/files/Sample App_1.0.0_Machine_X86_exe_en-US.exe
+  - https://fallback2.example.com/files/Sample App_1.0.0_Machine_X86_exe_en-US.exe
+  InstallerSha256: 2222222222222222222222222222222222222222222222222222222222222222
+  Scope: machine
+- Architecture: arm64
+  InstallerType: exe
+  InstallerUrl: https://cdn.example.com/files/Sample App_1.0.0_Machine_Arm64_exe_en-US.exe
+  InstallerSha256: 3333333333333333333333333333333333333333333333333333333333333333
+  Scope: machine
+ManifestType: merged
+ManifestVersion: 1.12.0

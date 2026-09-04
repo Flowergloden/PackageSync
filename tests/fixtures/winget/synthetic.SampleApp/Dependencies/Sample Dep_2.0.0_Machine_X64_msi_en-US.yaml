@@ -1,0 +1,13 @@
+PackageIdentifier: synthetic.SampleDep
+PackageVersion: 2.0.0
+PackageLocale: en-US
+PackageName: Sample Dep
+Publisher: PakageSync Fixtures
+Installers:
+- Architecture: x64
+  InstallerType: msi
+  InstallerUrl: https://cdn.example.com/deps/Sample Dep_2.0.0_Machine_X64_msi_en-US.msi
+  InstallerSha256: 4444444444444444444444444444444444444444444444444444444444444444
+  Scope: machine
+ManifestType: merged
+ManifestVersion: 1.12.0
