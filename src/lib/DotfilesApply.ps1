@@ -519,7 +519,18 @@ function Invoke-OSyncDotfilesApply {
     $managedRel = @(Get-OSyncChezmoiManagedTargets -ChezmoiExe $chezmoiExe -SourceDir $sourceDir -ConfigFile $configFile -PersistentState $persistentState -Destination $Destination)
 
     $scriptSourcePaths = @(Get-ChildItem -LiteralPath $sourceDir -File | Where-Object { $_.Name -like 'run_*' } | ForEach-Object { $_.FullName })
-    $dirSourcePaths = @(Get-ChildItem -LiteralPath $sourceDir -Directory -Recurse | ForEach-Object { $_.FullName })
+    # chezmoi v2 canonical script dir: .chezmoiscripts\run_* scripts are run
+    # too (verified v2.72.0: they map to <dest>\.chezmoiscripts\<name> via
+    # target-path). Enumerate them so they enter the apply set.
+    $chezmoiScriptsDir = Join-Path $sourceDir '.chezmoiscripts'
+    if (Test-Path -LiteralPath $chezmoiScriptsDir -PathType Container) {
+        $scriptSourcePaths += @(Get-ChildItem -LiteralPath $chezmoiScriptsDir -File | Where-Object { $_.Name -like 'run_*' } | ForEach-Object { $_.FullName })
+    }
+    # Directories: exclude .chezmoiscripts itself (it is not a managed target -
+    # applying it fails with 'not managed', verified v2.72.0).
+    $dirSourcePaths = @(Get-ChildItem -LiteralPath $sourceDir -Directory -Recurse |
+        Where-Object { $_.FullName -ne $chezmoiScriptsDir -and -not $_.FullName.StartsWith($chezmoiScriptsDir + '\', [System.StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object { $_.FullName })
 
     $scriptMap = Get-OSyncChezmoiSourceEntryTargets -ChezmoiExe $chezmoiExe -SourceDir $sourceDir -ConfigFile $configFile -PersistentState $persistentState -Destination $Destination -SourcePaths $scriptSourcePaths
     $dirMap = Get-OSyncChezmoiSourceEntryTargets -ChezmoiExe $chezmoiExe -SourceDir $sourceDir -ConfigFile $configFile -PersistentState $persistentState -Destination $Destination -SourcePaths $dirSourcePaths

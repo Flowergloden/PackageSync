@@ -323,6 +323,42 @@ Describe 'ApplyOrchestrator: packages round - work copy + apply' {
         $err | Should -BeLike '*winget*'
     }
 
+    It 're-verification catches a corrupted runtime payload and the whole generation is deleted' {
+        $repo = Join-Path $TestDrive 'r10'
+        $ts = & $script:NewRepo $repo
+        # Add a chezmoi.exe payload to the runtime category and re-publish the
+        # trust root so the runtime files.json lists it.
+        $chezmoiDir = Join-Path $repo 'runtime\chezmoi'
+        New-Item -ItemType Directory -Path $chezmoiDir -Force | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $chezmoiDir 'chezmoi.exe'), [byte[]]@(0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00))
+        $null = New-OSyncFilesManifest -Dir (Join-Path $repo 'runtime')
+        $null = Publish-OSyncIndex -StagingDir $repo
+        $ts = & $script:GetIndexTs $repo
+        $stateDir = Join-Path $TestDrive 's10'
+        $cfg = & $script:NewConfig $stateDir @{ repoRoot = $repo }
+        & $script:SeedBootstrapped $cfg $repo
+
+        # Corrupt the COPIED chezmoi.exe right after the generation is built
+        # (the copy is what the re-verification checks - the repo stays intact).
+        $realNewGen = (Get-Command New-OSyncApplyGeneration).ScriptBlock
+        Mock New-OSyncApplyGeneration {
+            param($Config, $RepoRoot, $ExportedAtUtc, $OkCategories)
+            $g = & $realNewGen -Config $Config -RepoRoot $RepoRoot -ExportedAtUtc $ExportedAtUtc -OkCategories $OkCategories
+            $t = Join-Path $g 'runtime\chezmoi\chezmoi.exe'
+            [System.IO.File]::WriteAllBytes($t, [byte[]]@(0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x01))
+            return $g
+        }
+
+        $result = Invoke-OSyncApply -Config $cfg -Category @('winget')
+
+        $result.outcome | Should -Be 'failed'
+        $result.error | Should -BeLike '*verification*'
+        # The whole generation is deleted - a bad generation must never remain
+        # the newest (Momus r4-B1).
+        (Test-Path -LiteralPath (Join-Path $stateDir ("work\{0}" -f $ts))) | Should -Be $false
+        $script:ApplyCalls | Should -BeNullOrEmpty
+    }
+
     It 'WhatIf produces a per-category report with ZERO changes' {
         $repo = Join-Path $TestDrive 'r9'
         $ts = & $script:NewRepo $repo
@@ -707,10 +743,10 @@ Describe 'ApplyOrchestrator: tool-copy self-refresh' {
         Test-OSyncLandingReadyForRefresh -LandingRoot $missing | Should -Be $false
     }
 
-    It 'refreshes via .new -> delete .old -> current -> .old -> .new -> current, excluding config' {
+    It 'refreshes via .new -> carry config -> delete .old -> current -> .old -> .new -> current' {
         $landing = Join-Path $TestDrive 'landing'
         New-Item -ItemType Directory -Path (Join-Path $landing 'config') -Force | Out-Null
-        [System.IO.File]::WriteAllText((Join-Path $landing 'config\local.txt'), 'local config - must survive /XD config')
+        [System.IO.File]::WriteAllText((Join-Path $landing 'config\local.txt'), 'local config - must survive the rotation')
         [System.IO.File]::WriteAllText((Join-Path $landing 'old-src.ps1'), 'old tool file - must be replaced')
         # Additive SID-based grants (same SIDs the bootstrap hardening uses)
         # so the owner/ACL re-verification passes. Inheritance is KEPT so the
@@ -730,13 +766,40 @@ Describe 'ApplyOrchestrator: tool-copy self-refresh' {
         (Test-Path -LiteralPath (Join-Path $landing 'src\Invoke-OfflineApply.ps1') -PathType Leaf) | Should -Be $true
         # The old tool file was replaced by the /MIR...
         (Get-Content -LiteralPath (Join-Path $landing 'src\Invoke-OfflineApply.ps1') -Raw) | Should -Be 'new tool'
-        # ...and the local config dir is NEVER mirrored.
-        (Test-Path -LiteralPath (Join-Path $landing 'config\local.txt') -PathType Leaf) | Should -Be $false
+        # ...and the local config dir is carried into the new current (the B
+        # side owns its config - it must survive every rotation, F3).
+        (Test-Path -LiteralPath (Join-Path $landing 'config\local.txt') -PathType Leaf) | Should -Be $true
+        (Get-Content -LiteralPath (Join-Path $landing 'config\local.txt') -Raw) | Should -Be 'local config - must survive the rotation'
         # .new is consumed by the swap; .old holds the PREVIOUS current (the
         # next refresh deletes it before renaming - pinned order, Oracle m9).
         (Test-Path -LiteralPath ($landing + '.new')) | Should -Be $false
         (Test-Path -LiteralPath ($landing + '.old') -PathType Container) | Should -Be $true
         (Test-Path -LiteralPath (Join-Path ($landing + '.old') 'old-src.ps1') -PathType Leaf) | Should -Be $true
+    }
+
+    It 'config survives TWO consecutive refreshes with its original content' {
+        $landing = Join-Path $TestDrive 'landing2'
+        New-Item -ItemType Directory -Path (Join-Path $landing 'config') -Force | Out-Null
+        $configContent = '{"role":"B","local":true}'
+        [System.IO.File]::WriteAllText((Join-Path $landing 'config\packagesync.json'), $configContent)
+        [System.IO.File]::WriteAllText((Join-Path $landing 'old-src.ps1'), 'old tool file')
+        $null = @(& icacls.exe $landing /grant '*S-1-5-18:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-5-32-545:(OI)(CI)RX' 2>&1)
+
+        $tool = Join-Path $TestDrive 'tool2'
+        New-Item -ItemType Directory -Path (Join-Path $tool 'src') -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $tool 'src\Invoke-OfflineApply.ps1'), 'new tool')
+
+        # Refresh 1: current (with config) -> .old, .new (config carried) -> current.
+        $r1 = Invoke-OSyncApplySelfRefresh -ToolDir $tool -LandingRoot $landing
+        $r1.Refreshed | Should -Be $true
+        # Refresh 2: the stale .old (which held the config after refresh 1) is
+        # DELETED - the config must have been carried into .new again, so it
+        # survives in the new current (F3 regression).
+        $r2 = Invoke-OSyncApplySelfRefresh -ToolDir $tool -LandingRoot $landing
+        $r2.Refreshed | Should -Be $true
+
+        (Test-Path -LiteralPath (Join-Path $landing 'config\packagesync.json') -PathType Leaf) | Should -Be $true
+        (Get-Content -LiteralPath (Join-Path $landing 'config\packagesync.json') -Raw) | Should -Be $configContent
     }
 
     It 'reports failure instead of throwing when the landing is missing' {

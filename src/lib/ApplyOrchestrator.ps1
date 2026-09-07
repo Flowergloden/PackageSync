@@ -261,7 +261,10 @@ function Test-OSyncApplyWorkCopy {
     [OutputType([bool])]
     param([Parameter(Mandatory = $true)][string]$Bw)
     $bad = @()
-    foreach ($cat in $script:OApplyCategories) {
+    # runtime is copied into EVERY generation (New-OSyncApplyGeneration) and
+    # carries chezmoi.exe / the tool payload - it must be re-verified too, or
+    # the .verified marker misrepresents the verification scope (F2).
+    foreach ($cat in (@('runtime') + $script:OApplyCategories)) {
         $catDir = Join-Path $Bw $cat
         if (-not (Test-Path -LiteralPath $catDir -PathType Container)) { continue }
         $filesJson = Join-Path $catDir 'files.json'
@@ -396,9 +399,10 @@ function Invoke-OSyncApplySelfRefresh {
     <#
       Self-refreshes the tool landing from a VERIFIED tool payload. Strict
       order (Oracle m9 / Momus r7-MAJOR-1): /MIR /XD config into
-      <landing>.new, delete a stale <landing>.old, rename current -> .old,
-      then .new -> current. The config dir is EXCLUDED (the B side owns its
-      config, Oracle m4). Any failure is caught and reported - the caller
+      <landing>.new, carry the CURRENT landing's config\ into .new\config
+      (the B side owns its config, Oracle m4 - it must survive every
+      rotation), delete a stale <landing>.old, rename current -> .old,
+      then .new -> current. Any failure is caught and reported - the caller
       logs it and retries next cycle (Oracle m5). An interruption can never
       leave a half-damaged current copy (the swap is rename-based).
       Returns { Refreshed, Message }.
@@ -420,6 +424,14 @@ function Invoke-OSyncApplySelfRefresh {
             Remove-Item -LiteralPath $newDir -Recurse -Force -ErrorAction Stop
         }
         Invoke-OSyncRobocopy -Source $ToolDir -Destination $newDir -ExtraArgs @('/MIR', '/XD', 'config') | Out-Null
+        # The B side owns its config (Oracle m4): carry the CURRENT landing's
+        # config\ into .new BEFORE the swap so the local config survives every
+        # rotation. Without this the config only ever rides into .old, which
+        # the NEXT refresh deletes - permanent config loss (F3).
+        $currentConfig = Join-Path $LandingRoot 'config'
+        if (Test-Path -LiteralPath $currentConfig -PathType Container) {
+            Invoke-OSyncRobocopy -Source $currentConfig -Destination (Join-Path $newDir 'config') -ExtraArgs @('/E') | Out-Null
+        }
         if (Test-Path -LiteralPath $oldDir -PathType Container) {
             Remove-Item -LiteralPath $oldDir -Recurse -Force -ErrorAction Stop
         }
@@ -428,7 +440,7 @@ function Invoke-OSyncApplySelfRefresh {
             Rename-Item -LiteralPath $LandingRoot -NewName $oldName -Force -ErrorAction Stop
         }
         Rename-Item -LiteralPath $newDir -NewName $leaf -Force -ErrorAction Stop
-        return [pscustomobject]@{ Refreshed = $true; Message = "tool landing refreshed from '$ToolDir' (exact order: .new -> delete .old -> current -> .old -> .new -> current)." }
+        return [pscustomobject]@{ Refreshed = $true; Message = "tool landing refreshed from '$ToolDir' (exact order: .new -> carry config -> delete .old -> current -> .old -> .new -> current; local config preserved)." }
     }
     catch {
         return [pscustomobject]@{ Refreshed = $false; Message = "self-refresh FAILED: $($_.Exception.Message)" }
@@ -562,6 +574,17 @@ function Invoke-OSyncApply {
     if ([string]::IsNullOrWhiteSpace($exportedAtUtc)) {
         $result.outcome = 'skipped'
         $result.skipReason = 'index.json has no exportedAtUtc.'
+        Write-OSyncLog -Category 'apply' -Level Warning -Message "round skipped: $($result.skipReason)" -Config $Config | Out-Null
+        return $result
+    }
+    # The generation id becomes a DIRECTORY name under <stateDir>\work\ (and
+    # is later Remove-Item'd on rebuild) - a '..\'-shaped value would escape
+    # work\. Validate the strict basic-format stamp before any path use (same
+    # semantics as the dotfiles-side ^\d{8}T\d{6}Z$ filter and
+    # Assert-OExportedAtUtc).
+    if ($exportedAtUtc -notmatch '^\d{8}T\d{6}Z$') {
+        $result.outcome = 'skipped'
+        $result.skipReason = "index.json exportedAtUtc '$exportedAtUtc' is not a valid generation id (expected ^\d{8}T\d{6}Z$)."
         Write-OSyncLog -Category 'apply' -Level Warning -Message "round skipped: $($result.skipReason)" -Config $Config | Out-Null
         return $result
     }

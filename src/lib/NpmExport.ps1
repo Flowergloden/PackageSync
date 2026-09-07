@@ -77,7 +77,18 @@ function Resolve-OSyncNpmVerdaccioVersion {
     if ($Version -ne 'PIN-ME') { return $Version }
 
     $npmExe = Get-ONpmExe
-    $output = @(& $npmExe view verdaccio version 2>&1)
+    # PS 5.1: a native command writing to stderr throws a terminating
+    # NativeCommandError under EAP=Stop - scope EAP to Continue around the
+    # call (same pattern as Invoke-ONpmInstall); the exit code stays the
+    # decision signal.
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $npmExe view verdaccio version 2>&1)
+    }
+    finally {
+        $ErrorActionPreference = $oldEap
+    }
     if ($LASTEXITCODE -ne 0) {
         $tail = ((@($output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 3) -join '; ')
         throw "Export-OSyncNpm: 'npm view verdaccio version' failed (exit $LASTEXITCODE): $tail"
@@ -332,7 +343,15 @@ function Test-OSyncNpmNodeCompat {
     )
 
     $npmExe = Get-ONpmExe
-    $output = @(& $npmExe view "verdaccio@$VerdaccioVersion" engines --json 2>&1)
+    # PS 5.1: same EAP=Stop native-stderr guard as Resolve-OSyncNpmVerdaccioVersion.
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $npmExe view "verdaccio@$VerdaccioVersion" engines --json 2>&1)
+    }
+    finally {
+        $ErrorActionPreference = $oldEap
+    }
     $candidates = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $jsonText = ($output -join "`n").Trim()
 
@@ -646,7 +665,15 @@ function Export-OSyncNpm {
     $aToolDir = Join-Path $Config.stagingRoot '.verdaccio-a'
     $npmExe = Get-ONpmExe
     $nodeExe = Get-ONodeExe
-    $installOut = @(& $npmExe install --prefix $aToolDir "verdaccio@$pinned" --no-audit --no-fund --loglevel error 2>&1)
+    # PS 5.1: same EAP=Stop native-stderr guard as Resolve-OSyncNpmVerdaccioVersion.
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $installOut = @(& $npmExe install --prefix $aToolDir "verdaccio@$pinned" --no-audit --no-fund --loglevel error 2>&1)
+    }
+    finally {
+        $ErrorActionPreference = $oldEap
+    }
     if ($LASTEXITCODE -ne 0) {
         $tail = ((@($installOut) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 5) -join '; ')
         throw "Export-OSyncNpm: 'npm install verdaccio@$pinned' failed (exit $LASTEXITCODE): $tail"

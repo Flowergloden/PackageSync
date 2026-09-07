@@ -48,6 +48,8 @@ Describe 'DotfilesApply' {
         New-Item -ItemType Directory -Path $script:SourceDir -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $script:SourceDir 'dot_plain.txt') -Value 'source content' -Encoding UTF8 -NoNewline
         Set-Content -LiteralPath (Join-Path $script:SourceDir 'run_once_hello.ps1') -Value "Write-Output 'hi'" -Encoding UTF8 -NoNewline
+        New-Item -ItemType Directory -Path (Join-Path $script:SourceDir '.chezmoiscripts') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:SourceDir '.chezmoiscripts\run_foo.ps1') -Value "Write-Output 'foo'" -Encoding UTF8 -NoNewline
         New-Item -ItemType Directory -Path (Join-Path $script:SourceDir 'dot_confdir') -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $script:SourceDir 'dot_confdir\settings.txt') -Value 'setting=1' -Encoding UTF8 -NoNewline
         New-Item -ItemType Directory -Path (Join-Path $script:WorkDir 'dotfiles') -Force | Out-Null
@@ -147,7 +149,14 @@ Describe 'DotfilesApply' {
                 $idx = [Array]::IndexOf($Arguments, 'target-path')
                 $src = $Arguments[$idx + 1]
                 $rel = $src.Substring($script:SourceDir.Length).TrimStart('\')
-                $target = Join-Path $script:DestDir ($rel -replace '^dot_', '.' -replace '^run_(once|onchange|before|after)_', '')
+                # chezmoi maps the LAST path segment: dot_ -> ., run_once_/run_onchange_/
+                # run_before_/run_after_ -> '', plain run_ -> '' (verified
+                # v2.72.0, incl. .chezmoiscripts\run_* -> .chezmoiscripts\<name>).
+                $leaf = Split-Path -Leaf $rel
+                $mappedLeaf = $leaf -replace '^dot_', '.' -replace '^run_(once|onchange|before|after)_', '' -replace '^run_', ''
+                $parent = Split-Path -Parent $rel
+                $mappedRel = if ([string]::IsNullOrWhiteSpace($parent)) { $mappedLeaf } else { Join-Path $parent $mappedLeaf }
+                $target = Join-Path $script:DestDir $mappedRel
                 return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Stdout = $target; Stderr = '' }
             }
             throw "unexpected chezmoi text command: $($Arguments -join ' ')"
@@ -235,6 +244,18 @@ Describe 'DotfilesApply' {
             $state.dotfiles.files['.plain.txt'] | Should -Not -BeNullOrEmpty
             $state.dotfiles.files['.confdir\settings.txt'] | Should -Not -BeNullOrEmpty
             $state.dotfiles.skipped.Count | Should -Be 0
+        }
+
+        It 'includes .chezmoiscripts\run_* scripts in the apply set and excludes the dir itself' {
+            $report = Invoke-OSyncDotfilesApply -WorkDir $script:WorkDir -Config $script:Config -Destination $script:DestDir
+            $report.status | Should -Be 'ok'
+            $targets = $script:ApplyCalls[0]
+            # .chezmoiscripts\run_foo.ps1 maps to <dest>\.chezmoiscripts\foo.ps1
+            # (verified v2.72.0) and must enter the apply set.
+            $targets | Should -Contain (Join-Path $script:DestDir '.chezmoiscripts\foo.ps1')
+            # The .chezmoiscripts DIRECTORY itself is not a managed target -
+            # applying it fails with 'not managed' (verified v2.72.0).
+            $targets | Should -Not -Contain (Join-Path $script:DestDir '.chezmoiscripts')
         }
 
         It 'records the POST-APPLY raw file hash, not the rendered value' {
