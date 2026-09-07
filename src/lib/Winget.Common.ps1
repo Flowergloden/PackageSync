@@ -9,9 +9,19 @@
     (todo 12 / todo 13) treat these as idempotent success and ONLY READ this
     constant - it is the single source of truth (Momus r4-M3).
 
-    Initial value @(0) per plan todo 1. TODO (todo 13 QA): extend this set
-    after real double-install testing; each added entry must be documented
-    with the observed scenario and the winget version it was observed on.
+    OBSERVED (winget v1.29.290, QA 2026-09-04, todo 13):
+      `winget install --manifest <dir>` on an already-installed package does
+      NOT return a non-zero "already installed" code. Verified scenarios:
+        * same-version reinstall (7zip.7zip 26.02 installed, 26.02 manifest)
+          -> exit 0, winget re-runs the installer (repair) and reports success
+        * older-version manifest (26.01 manifest while 26.02 installed)
+          -> exit 0, winget runs the installer regardless
+      The classic `winget install --id` path DOES return a non-zero
+      "no applicable upgrade" code (observed -1978335189 / 0x8A15002B), but
+      the apply flows use --manifest exclusively, so that code is NOT added.
+      Conclusion: @(0) is the complete satisfied set for the --manifest path;
+      the satisfied branch below is kept as a defensive extension point for
+      future winget versions that may return dedicated satisfied codes.
 
   Resolve-OSyncWingetExePath:
     Globs C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe
