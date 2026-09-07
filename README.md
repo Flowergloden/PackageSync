@@ -214,6 +214,8 @@ chezmoi 与 App Installer 四件套（msixbundle/VCLibs/UI.Xaml/VC_redist）都�
 
 ## 六、已知限制
 
+## 六、已知限制
+
 1. **L1. winget 包依赖离线解析仅经合成 fixture 验证**：`Dependencies` 子目录依赖的端到端离线解析只用合成清单 fixture 覆盖，未经真实复杂依赖包实测（真实 7zip 无依赖，未出现 `Dependencies\` 目录）。
 2. **L2. SYSTEM 上下文需机器级 VC_redist**：Appx 版 VCLibs 不覆盖 SYSTEM；SYSTEM 计划任务运行 winget 的前提是机器级 VC++ 运行库（bootstrap 步骤⓪在 App Installer 链之前静默安装）。
 3. **L3. LocalManifestFiles 为 per-user 设置**：bootstrap 按**双上下文分别启用**（管理员 + 一次性 SYSTEM 任务）。winget v1.29.290 上它位于 `C:\ProgramData\Microsoft\WinGet\<SID>\settings\pkg\Microsoft.DesktopAppInstaller\admin_settings`（哈希保护文件，用 `winget settings export` 查看/备份）；SYSTEM 上下文路径不同：`C:\ProgramData\Microsoft\WinGet\S-1-5-18\settings\win\defaultState\admin_settings`——两处均以首次真实安装验证生效。
@@ -229,3 +231,9 @@ chezmoi 与 App Installer 四件套（msixbundle/VCLibs/UI.Xaml/VC_redist）都�
 13. **L13. SYSTEM 自愈 bootstrap 路径未经完整 QA**：该自动路径仅作自愈兜底，QA 不覆盖完整链；失败不阻断完成判定（手动 bootstrap 仍是受支持路径）。
 14. **L14.（todo-10 QA）App Installer 依赖版本缺口**：aka.ms 钉定的 VCLibs（14.0.33321.0）**旧于** App Installer 1.29.290 的 bundle 需求（14.0.33728.0），且 UI.Xaml 2.8 已不是当前 bundle 依赖（改为 WindowsAppRuntime 1.8）；Windows 10/11 一般自带 VCLibs，但**全新 B 上钉定 VCLibs 可能不满足 bundle**——若 B 安装失败请换新 URL 重钉（PIN-ME 流程见 5.6）。
 15. **L15.（todo-13 QA）`winget install --manifest <dir>` 拒绝非 YAML 文件/子目录**：winget 会把目录里每个文件当清单解析，二进制安装器会触发 `0x8a150004`；工具在 apply/bootstrap 前把每个包 staging 成**纯清单扁平目录**（只含 `*.yaml`）再传 `--manifest`，安装器保留在工作副本供本地 HTTP 服务读取（本限制仅在相关报错排查时涉及）。
+
+
+16. **L16. Node MSI 同名修复限制（todo-20 QA）**：导出会把安装器改名为 YAML 主干名（如 Node.js_26.7.0_Machine_X64_wix_zh-CN.msi）；实测该改名后的 Node MSI 在"同版本已装"的修复路径上以 1603 失败（Wix4RollbackInternetShortcuts 动作返回 3），原名（node-v26.7.0-x64.msi）则成功——B 端首次引导（全新安装）预期不受影响（失败动作仅在修复/卸载序列运行），但 B 端对已装 Node 的重复引导会命中同一 1603，属部署期验证项。
+17. **L17. SYSTEM 自愈 bootstrap 幂等冒烟在 A 机 QA 中失败（todo-20）**：临时 SYSTEM 任务重跑 bootstrap 在步骤 1 失败（Add-AppxPackage 在 SYSTEM 上下文被拒，0x80073CF9——本地系统账户不允许执行部署 Add 操作）；该自动路径仍仅作自愈兜底，手动 bootstrap 是受支持路径（详见 task-20 evidence）。
+18. **L18. SYSTEM 上下文 winget 安装失败（todo-20 QA 结论）**：A 机上 SYSTEM 主体执行 winget install --manifest 在"Starting package install..."处挂起（未生成 msiexec、无安装日志；直接 msiexec 在 SYSTEM 下可正常安装，挂起点在 winget 的安装器执行环节）——SYSTEM 主体 apply 路径在本机不可用，降级路径 Register-SyncTasks -Role B -PackagesTaskPrincipal User（管理员账户 S4U/Highest）实测可用；真实 B 机若 SYSTEM 安装同样挂起，请使用 User 降级注册（README 3.3）。
+19. **L19. 离线模拟限制（todo-20 QA）**：A 机上 winget.exe 为打包应用（App Installer），其流量豁免 Windows 防火墙规则（程序/端口/全协议规则均实测无效），且 winget source update 对抓取失败吞错返回 0——离线 source 更新失败场景无法在 A 机复现；manifest 安装路径已实测不依赖 source 连通性（安装日志无 source 活动，仅需 loopback HTTP），真实离线 B 的 source 更新行为仍属部署期验证项。
