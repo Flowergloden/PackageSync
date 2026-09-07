@@ -65,6 +65,12 @@ function Resolve-OSyncPython {
         2. Fallback to the pinned machine-wide Python 3.12 install
            (C:\Program Files\Python312\python.exe - the B-side target).
       Throws when neither yields a working interpreter.
+
+      Get-Command can return MULTIPLE Application candidates - the real
+      Python 3.12 install AND the WindowsApps store stub are both on PATH in
+      the elevated production context. Force an array and probe each one in
+      order; passing the array straight to the [string] -PythonPath parameter
+      would throw a ParameterBindingException (todo-11 QA hit this).
     #>
     [CmdletBinding()]
     param(
@@ -74,10 +80,14 @@ function Resolve-OSyncPython {
         [string]$FallbackPath = 'C:\Program Files\Python312\python.exe'
     )
 
-    $cmd = Get-Command python -CommandType Application -ErrorAction SilentlyContinue
-    if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) {
-        if (Test-OSyncPythonInterpreter -PythonPath $cmd.Source) {
-            return $cmd.Source
+    # @(...) forces an array even for a single/null result; a $null element
+    # (PS 5.1: @($null).Count is 1) is skipped by the guard below.
+    $candidates = @(Get-Command python -CommandType Application -ErrorAction SilentlyContinue)
+    foreach ($cmd in $candidates) {
+        if ($null -ne $cmd -and -not [string]::IsNullOrWhiteSpace($cmd.Source)) {
+            if (Test-OSyncPythonInterpreter -PythonPath $cmd.Source) {
+                return $cmd.Source
+            }
         }
     }
 

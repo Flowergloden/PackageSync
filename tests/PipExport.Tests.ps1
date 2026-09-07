@@ -122,6 +122,55 @@ Describe 'PipExport' {
             Resolve-OSyncPython -FallbackPath 'C:\does-not-exist\python.exe' | Should -Be 'C:\somewhere\python.exe'
         }
 
+        It 'iterates MULTIPLE PATH candidates and picks the first WORKING one (store stub rejected)' {
+            # Regression: real Python 3.12 + the WindowsApps store stub are
+            # BOTH on PATH in the elevated production context. Get-Command
+            # returns an array; the old code passed the array to the [string]
+            # -PythonPath parameter and threw ParameterBindingException.
+            Mock Get-Command {
+                @(
+                    [pscustomobject]@{ Source = 'C:\WindowsApps\python.exe' },
+                    [pscustomobject]@{ Source = 'C:\Python312\python.exe' }
+                )
+            }
+            Mock Test-OSyncPythonInterpreter {
+                param([string]$PythonPath)
+                return ($PythonPath -eq 'C:\Python312\python.exe')
+            }
+            Resolve-OSyncPython | Should -Be 'C:\Python312\python.exe'
+        }
+
+        It 'stops at the FIRST working candidate without probing the rest' {
+            Mock Get-Command {
+                @(
+                    [pscustomobject]@{ Source = 'C:\first\python.exe' },
+                    [pscustomobject]@{ Source = 'C:\second\python.exe' }
+                )
+            }
+            Mock Test-OSyncPythonInterpreter {
+                param([string]$PythonPath)
+                $script:ProbedPaths += $PythonPath
+                return ($PythonPath -eq 'C:\first\python.exe')
+            }
+            $script:ProbedPaths = @()
+            Resolve-OSyncPython | Should -Be 'C:\first\python.exe'
+            $script:ProbedPaths | Should -Be @('C:\first\python.exe')
+        }
+
+        It 'falls back when ALL PATH candidates are stubs' {
+            Mock Get-Command {
+                @(
+                    [pscustomobject]@{ Source = 'C:\WindowsApps\python.exe' },
+                    [pscustomobject]@{ Source = 'C:\WindowsApps\python3.exe' }
+                )
+            }
+            Mock Test-OSyncPythonInterpreter {
+                param([string]$PythonPath)
+                return ($PythonPath -eq 'C:\Program Files\Python312\python.exe')
+            }
+            Resolve-OSyncPython | Should -Be 'C:\Program Files\Python312\python.exe'
+        }
+
         It 'falls back to the pinned C:\Program Files\Python312\python.exe when the PATH candidate is a stub' {
             Mock Get-Command { [pscustomobject]@{ Source = 'C:\WindowsApps\python.exe' } }
             Mock Test-OSyncPythonInterpreter {
