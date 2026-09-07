@@ -129,4 +129,41 @@ Describe 'OfflineSync config loading (Get-OSyncConfig)' {
             $err.Exception.Message | Should -BeLike '*valid JSON*'
         }
     }
+
+    Context 'toolRoot stamping and path resolution' {
+        It 'stamps toolRoot as the parent of the config file parent' {
+            $config = Get-OSyncConfig -Path $configPath
+            $config.toolRoot | Should -Be $repoRoot
+        }
+
+        It 'resolves relative paths.* against the tool root even when repoRoot is a DIFFERENT drive' {
+            # Regression for the path-resolution fix: config.repoRoot is the
+            # OUTPUT landing dir (D:\OfflineRepo - a different drive than the
+            # temp tool root); the operator-edited manifests live under the
+            # TOOL root and must be found there, never under repoRoot.
+            $toolRoot = Join-Path $testRoot 'tool'
+            New-Item -ItemType Directory -Path (Join-Path $toolRoot 'manifests') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $toolRoot 'manifests\winget-packages.txt') -Value '7zip.7zip@26.02' -Encoding UTF8
+
+            $cfgPath = Join-Path $toolRoot 'config\packagesync.json'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $cfgPath) -Force | Out-Null
+            New-TestConfig -OutFile $cfgPath -Mutate { param($o) $o.repoRoot = 'D:\OfflineRepo' }
+
+            $config = Get-OSyncConfig -Path $cfgPath
+            $config.toolRoot | Should -Be $toolRoot
+            $config.repoRoot | Should -Be 'D:\OfflineRepo'
+
+            $resolved = Resolve-OSyncConfigPath -Config $config -Path $config.paths.wingetWhitelist
+            $resolved | Should -Be (Join-Path $toolRoot 'manifests\winget-packages.txt')
+            Test-Path -LiteralPath $resolved -PathType Leaf | Should -BeTrue
+
+            # The old (buggy) repoRoot-relative resolution would NOT find it.
+            Test-Path -LiteralPath (Join-Path $config.repoRoot 'manifests\winget-packages.txt') -PathType Leaf | Should -BeFalse
+        }
+
+        It 'Resolve-OSyncConfigPath passes absolute paths through verbatim' {
+            $config = Get-OSyncConfig -Path $configPath
+            Resolve-OSyncConfigPath -Config $config -Path 'C:\some\absolute\file.txt' | Should -Be 'C:\some\absolute\file.txt'
+        }
+    }
 }

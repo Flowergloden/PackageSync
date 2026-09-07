@@ -39,15 +39,19 @@ Describe 'PipExport' {
             '--abi', 'cp312'
         )
 
-        # Test repo root with manifests\requirements.txt (paths.* are
-        # repo-root-relative by the config contract).
+        # Test tool root with manifests\requirements.txt (paths.* are
+        # tool-root-relative by the config contract - the fixture root doubles
+        # as the tool root here; the different-drive case is covered by
+        # Config.Tests.ps1).
         $script:RepoRoot = Join-Path $TestDrive 'repo'
         New-Item -ItemType Directory -Path (Join-Path $script:RepoRoot 'manifests') -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $script:RepoRoot 'manifests\requirements.txt') -Value @('six==1.17.0', 'isodate==0.7.2') -Encoding UTF8
         $script:RequirementsPath = Join-Path $script:RepoRoot 'manifests\requirements.txt'
 
         # Minimal valid config shape consumed by Export-OSyncPip
-        # (Get-OSyncConfig validation is todo-11 territory).
+        # (Get-OSyncConfig validation is todo-11 territory). toolRoot is the
+        # derived property Get-OSyncConfig stamps; Resolve-OSyncConfigPath
+        # resolves paths.* against it (never config.repoRoot).
         function New-OTestConfig {
             param(
                 [string]$RepoRoot = $script:RepoRoot,
@@ -57,6 +61,7 @@ Describe 'PipExport' {
             return [pscustomobject]@{
                 role      = 'A'
                 repoRoot  = $RepoRoot
+                toolRoot  = $RepoRoot
                 stateDir  = Join-Path $RepoRoot 'state'
                 paths     = [pscustomobject]@{ requirements = 'manifests\requirements.txt' }
                 pip       = [pscustomobject]@{
@@ -400,7 +405,7 @@ Describe 'PipExport' {
             $report.status | Should -Be 'ok'
         }
 
-        It 'throws when the requirements file does not exist (repo-root-relative path)' {
+        It 'throws when the requirements file does not exist (tool-root-relative path)' {
             $cfg = New-OTestConfig -RepoRoot (Join-Path $TestDrive 'noreq')
             Mock Resolve-OSyncPython { 'python.exe' }
             { Export-OSyncPip -Config $cfg -StagingDir (Join-Path $TestDrive 'x') } |

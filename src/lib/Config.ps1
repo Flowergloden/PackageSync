@@ -14,7 +14,10 @@
     categories.pip OR categories.npm enabled => categories.winget MUST be
     enabled (the runtime bootstrap payload - the Python/Node winget entries -
     lives under the winget category directory; Oracle m7 / Momus m6).
-  Returns the parsed PSCustomObject.
+  Returns the parsed PSCustomObject with a DERIVED toolRoot NoteProperty
+  (the parent of the config file's parent - the repo owning the operator
+  manifests) stamped on it; Resolve-OSyncConfigPath resolves config.paths.*
+  against that tool root (never config.repoRoot, the output landing dir).
 #>
 
 function Get-ONestedValue {
@@ -139,5 +142,55 @@ function Get-OSyncConfig {
         throw "Get-OSyncConfig: config key 'categories.winget' must be enabled when 'categories.pip' or 'categories.npm' is enabled (the runtime bootstrap payload lives in the winget category directory)."
     }
 
+    # --- stamp the derived tool root (path-resolution fix) ---
+    # config.paths.* are operator-edited INPUT files living in the TOOL repo
+    # (manifests\...), NOT in the output landing dir config.repoRoot. The tool
+    # root is the parent of the config file's parent ('<toolRoot>\config\
+    # packagesync.json'). It is DERIVED - never a JSON key - and added as a
+    # NoteProperty so the export libs can resolve paths.* via
+    # Resolve-OSyncConfigPath. No code path serializes the whole config
+    # object, so the extra property cannot leak into any JSON artifact.
+    $fullConfigPath = (Resolve-Path -LiteralPath $Path).Path
+    $configDir = Split-Path -Parent $fullConfigPath
+    $toolRoot = Split-Path -Parent $configDir
+    if ([string]::IsNullOrWhiteSpace($toolRoot)) { $toolRoot = $configDir }
+    $config | Add-Member -NotePropertyName toolRoot -NotePropertyValue $toolRoot -Force
+
     return $config
+}
+
+function Resolve-OSyncConfigPath {
+    <#
+      Resolves a config.paths.* value against the TOOL root - the repo that
+      owns the operator-edited manifests (the parent of the config file's
+      parent), NOT config.repoRoot (the output landing dir):
+        - an absolute/rooted path is used verbatim,
+        - a relative path is joined to $Config.toolRoot.
+      $Config.toolRoot is stamped by Get-OSyncConfig (derived, never a JSON
+      key); when absent (hand-rolled configs in tests) it falls back to this
+      module's repo root (src\lib -> two levels up).
+      Returns the resolved path string; existence is NOT required - callers
+      decide what a missing file means.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Config,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if ([System.IO.Path]::IsPathRooted($Path)) { return $Path }
+
+    $toolRoot = $null
+    if ($null -ne $Config) {
+        $prop = $Config.PSObject.Properties['toolRoot']
+        if ($null -ne $prop) { $toolRoot = [string]$prop.Value }
+    }
+    if ([string]::IsNullOrWhiteSpace($toolRoot)) {
+        $toolRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
+    }
+    return (Join-Path $toolRoot $Path)
 }

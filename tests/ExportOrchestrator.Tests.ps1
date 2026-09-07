@@ -45,8 +45,13 @@ Describe 'ExportOrchestrator' {
         . (Join-Path $PSScriptRoot '..\src\lib\ExportOrchestrator.ps1')
 
         # --- config helper: writes a full valid packagesync config JSON ---
+        # The config lives at <ToolRoot>\config\packagesync.json so
+        # Get-OSyncConfig derives toolRoot = <ToolRoot> (the parent of the
+        # config file's parent) - the same layout as the real repo. repoRoot
+        # is the separate OUTPUT landing dir (never the manifest location).
         function New-OTestConfigFile {
             param(
+                [string]$ToolRoot,
                 [string]$RepoRoot,
                 [string]$StagingRoot,
                 [string]$Role = 'A',
@@ -100,20 +105,22 @@ Describe 'ExportOrchestrator' {
                     npm = [ordered]@{ verdaccioVersion = '6.10.2' }
                 }
             }
-            $path = Join-Path $TestDrive ("config-{0}.json" -f [guid]::NewGuid().ToString('N'))
+            $configDir = Join-Path $ToolRoot 'config'
+            New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+            $path = Join-Path $configDir 'packagesync.json'
             [System.IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $config -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
             return $path
         }
 
-        # --- repo helper: manifests under <RepoRoot>\manifests (paths.* are repo-root-relative) ---
+        # --- repo helper: manifests under <ToolRoot>\manifests (paths.* are tool-root-relative) ---
         function New-OTestRepo {
-            param([string]$RepoRoot)
-            New-Item -ItemType Directory -Path (Join-Path $RepoRoot 'manifests\dotfiles') -Force | Out-Null
-            Set-Content -LiteralPath (Join-Path $RepoRoot 'manifests\winget-packages.txt') -Value @('# test', '7zip.7zip@26.02') -Encoding UTF8
-            Set-Content -LiteralPath (Join-Path $RepoRoot 'manifests\runtime-winget.txt') -Value @('Python.Python.3.12@3.12.10', 'OpenJS.NodeJS.LTS@24.19.0') -Encoding UTF8
-            Set-Content -LiteralPath (Join-Path $RepoRoot 'manifests\requirements.txt') -Value 'six==1.17.0' -Encoding UTF8
-            Set-Content -LiteralPath (Join-Path $RepoRoot 'manifests\npm-packages.txt') -Value 'is-odd@3.0.1' -Encoding UTF8
-            Set-Content -LiteralPath (Join-Path $RepoRoot 'manifests\dotfiles\dot_bashrc') -Value 'export FOO=bar' -Encoding UTF8
+            param([string]$ToolRoot)
+            New-Item -ItemType Directory -Path (Join-Path $ToolRoot 'manifests\dotfiles') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $ToolRoot 'manifests\winget-packages.txt') -Value @('# test', '7zip.7zip@26.02') -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $ToolRoot 'manifests\runtime-winget.txt') -Value @('Python.Python.3.12@3.12.10', 'OpenJS.NodeJS.LTS@24.19.0') -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $ToolRoot 'manifests\requirements.txt') -Value 'six==1.17.0' -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $ToolRoot 'manifests\npm-packages.txt') -Value 'is-odd@3.0.1' -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $ToolRoot 'manifests\dotfiles\dot_bashrc') -Value 'export FOO=bar' -Encoding UTF8
         }
 
         $script:OkReport = [pscustomobject]@{ category = 'x'; ok = @(); failed = @() }
@@ -181,8 +188,9 @@ Describe 'ExportOrchestrator' {
         It 'exports all categories in order, publishes, and index.json is the newest file in repoRoot' {
             $repoRoot = Join-Path $TestDrive 'repo'
             $stagingRoot = Join-Path $TestDrive 'staging'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $toolRoot = Join-Path $TestDrive 'tool'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
 
             $report = Invoke-OSyncExport -ConfigPath $cfg -Category 'winget,pip,npm,dotfiles'
 
@@ -236,8 +244,9 @@ Describe 'ExportOrchestrator' {
         It 'keeps only the newest 3 staging generations and never touches .verdaccio-a' {
             $repoRoot = Join-Path $TestDrive 'repo2'
             $stagingRoot = Join-Path $TestDrive 'staging2'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $toolRoot = Join-Path $TestDrive 'tool2'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
 
             # 5 pre-existing generations + the A-side-only tool dir
             foreach ($i in 1..5) {
@@ -266,8 +275,9 @@ Describe 'ExportOrchestrator' {
         It 'a failing category does not block the others, and publish is aborted' {
             $repoRoot = Join-Path $TestDrive 'repo3'
             $stagingRoot = Join-Path $TestDrive 'staging3'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $toolRoot = Join-Path $TestDrive 'tool3'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
             $script:FailCategory = 'pip'
 
             $report = Invoke-OSyncExport -ConfigPath $cfg -Category 'winget,pip,npm,dotfiles'
@@ -293,8 +303,9 @@ Describe 'ExportOrchestrator' {
         It 'integrity gate: an Incomplete staging repo aborts the publish' {
             $repoRoot = Join-Path $TestDrive 'repo4'
             $stagingRoot = Join-Path $TestDrive 'staging4'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $toolRoot = Join-Path $TestDrive 'tool4'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
 
             Mock Test-OSyncRepoIntegrity {
                 return [pscustomobject]@{ Overall = 'Incomplete'; Categories = @{} }
@@ -314,8 +325,9 @@ Describe 'ExportOrchestrator' {
         It 'disabled categories are not exported and get no index key' {
             $repoRoot = Join-Path $TestDrive 'repo5'
             $stagingRoot = Join-Path $TestDrive 'staging5'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot -Categories @{ winget = $true; pip = $true; npm = $false; dotfiles = $true }
+            $toolRoot = Join-Path $TestDrive 'tool5'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot -Categories @{ winget = $true; pip = $true; npm = $false; dotfiles = $true }
 
             $report = Invoke-OSyncExport -ConfigPath $cfg -Category 'winget,pip,npm,dotfiles'
 
@@ -336,8 +348,9 @@ Describe 'ExportOrchestrator' {
         It '-Category filters which categories run (runtime still runs)' {
             $repoRoot = Join-Path $TestDrive 'repo6'
             $stagingRoot = Join-Path $TestDrive 'staging6'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $toolRoot = Join-Path $TestDrive 'tool6'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
 
             $report = Invoke-OSyncExport -ConfigPath $cfg -Category 'pip'
 
@@ -350,8 +363,9 @@ Describe 'ExportOrchestrator' {
         It 'no categories enabled: reports success without any staging work' {
             $repoRoot = Join-Path $TestDrive 'repo7'
             $stagingRoot = Join-Path $TestDrive 'staging7'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot -Categories @{ winget = $false; pip = $false; npm = $false; dotfiles = $false }
+            $toolRoot = Join-Path $TestDrive 'tool7'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot -Categories @{ winget = $false; pip = $false; npm = $false; dotfiles = $false }
 
             $report = Invoke-OSyncExport -ConfigPath $cfg -Category 'winget,pip,npm,dotfiles'
 
@@ -365,8 +379,9 @@ Describe 'ExportOrchestrator' {
         It 'unknown -Category value throws' {
             $repoRoot = Join-Path $TestDrive 'repo8'
             $stagingRoot = Join-Path $TestDrive 'staging8'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $toolRoot = Join-Path $TestDrive 'tool8'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
 
             $err = $null
             try { Invoke-OSyncExport -ConfigPath $cfg -Category 'foo' } catch { $err = $_ }
@@ -379,8 +394,9 @@ Describe 'ExportOrchestrator' {
         It 'role B config is rejected with an explicit error' {
             $repoRoot = Join-Path $TestDrive 'repo9'
             $stagingRoot = Join-Path $TestDrive 'staging9'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot -Role 'B'
+            $toolRoot = Join-Path $TestDrive 'tool9'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot -Role 'B'
 
             $err = $null
             try { Invoke-OSyncExport -ConfigPath $cfg -Category 'winget,pip,npm,dotfiles' } catch { $err = $_ }
@@ -391,8 +407,9 @@ Describe 'ExportOrchestrator' {
         It 'pre-flight: missing node is an explicit error before any staging work' {
             $repoRoot = Join-Path $TestDrive 'repo10'
             $stagingRoot = Join-Path $TestDrive 'staging10'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $toolRoot = Join-Path $TestDrive 'tool10'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
 
             Mock Get-Command { return $null } -ParameterFilter { $Name -eq 'node' }
 
@@ -407,8 +424,9 @@ Describe 'ExportOrchestrator' {
         It 'pre-flight: missing python is an explicit error' {
             $repoRoot = Join-Path $TestDrive 'repo11'
             $stagingRoot = Join-Path $TestDrive 'staging11'
-            New-OTestRepo -RepoRoot $repoRoot
-            $cfg = New-OTestConfigFile -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $toolRoot = Join-Path $TestDrive 'tool11'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
 
             Mock Resolve-OSyncPython { throw 'Resolve-OSyncPython: no usable python interpreter' }
 

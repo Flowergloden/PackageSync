@@ -280,8 +280,9 @@ function Export-OSyncPip {
     # WingetExport.ps1 / NpmExport.ps1).
     Write-OSyncLog -Category 'pip' -Level Info -Message "Using python interpreter: $pythonPath" -Config $Config | Out-Null
 
-    # --- 2. requirements file (config.paths.* are repo-root-relative) ---
-    $requirementsPath = Join-Path $Config.repoRoot $Config.paths.requirements
+    # --- 2. requirements file (config.paths.* are tool-root-relative INPUT
+    # manifests - never config.repoRoot, the output landing dir) ---
+    $requirementsPath = Resolve-OSyncConfigPath -Config $Config -Path $Config.paths.requirements
     if (-not (Test-Path -LiteralPath $requirementsPath -PathType Leaf)) {
         throw "Export-OSyncPip: requirements file not found: '$requirementsPath'."
     }

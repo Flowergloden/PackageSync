@@ -223,7 +223,9 @@ function Invoke-OSyncExport {
         try {
             switch ($cat) {
                 'winget' {
-                    $listPath = Join-Path $config.repoRoot $config.paths.wingetWhitelist
+                    # config.paths.* are tool-root-relative INPUT manifests
+                    # (never config.repoRoot - that is the output landing dir).
+                    $listPath = Resolve-OSyncConfigPath -Config $config -Path $config.paths.wingetWhitelist
                     if (-not (Test-Path -LiteralPath $listPath -PathType Leaf)) {
                         throw "Export-OfflineRepo: winget whitelist not found: '$listPath'."
                     }

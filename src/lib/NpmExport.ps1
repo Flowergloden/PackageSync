@@ -43,26 +43,6 @@
     entries with error text).
 #>
 
-function Resolve-OPathForConfig {
-    <#
-      Resolves a config.paths.* value: used verbatim when it exists as a file
-      (handles absolute test paths), otherwise resolved against the repo root
-      derived from this module's location (src\lib -> two levels up). This
-      makes the export independent of the caller's current directory.
-    #>
-    param([string]$Configured)
-    if ([string]::IsNullOrWhiteSpace($Configured)) { return $null }
-    if (Test-Path -LiteralPath $Configured -PathType Leaf) {
-        return (Resolve-Path -LiteralPath $Configured).Path
-    }
-    $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
-    $candidate = Join-Path $repoRoot $Configured
-    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-        return (Resolve-Path -LiteralPath $candidate).Path
-    }
-    return $candidate
-}
-
 function Get-ONpmExe {
     # Resolves the npm executable (npm.cmd on Windows). Throws when npm is
     # not available - the export cannot work without it (Oracle m7).
@@ -414,7 +394,7 @@ function Get-OPinnedNodeMajor {
     #>
     param([Parameter(Mandatory = $true)]$Config)
 
-    $path = Resolve-OPathForConfig -Configured $Config.paths.runtimeWhitelist
+    $path = Resolve-OSyncConfigPath -Config $Config -Path $Config.paths.runtimeWhitelist
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Export-OSyncNpm: runtime whitelist not found: '$path' (required for the Node engines cross-assertion)."
     }
@@ -643,8 +623,8 @@ function Export-OSyncNpm {
         throw "Export-OSyncNpm: cross-assertion failed - verdaccio@$pinned requires node '$($nodeCompat.EnginesNode)' which is incompatible with the pinned Node major version $pinnedNodeMajor from '$($Config.paths.runtimeWhitelist)'. $($nodeCompat.Reason)"
     }
 
-    # --- package list ---
-    $listPath = Resolve-OPathForConfig -Configured $Config.paths.npmList
+    # --- package list (config.paths.* are tool-root-relative INPUT manifests) ---
+    $listPath = Resolve-OSyncConfigPath -Config $Config -Path $Config.paths.npmList
     $entries = @(Read-OSyncNpmList -Path $listPath)
     if ($entries.Count -eq 0) {
         throw "Export-OSyncNpm: npm package list '$listPath' is empty - nothing to warm."

@@ -72,26 +72,6 @@
   Returns the export report as a PSCustomObject.
 #>
 
-function Resolve-ORuntimePath {
-    <#
-      Resolves a config.paths.* value: used verbatim when it exists as a
-      file (handles absolute test paths), otherwise resolved against the
-      repo root derived from this module's location (src\lib -> two levels
-      up). Same semantics as NpmExport's Resolve-OPathForConfig.
-    #>
-    param([string]$Configured)
-    if ([string]::IsNullOrWhiteSpace($Configured)) { return $null }
-    if (Test-Path -LiteralPath $Configured -PathType Leaf) {
-        return (Resolve-Path -LiteralPath $Configured).Path
-    }
-    $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
-    $candidate = Join-Path $repoRoot $Configured
-    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-        return (Resolve-Path -LiteralPath $candidate).Path
-    }
-    return $candidate
-}
-
 function Assert-OSyncRuntimeWinget {
     <#
       Validates manifests\runtime-winget.txt for the runtime export:
@@ -796,8 +776,10 @@ function Export-OSyncRuntime {
         [string]$ToolSourceDir
     )
 
-    # --- 1. validate manifests\runtime-winget.txt ---
-    $runtimeWingetPath = Resolve-ORuntimePath -Configured $Config.paths.runtimeWhitelist
+    # --- 1. validate manifests\runtime-winget.txt (config.paths.* are
+    # tool-root-relative INPUT manifests - never config.repoRoot, the output
+    # landing dir) ---
+    $runtimeWingetPath = Resolve-OSyncConfigPath -Config $Config -Path $Config.paths.runtimeWhitelist
     $validated = Assert-OSyncRuntimeWinget -Path $runtimeWingetPath -Config $Config
     # Write-OSyncLog RETURNS the JSONL path - pipe to Out-Null so the export
     # report object is the ONLY thing this function emits.

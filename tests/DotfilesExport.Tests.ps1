@@ -37,7 +37,8 @@ Describe 'DotfilesExport' {
         Compress-Archive -Path (Join-Path $script:FakeExeDir '*') -DestinationPath $script:FakeZip -Force
         $script:FakeZipHash = Get-OSyncFileSha256 -Path $script:FakeZip
 
-        # --- test repo with a dotfiles source state (paths.* are repo-root-relative) ---
+        # --- test tool root with a dotfiles source state (paths.* are
+        # tool-root-relative; the fixture root doubles as the tool root here) ---
         $script:RepoRoot = Join-Path $TestDrive 'repo'
         $script:DotfilesSource = Join-Path $script:RepoRoot 'manifests\dotfiles'
         New-Item -ItemType Directory -Path $script:DotfilesSource -Force | Out-Null
@@ -46,7 +47,9 @@ Describe 'DotfilesExport' {
         Set-Content -LiteralPath (Join-Path $script:DotfilesSource 'sub\nested.txt') -Value 'nested content' -Encoding UTF8
 
         # Minimal valid config shape consumed by Export-OSyncDotfiles
-        # (Get-OSyncConfig validation is todo-11 territory).
+        # (Get-OSyncConfig validation is todo-11 territory). toolRoot is the
+        # derived property Get-OSyncConfig stamps; Resolve-OSyncConfigPath
+        # resolves paths.* against it (never config.repoRoot).
         function New-OTestConfig {
             param(
                 [string]$RepoRoot = $script:RepoRoot,
@@ -56,6 +59,7 @@ Describe 'DotfilesExport' {
             return [pscustomobject]@{
                 role     = 'A'
                 repoRoot = $RepoRoot
+                toolRoot = $RepoRoot
                 stateDir = Join-Path $RepoRoot 'state'
                 paths    = [pscustomobject]@{ dotfilesSource = $SourceDir }
                 pins     = [pscustomobject]@{

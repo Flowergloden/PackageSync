@@ -102,7 +102,8 @@ exit /b %FAKE_NPM_EXIT%
     }
 
     # A synthetic in-memory config object for Export-OSyncNpm. All paths are
-    # absolute so Resolve-OPathForConfig uses them verbatim.
+    # absolute so Resolve-OSyncConfigPath uses them verbatim (absolute paths
+    # never resolve against the tool root).
     function New-NeConfig {
         param(
             [string]$VerdaccioVersion,

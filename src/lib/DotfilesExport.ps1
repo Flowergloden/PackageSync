@@ -5,13 +5,13 @@
 
   Export-OSyncDotfiles -Config -StagingDir
 
-    1. Validates <repoRoot>\manifests\dotfiles is a legal chezmoi source state:
+    1. Validates <toolRoot>\manifests\dotfiles is a legal chezmoi source state:
        the directory must exist, and NO .chezmoiexternal* file may be present
        anywhere under it (recursive). Externals fetch content from the network
        at apply time, which the offline B side does not have - the export
        rejects them up front ("offline does not support externals").
     2. robocopy /MIR the source state to <staging>\dotfiles\source.
-    3. <repoRoot>\manifests\dotfiles.toml (when present) is copied to
+    3. <toolRoot>\manifests\dotfiles.toml (when present) is copied to
        <staging>\dotfiles\chezmoi.toml; otherwise a minimal template with an
        empty [data] section and commented examples is generated.
     4. Downloads chezmoi (config.pins.chezmoi.url; default v2.72.0 GitHub
@@ -168,7 +168,9 @@ function Export-OSyncDotfiles {
     )
 
     # --- 1. validate the chezmoi source state (dir exists, no externals) ---
-    $sourceDir = Join-Path $Config.repoRoot $Config.paths.dotfilesSource
+    # config.paths.* are tool-root-relative INPUT manifests (never
+    # config.repoRoot - that is the output landing dir).
+    $sourceDir = Resolve-OSyncConfigPath -Config $Config -Path $Config.paths.dotfilesSource
     $null = Assert-OSyncDotfilesSource -SourceDir $sourceDir
     # Write-OSyncLog RETURNS the JSONL path - pipe to Out-Null so the export
     # report object is the ONLY thing this function emits (same pattern as
@@ -182,7 +184,7 @@ function Export-OSyncDotfiles {
     Write-OSyncLog -Category 'dotfiles' -Level Info -Message "dotfiles source state copied to '$sourceTarget'" -Config $Config | Out-Null
 
     # --- 3. chezmoi.toml: copy manifests\dotfiles.toml or generate a template ---
-    $tomlSource = Join-Path $Config.repoRoot 'manifests\dotfiles.toml'
+    $tomlSource = Resolve-OSyncConfigPath -Config $Config -Path 'manifests\dotfiles.toml'
     $tomlTarget = Join-Path $dotfilesDir 'chezmoi.toml'
     if (Test-Path -LiteralPath $tomlSource -PathType Leaf) {
         Copy-Item -LiteralPath $tomlSource -Destination $tomlTarget -Force
