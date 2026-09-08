@@ -4,6 +4,9 @@
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
 
   Invoke-OSyncDownload : TLS 1.2 first, then Invoke-WebRequest -UseBasicParsing.
+                        Retry policy: 3 attempts total (initial + 2 retries),
+                        5s then 15s backoff, on ANY Invoke-WebRequest exception;
+                        original exception rethrown after the final failure.
   Invoke-OSyncRobocopy : robocopy wrapper with fixed /R:3 /W:5; exit <= 7 OK, >= 8 error.
   ConvertTo-OSyncJson  : ConvertTo-Json with -Depth 10 always (PS 5.1 defaults to 2).
 #>
@@ -29,7 +32,30 @@ function Invoke-OSyncDownload {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
 
-    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+    # Bounded retry with simple backoff: production observed transient HTTP
+    # 503s from the corporate proxy's CONNECT tunnel (github.com, aka.ms)
+    # that cleared minutes later - one un-retried request aborted the whole
+    # export category on a blip. 3 attempts total (initial + 2 retries),
+    # 5s then 15s delay, retried on ANY Invoke-WebRequest exception; after
+    # the final failed attempt the ORIGINAL exception is rethrown so error
+    # messages and caller behavior are unchanged. Warnings go to the warning
+    # stream so the output stream still carries ONLY the Get-Item result.
+    $retryDelays = @(5, 15)
+    $attempt = 1
+    while ($true) {
+        try {
+            Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+            break
+        }
+        catch {
+            if ($attempt -gt $retryDelays.Count) {
+                throw
+            }
+            Write-Warning ("Invoke-OSyncDownload: attempt {0} of {1} failed downloading '{2}': {3} - retrying in {4}s." -f $attempt, ($retryDelays.Count + 1), $Uri, $_.Exception.Message, $retryDelays[$attempt - 1])
+            Start-Sleep -Seconds $retryDelays[$attempt - 1]
+            $attempt++
+        }
+    }
 
     return (Get-Item -LiteralPath $OutFile)
 }
