@@ -305,3 +305,172 @@ Describe 'WingetExport: export loop with a fake winget (no network)' {
             Should -Throw -ExpectedMessage '*synthetic.BrokenManifest*'
     }
 }
+
+Describe 'WingetExport: incremental reuse of unchanged pinned packages (P1)' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\RepoContract.ps1')
+
+        $script:synFix = Join-Path $PSScriptRoot 'fixtures\winget\synthetic.SampleApp'
+
+        # Fake winget that FAILS every download: a successful export with this
+        # stub proves the payload came from reuse, not from `winget download`.
+        $script:fakeFailAll = Join-Path $TestDrive 'fakewinget-failall.cmd'
+        [System.IO.File]::WriteAllText($script:fakeFailAll,
+            "@echo off`r`necho %*| findstr /C:`"download`" >nul`r`nif errorlevel 1 exit /b 0`r`nexit /b 1",
+            [System.Text.Encoding]::ASCII)
+
+        # Fake winget that seeds the synthetic fixture into the download dir.
+        $script:fakeOk = Join-Path $TestDrive 'fakewinget-ok.cmd'
+        $okContent = @(
+            '@echo off',
+            'set DIR=',
+            'echo %*| findstr /C:"download" >nul',
+            'if errorlevel 1 exit /b 0',
+            'for %%A in (%*) do set DIR=%%~A',
+            'if not exist "%DIR%" mkdir "%DIR%"',
+            "xcopy /E /I /Y `"$($script:synFix)\*`" `"%DIR%`" >nul",
+            'exit /b 0'
+        ) -join "`r`n"
+        [System.IO.File]::WriteAllText($script:fakeOk, $okContent, [System.Text.Encoding]::ASCII)
+
+        # Builds a "previous published repo" for synthetic.SampleApp@1.0.0:
+        # fixture payload, URLs rewritten to 127.0.0.1:8788, winget\files.json.
+        $script:NewPrevRepo = {
+            param([string]$RepoRoot)
+            $wingetDir = Join-Path $RepoRoot 'winget'
+            New-Item -ItemType Directory -Path $wingetDir -Force | Out-Null
+            $pkgDir = Join-Path $wingetDir 'synthetic.SampleApp'
+            Copy-Item -Recurse -Force -LiteralPath $script:synFix -Destination $pkgDir
+            Get-ChildItem -LiteralPath $pkgDir -Recurse -Filter '*.yaml' -File | ForEach-Object {
+                ConvertTo-OSyncWingetYamlContent -YamlPath $_.FullName -IdDir $pkgDir `
+                    -Id 'synthetic.SampleApp' -HttpBind '127.0.0.1' -HttpPort 8788 | Out-Null
+            }
+            New-OSyncFilesManifest -Dir $wingetDir | Out-Null
+        }
+
+        $script:NewReuseConfig = {
+            param([string]$RepoRoot, [int]$Port = 8788)
+            return [pscustomobject]@{
+                role     = 'A'
+                repoRoot = $RepoRoot
+                stateDir = 'C:\ProgramData\PakageSync'
+                httpBind = '127.0.0.1'
+                httpPort = $Port
+                winget   = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
+            }
+        }
+    }
+
+    It 'reuses the previous payload when the pinned version is unchanged (works even with a dead winget)' {
+        $repo = Join-Path $TestDrive 'repo-reuse'
+        & $script:NewPrevRepo $repo
+        $cfg = & $script:NewReuseConfig $repo
+        $staging = Join-Path $TestDrive 'staging-reuse'
+        $list = @([pscustomobject]@{ Id = 'synthetic.SampleApp'; Version = '1.0.0'; Line = 1 })
+
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir $staging `
+            -Config $cfg -WingetExePath $script:fakeFailAll
+
+        $report.ok.Count | Should -Be 1
+        $report.reused.Count | Should -Be 1
+        $report.reused[0].Id | Should -Be 'synthetic.SampleApp'
+        $report.failed.Count | Should -Be 0
+
+        # Payload staged verbatim (top-level YAML + Dependencies installer).
+        $stagedYaml = Join-Path $staging 'winget\synthetic.SampleApp\Sample App_1.0.0_Machine_X64_exe_en-US.yaml'
+        Test-Path -LiteralPath $stagedYaml | Should -BeTrue
+        Test-OSyncWingetYamlNoLeak -Text ([System.IO.File]::ReadAllText($stagedYaml, [System.Text.Encoding]::UTF8)) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $staging 'winget\synthetic.SampleApp\Dependencies\Sample Dep_2.0.0_Machine_X64_msi_en-US.msi') | Should -BeTrue
+
+        # Reused IDs still land in packages.txt.
+        $packagesTxt = [System.IO.File]::ReadAllText((Join-Path $staging 'winget\packages.txt'), [System.Text.Encoding]::UTF8)
+        $packagesTxt.Trim() | Should -Be 'synthetic.SampleApp@1.0.0'
+    }
+
+    It 'falls back to download when the pinned version changed' {
+        $repo = Join-Path $TestDrive 'repo-ver'
+        & $script:NewPrevRepo $repo
+        $cfg = & $script:NewReuseConfig $repo
+        $staging = Join-Path $TestDrive 'staging-ver'
+        $list = @([pscustomobject]@{ Id = 'synthetic.SampleApp'; Version = '2.0.0'; Line = 1 })
+
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir $staging `
+            -Config $cfg -WingetExePath $script:fakeOk
+
+        $report.reused.Count | Should -Be 0
+        $report.ok.Count | Should -Be 1
+        $report.failed.Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $staging 'winget\synthetic.SampleApp\Sample App_1.0.0_Machine_X64_exe_en-US.yaml') | Should -BeTrue
+    }
+
+    It 'never reuses an UNPINNED entry even when a previous payload exists' {
+        $repo = Join-Path $TestDrive 'repo-unpinned'
+        & $script:NewPrevRepo $repo
+        $cfg = & $script:NewReuseConfig $repo
+        $staging = Join-Path $TestDrive 'staging-unpinned'
+        $list = @([pscustomobject]@{ Id = 'synthetic.SampleApp'; Version = $null; Line = 1 })
+
+        # failall stub: the download MUST be attempted (and therefore fails).
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir $staging `
+            -Config $cfg -WingetExePath $script:fakeFailAll
+
+        $report.ok.Count | Should -Be 0
+        $report.reused.Count | Should -Be 0
+        $report.failed.Count | Should -Be 1
+    }
+
+    It 'falls back to download when the previous payload is corrupted (files.json hash mismatch)' {
+        $repo = Join-Path $TestDrive 'repo-corrupt'
+        & $script:NewPrevRepo $repo
+        # Flip a byte in the installer AFTER files.json was written.
+        $exe = Join-Path $repo 'winget\synthetic.SampleApp\Sample App_1.0.0_Machine_X64_exe_en-US.exe'
+        $bytes = [System.IO.File]::ReadAllBytes($exe)
+        $bytes[0] = ($bytes[0] -bxor 0xFF)
+        [System.IO.File]::WriteAllBytes($exe, $bytes)
+
+        $cfg = & $script:NewReuseConfig $repo
+        $staging = Join-Path $TestDrive 'staging-corrupt'
+        $list = @([pscustomobject]@{ Id = 'synthetic.SampleApp'; Version = '1.0.0'; Line = 1 })
+
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir $staging `
+            -Config $cfg -WingetExePath $script:fakeFailAll
+
+        $report.ok.Count | Should -Be 0
+        $report.reused.Count | Should -Be 0
+        $report.failed.Count | Should -Be 1
+    }
+
+    It 'falls back to download when config.httpPort changed (baked URLs decoupled)' {
+        $repo = Join-Path $TestDrive 'repo-port'
+        & $script:NewPrevRepo $repo
+        $cfg = & $script:NewReuseConfig $repo 9999
+        $staging = Join-Path $TestDrive 'staging-port'
+        $list = @([pscustomobject]@{ Id = 'synthetic.SampleApp'; Version = '1.0.0'; Line = 1 })
+
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir $staging `
+            -Config $cfg -WingetExePath $script:fakeOk
+
+        $report.reused.Count | Should -Be 0
+        $report.ok.Count | Should -Be 1
+        $stagedYaml = Join-Path $staging 'winget\synthetic.SampleApp\Sample App_1.0.0_Machine_X64_exe_en-US.yaml'
+        ([System.IO.File]::ReadAllText($stagedYaml, [System.Text.Encoding]::UTF8)) -match ':9999/' | Should -BeTrue
+    }
+
+    It 'first run (no previous repo at all) downloads normally' {
+        $repo = Join-Path $TestDrive 'repo-firstrun'   # never created
+        $cfg = & $script:NewReuseConfig $repo
+        $staging = Join-Path $TestDrive 'staging-firstrun'
+        $list = @([pscustomobject]@{ Id = 'synthetic.SampleApp'; Version = '1.0.0'; Line = 1 })
+
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir $staging `
+            -Config $cfg -WingetExePath $script:fakeOk
+
+        $report.reused.Count | Should -Be 0
+        $report.ok.Count | Should -Be 1
+        $report.failed.Count | Should -Be 0
+    }
+}

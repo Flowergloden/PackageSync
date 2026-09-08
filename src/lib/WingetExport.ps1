@@ -544,6 +544,130 @@ public sealed class OSyncStreamPump
     }
 }
 
+function Copy-OSyncWingetReusedPackage {
+    <#
+    .SYNOPSIS
+    Incremental export: reuses the PREVIOUS published payload of a pinned
+    whitelist entry when it provably matches, skipping `winget download`.
+
+    .DESCRIPTION
+    All five gates must pass, otherwise the caller falls back to a real
+    download (the fail-safe direction - reuse never ships anything the
+    download path would not have produced):
+
+      1. PIN     - the whitelist entry is pinned (Id@version). Unpinned
+                   entries track "latest at export time" and always download.
+      2. PRESENT - <repoRoot>\winget\<Id>\ and <repoRoot>\winget\files.json
+                   both exist (first-ever run has nothing to reuse).
+      3. INTACT  - every file of this package listed in the PREVIOUS
+                   generation's files.json still exists with matching
+                   bytes/sha256. Reuse must never carry a corrupted repo
+                   payload forward into the next generation.
+      4. VERSION - every TOP-LEVEL manifest YAML (Dependencies\ YAMLs belong
+                   to OTHER packages and are excluded here) declares
+                   PackageVersion == the pinned version.
+      5. COUPLED - every InstallerUrl/InstallerFallbackUrls value still
+                   points at the CURRENT httpBind:httpPort. The URL endpoint
+                   is baked into the YAML at rewrite time, so a config
+                   port/bind change since the last export forces a real
+                   re-download (the rewrite stamps the new endpoint).
+
+    On success the previous package directory is copied verbatim into
+    -PkgStagingDir (already rewritten, already leak-asserted) and $true is
+    returned. The staging files.json + index.json + Test-OSyncRepoIntegrity
+    pipeline downstream is unchanged - the trust-root chain is identical
+    whether the payload was downloaded or reused.
+
+    Depends on ConvertFrom-RcJson / Get-RcSha256 (RepoContract.ps1) and
+    Get-OSyncWingetYamlUrls (this file) - all loaded by OfflineSync.psm1 at
+    runtime; Pester tests dot-source RepoContract.ps1 explicitly.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Entry,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PkgStagingDir,
+
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+
+    # Gate 1: PIN.
+    if ($null -eq $Entry.Version -or $Entry.Version.Trim().Length -eq 0) {
+        return $false
+    }
+
+    # Gate 2: PRESENT.
+    $repoWingetDir = Join-Path ([string]$Config.repoRoot) 'winget'
+    $prevPkgDir = Join-Path $repoWingetDir $Entry.Id
+    $prevFilesJson = Join-Path $repoWingetDir 'files.json'
+    if (-not (Test-Path -LiteralPath $prevPkgDir -PathType Container)) { return $false }
+    if (-not (Test-Path -LiteralPath $prevFilesJson -PathType Leaf)) { return $false }
+
+    $manifest = $null
+    try {
+        $manifest = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($prevFilesJson))
+    }
+    catch {
+        return $false
+    }
+    if ($null -eq $manifest -or -not ($manifest -is [System.Collections.IDictionary])) { return $false }
+
+    # Gate 3: INTACT - per-file bytes + sha256 against the previous
+    # generation's files.json (keys are '<Id>/<rel>' with forward slashes,
+    # relative to the winget category dir).
+    $idPrefix = ($Entry.Id + '/')
+    $pkgRelPaths = @()
+    foreach ($key in $manifest.Keys) {
+        if (([string]$key).StartsWith($idPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $pkgRelPaths += [string]$key
+        }
+    }
+    if ($pkgRelPaths.Count -eq 0) { return $false }
+
+    foreach ($rel in $pkgRelPaths) {
+        $meta = $manifest[$rel]
+        $file = Join-Path $repoWingetDir $rel
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return $false }
+        if ($meta -is [System.Collections.IDictionary] -and $meta.ContainsKey('bytes')) {
+            if ((Get-Item -LiteralPath $file -Force).Length -ne [int64]$meta['bytes']) { return $false }
+        }
+        if ($meta -is [System.Collections.IDictionary] -and $meta.ContainsKey('sha256')) {
+            if ((Get-RcSha256 -Path $file) -ne [string]$meta['sha256']) { return $false }
+        }
+    }
+
+    # Gates 4+5: VERSION (top-level YAMLs only) and COUPLED (every YAML).
+    $prevPkgFull = [System.IO.Path]::GetFullPath($prevPkgDir).TrimEnd('\')
+    $urlPrefix = ('http://{0}:{1}/' -f [string]$Config.httpBind, [int]$Config.httpPort)
+    $yamls = @(Get-ChildItem -LiteralPath $prevPkgDir -Recurse -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+    if ($yamls.Count -eq 0) { return $false }
+
+    foreach ($yaml in $yamls) {
+        $text = [System.IO.File]::ReadAllText($yaml.FullName, [System.Text.Encoding]::UTF8)
+
+        $isTopLevel = ([System.IO.Path]::GetFullPath((Split-Path -Parent $yaml.FullName)).TrimEnd('\') -eq $prevPkgFull)
+        if ($isTopLevel) {
+            $m = [regex]::Match($text, '(?m)^PackageVersion:\s*(.+?)\s*$')
+            if (-not $m.Success) { return $false }
+            $prevVersion = $m.Groups[1].Value.Trim().Trim('"').Trim("'")
+            if (-not [string]::Equals($prevVersion, $Entry.Version.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+        }
+
+        foreach ($url in @(Get-OSyncWingetYamlUrls -Text $text)) {
+            if (-not $url.StartsWith($urlPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        }
+    }
+
+    Copy-Item -LiteralPath $prevPkgDir -Destination $PkgStagingDir -Recurse -Force
+    return $true
+}
+
 function Export-OSyncWinget {
     <#
     .SYNOPSIS
@@ -554,11 +678,17 @@ function Export-OSyncWinget {
     and writes <StagingDir>\winget\packages.txt with ONLY the successful IDs.
 
     .DESCRIPTION
-    Per-package failures (non-zero exit, timeout, no manifest downloaded -
-    including UA-403 blocks and nonexistent versions) are recorded in the
-    report's failed array and processing CONTINUES with the next package.
-    A rewrite/leak-assertion failure is a tool bug, not a per-package
-    condition, and therefore throws (the whole export fails).
+    INCREMENTAL (P1): a PINNED entry whose previous published payload passes
+    every gate of Copy-OSyncWingetReusedPackage is copied from
+    <repoRoot>\winget\<Id>\ instead of being re-downloaded; reused IDs are
+    reported in the report's reused array and count as ok for packages.txt.
+    A reuse-check failure always falls back to a real download.
+
+    Per-package download failures (non-zero exit, timeout, no manifest
+    downloaded - including UA-403 blocks and nonexistent versions) are
+    recorded in the report's failed array and processing CONTINUES with the
+    next package. A rewrite/leak-assertion failure is a tool bug, not a
+    per-package condition, and therefore throws (the whole export fails).
 
     Returns the export report object and also writes it to
     <StagingDir>\winget\export-report.json.
@@ -605,6 +735,7 @@ function Export-OSyncWinget {
 
     $okIds = @{}
     $failed = @()
+    $reused = @()
 
     $wingetVersion = ''
     try {
@@ -620,6 +751,33 @@ function Export-OSyncWinget {
 
         # Stale-content guard: a previous partial download must not leak files
         # into this round's rewrite.
+        if (Test-Path -LiteralPath $pkgDir) {
+            Remove-Item -Recurse -Force -LiteralPath $pkgDir
+        }
+
+        # INCREMENTAL (P1): a pinned entry whose previous published payload is
+        # provably unchanged is reused instead of re-downloaded. Any failure
+        # inside the check falls back to a real download (fail-safe).
+        $reuseOk = $false
+        try {
+            $reuseOk = Copy-OSyncWingetReusedPackage -Entry $entry -PkgStagingDir $pkgDir -Config $Config
+        }
+        catch {
+            Write-OSyncLog -Category 'winget' -Level 'Warning' `
+                -Message ("reuse check for {0} failed ({1}) - falling back to download" -f $entry.Id, $_.Exception.Message) `
+                -Data @{ Id = $entry.Id; Error = $_.Exception.Message } -Config $Config | Out-Null
+            $reuseOk = $false
+        }
+        if ($reuseOk) {
+            $okIds[$entry.Id.ToLowerInvariant()] = $entry
+            $reused += [pscustomobject]@{ Id = $entry.Id; Version = $entry.Version }
+            Write-OSyncLog -Category 'winget' -Level 'Info' `
+                -Message ("winget package {0}@{1} unchanged - reused previous published payload, download skipped" -f $entry.Id, $entry.Version) `
+                -Data @{ Id = $entry.Id; Version = $entry.Version } -Config $Config | Out-Null
+            continue
+        }
+
+        # The reuse attempt may have left a partial copy behind.
         if (Test-Path -LiteralPath $pkgDir) {
             Remove-Item -Recurse -Force -LiteralPath $pkgDir
         }
@@ -721,6 +879,7 @@ function Export-OSyncWinget {
         category        = 'winget'
         wingetExeVersion = $wingetVersion
         ok              = $okReport
+        reused          = $reused
         failed          = $failed
         packagesTxt     = $packagesTxtPath
     }
@@ -729,8 +888,8 @@ function Export-OSyncWinget {
     [System.IO.File]::WriteAllText((Join-Path $wingetDir 'export-report.json'), $reportJson, (New-Object System.Text.UTF8Encoding($true)))
 
     Write-OSyncLog -Category 'winget' -Level 'Info' `
-        -Message ("winget export round done: {0} ok, {1} failed" -f $okReport.Count, $failed.Count) `
-        -Data @{ ok = $okReport.Count; failed = $failed.Count } -Config $Config | Out-Null
+        -Message ("winget export round done: {0} ok ({1} reused, {2} downloaded), {3} failed" -f $okReport.Count, $reused.Count, ($okReport.Count - $reused.Count), $failed.Count) `
+        -Data @{ ok = $okReport.Count; reused = $reused.Count; failed = $failed.Count } -Config $Config | Out-Null
 
     return $report
 }

@@ -416,6 +416,20 @@ Describe 'WingetApply: winget command line (fake winget .cmd)' {
             winget   = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
         }
 
+        # P2 state-match skip makes a SHARED stateDir leaky across tests (a
+        # successful install in one test records winget/7zip.7zip, and later
+        # tests would then skip the winget call they exist to observe). Each
+        # command-line test below therefore gets its OWN fresh stateDir.
+        $script:NewCmdConfig = {
+            param([string]$StateDir)
+            return [pscustomobject]@{
+                role     = 'B'
+                stateDir = $StateDir
+                httpPort = 8788
+                winget   = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
+            }
+        }
+
         Mock Start-OSyncHttpServer { return [pscustomobject]@{ IsStopped = $false } }
         Mock Stop-OSyncHttpServer { }
     }
@@ -432,9 +446,10 @@ Describe 'WingetApply: winget command line (fake winget .cmd)' {
     }
 
     It 'stages a manifest-ONLY flat directory (no installers, no subdirectories) for the --manifest argument' {
-        $report = Invoke-OSyncWingetApply -WorkDir $script:work -Config $script:cfg -WingetExePath $script:fakeWinget
+        $cfg = & $script:NewCmdConfig (Join-Path $TestDrive 'state-cmd-flat')
+        $report = Invoke-OSyncWingetApply -WorkDir $script:work -Config $cfg -WingetExePath $script:fakeWinget
 
-        $staging = Join-Path (Join-Path $script:cfg.stateDir 'run') 'winget-manifests\7zip.7zip'
+        $staging = Join-Path (Join-Path $cfg.stateDir 'run') 'winget-manifests\7zip.7zip'
         Test-Path -LiteralPath $staging -PathType Container | Should -BeTrue
 
         $files = @(Get-ChildItem -LiteralPath $staging -Recurse -File)
@@ -450,10 +465,11 @@ Describe 'WingetApply: winget command line (fake winget .cmd)' {
             "PackageIdentifier: dep.Test`nPackageVersion: 1.0.0`nInstallers:`n- Architecture: x64`n  InstallerType: msi`n  InstallerUrl: http://127.0.0.1:8788/winget/7zip.7zip/Dependencies/Dep_1.0.0_Machine_X64_msi_en-US.msi`n  InstallerSha256: 1111111111111111111111111111111111111111111111111111111111111111`n  Scope: machine`nManifestType: merged`nManifestVersion: 1.12.0",
             (New-Object System.Text.UTF8Encoding($true)))
 
-        $report = Invoke-OSyncWingetApply -WorkDir $script:work -Config $script:cfg -WingetExePath $script:fakeWinget
+        $cfg = & $script:NewCmdConfig (Join-Path $TestDrive 'state-cmd-deps')
+        $report = Invoke-OSyncWingetApply -WorkDir $script:work -Config $cfg -WingetExePath $script:fakeWinget
         $report.ok.Count | Should -Be 1
 
-        $staging = Join-Path (Join-Path $script:cfg.stateDir 'run') 'winget-manifests\7zip.7zip'
+        $staging = Join-Path (Join-Path $cfg.stateDir 'run') 'winget-manifests\7zip.7zip'
         $files = @(Get-ChildItem -LiteralPath $staging -Recurse -File)
         $files.Count | Should -Be 2
         @(Get-ChildItem -LiteralPath $staging -Directory).Count | Should -Be 0
@@ -462,9 +478,137 @@ Describe 'WingetApply: winget command line (fake winget .cmd)' {
     It 're-derives winget.exe via Resolve-OSyncWingetExePath when no -WingetExePath is given' {
         Mock Resolve-OSyncWingetExePath { return $script:fakeWinget }
 
-        $report = Invoke-OSyncWingetApply -WorkDir $script:work -Config $script:cfg
+        $cfg = & $script:NewCmdConfig (Join-Path $TestDrive 'state-cmd-rederive')
+        $report = Invoke-OSyncWingetApply -WorkDir $script:work -Config $cfg
 
         $report.wingetExe | Should -Be $script:fakeWinget
         $report.ok.Count | Should -Be 1
+    }
+}
+
+Describe 'WingetApply: state-match skip (P2 incremental)' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\ManifestParse.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\HttpServer.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\State.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetApply.ps1')
+
+        $script:fixtureDir = Join-Path $PSScriptRoot 'fixtures\winget\7zip.7zip'
+        $script:goldenSha = 'db407a4f6d4999e5c7bc00ce8a882be94717b56e7fa68140fe3f12605d91643e'
+
+        $script:NewWorkCopy = {
+            param([string]$Root)
+            $pkgDir = Join-Path $Root 'winget\7zip.7zip'
+            New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $script:fixtureDir '7-Zip_26.02_Machine_X64_wix_zh-CN.yaml') -Destination $pkgDir
+            [System.IO.File]::WriteAllBytes((Join-Path $pkgDir '7-Zip_26.02_Machine_X64_wix_zh-CN.msi'), [byte[]]@(1, 2, 3))
+            ConvertTo-OSyncWingetYamlContent -YamlPath (Join-Path $pkgDir '7-Zip_26.02_Machine_X64_wix_zh-CN.yaml') `
+                -IdDir $pkgDir -Id '7zip.7zip' -HttpBind '127.0.0.1' -HttpPort 8788 | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $Root 'winget\packages.txt'), "7zip.7zip@26.02`r`n", (New-Object System.Text.UTF8Encoding($true)))
+        }
+        $script:NewConfig = {
+            param([string]$StateDir)
+            return [pscustomobject]@{
+                role     = 'B'
+                stateDir = $StateDir
+                httpPort = 8788
+                winget   = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
+            }
+        }
+
+        Mock Resolve-OSyncWingetExePath { return 'C:\fake\winget.exe' }
+        Mock Start-OSyncHttpServer { return [pscustomobject]@{ IsStopped = $false } }
+        Mock Stop-OSyncHttpServer { }
+        Mock Invoke-OSyncWingetInstall {
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = 'mocked' }
+        }
+    }
+
+    It 'skips install when the state record matches version+sha256 exactly (no winget call, no HTTP server)' {
+        $work = Join-Path $TestDrive 'work-skip'
+        & $script:NewWorkCopy $work
+        $stateDir = Join-Path $TestDrive 'state-skip'
+        Add-OSyncStateRecord -Category winget -Name '7zip.7zip' -Version '26.02' -Sha256 $script:goldenSha -StateDir $stateDir | Out-Null
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config (& $script:NewConfig $stateDir)
+
+        $report.skipped.Count | Should -Be 1
+        $report.skipped[0].Id | Should -Be '7zip.7zip'
+        $report.skipped[0].Version | Should -Be '26.02'
+        $report.skipped[0].Reason | Should -Be 'state-match'
+        $report.ok.Count | Should -Be 0
+        $report.satisfied.Count | Should -Be 0
+        $report.failed.Count | Should -Be 0
+        Should -Invoke Invoke-OSyncWingetInstall -Times 0 -Scope It
+        Should -Invoke Start-OSyncHttpServer -Times 0 -Scope It
+    }
+
+    It 'installs normally when the recorded sha256 differs' {
+        $work = Join-Path $TestDrive 'work-shadiff'
+        & $script:NewWorkCopy $work
+        $stateDir = Join-Path $TestDrive 'state-shadiff'
+        Add-OSyncStateRecord -Category winget -Name '7zip.7zip' -Version '26.02' `
+            -Sha256 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -StateDir $stateDir | Out-Null
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config (& $script:NewConfig $stateDir)
+
+        $report.skipped.Count | Should -Be 0
+        $report.ok.Count | Should -Be 1
+        Should -Invoke Invoke-OSyncWingetInstall -Times 1 -Scope It
+    }
+
+    It 'installs normally when the recorded version differs' {
+        $work = Join-Path $TestDrive 'work-verdiff'
+        & $script:NewWorkCopy $work
+        $stateDir = Join-Path $TestDrive 'state-verdiff'
+        Add-OSyncStateRecord -Category winget -Name '7zip.7zip' -Version '25.0' -Sha256 $script:goldenSha -StateDir $stateDir | Out-Null
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config (& $script:NewConfig $stateDir)
+
+        $report.skipped.Count | Should -Be 0
+        $report.ok.Count | Should -Be 1
+        Should -Invoke Invoke-OSyncWingetInstall -Times 1 -Scope It
+    }
+
+    It 'installs normally when no state record exists' {
+        $work = Join-Path $TestDrive 'work-norec'
+        & $script:NewWorkCopy $work
+        $stateDir = Join-Path $TestDrive 'state-norec'
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config (& $script:NewConfig $stateDir)
+
+        $report.skipped.Count | Should -Be 0
+        $report.ok.Count | Should -Be 1
+        Should -Invoke Invoke-OSyncWingetInstall -Times 1 -Scope It
+    }
+
+    It 'skips only the matched package in a mixed set' {
+        $work = Join-Path $TestDrive 'work-mixed'
+        & $script:NewWorkCopy $work
+        $pkgDir2 = Join-Path $work 'winget\second.Pkg'
+        New-Item -ItemType Directory -Path $pkgDir2 -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:fixtureDir '7-Zip_26.02_Machine_X64_wix_zh-CN.yaml') `
+            -Destination (Join-Path $pkgDir2 'Second_1.0.0_Machine_X64_wix_zh-CN.yaml')
+        [System.IO.File]::WriteAllBytes((Join-Path $pkgDir2 'Second_1.0.0_Machine_X64_wix_zh-CN.msi'), [byte[]]@(9))
+        ConvertTo-OSyncWingetYamlContent -YamlPath (Join-Path $pkgDir2 'Second_1.0.0_Machine_X64_wix_zh-CN.yaml') `
+            -IdDir $pkgDir2 -Id 'second.Pkg' -HttpBind '127.0.0.1' -HttpPort 8788 | Out-Null
+        Add-Content -LiteralPath (Join-Path $work 'winget\packages.txt') -Value 'second.Pkg@1.0.0'
+
+        $stateDir = Join-Path $TestDrive 'state-mixed'
+        Add-OSyncStateRecord -Category winget -Name '7zip.7zip' -Version '26.02' -Sha256 $script:goldenSha -StateDir $stateDir | Out-Null
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config (& $script:NewConfig $stateDir)
+
+        $report.skipped.Count | Should -Be 1
+        $report.skipped[0].Id | Should -Be '7zip.7zip'
+        $report.ok.Count | Should -Be 1
+        $report.ok[0].Id | Should -Be 'second.Pkg'
+        $report.failed.Count | Should -Be 0
+        Should -Invoke Invoke-OSyncWingetInstall -Times 1 -Scope It
     }
 }

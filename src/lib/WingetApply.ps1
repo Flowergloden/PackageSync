@@ -46,8 +46,12 @@
     thrown error as "category failed" and continues with the other categories.
 
     Returns the report object on full success:
-      { category, wingetExe, wingetExeVersion, ok, satisfied, failed, packagesTxt }
+      { category, wingetExe, wingetExeVersion, ok, satisfied, skipped, failed, packagesTxt }
     ok/satisfied entries: { Id, Version, Sha256, ExitCode }
+    skipped entries:      { Id, Version, Sha256, Reason='state-match' }
+        (P2 incremental: state record EXACTLY matches the work copy manifest,
+        so winget is never invoked for the package - see README 5.8 for the
+        manual-uninstall trade-off)
     failed entries:       { Id, ExitCode, Output }
 
   PORT-COUPLING GUARD (Oracle r7-4): the InstallerUrl port is baked in at
@@ -370,6 +374,83 @@ function Invoke-OSyncWingetApply {
             wingetExeVersion = $wingetVersion
             ok              = @()
             satisfied       = @()
+            skipped         = @()
+            failed          = @()
+            packagesTxt     = $packagesTxt
+        }
+    }
+
+    # INCREMENTAL (P2): skip a package when its state record EXACTLY matches
+    # the work copy manifest (PackageVersion + first InstallerSha256, both
+    # from Get-OSyncWingetManifestInfo - the same values Add-OSyncStateRecord
+    # persists). The record is written ONLY after a real successful/satisfied
+    # install, so a match proves "B already runs precisely this payload" and
+    # winget would only echo a satisfied exit code. A null/absent field on
+    # either side cannot prove the match and falls through to a real install.
+    #
+    # Trade-off (documented in README 5.8): a package MANUALLY uninstalled on
+    # B is not reinstalled while its state record still matches - winget is
+    # never invoked for it. Remediation: delete the winget/<Id> record from
+    # system-state.json (or bump the pinned version) and re-run apply.
+    $applyState = Get-OSyncState -Category 'winget' -Config $Config
+    $wingetRecords = $applyState['winget']
+    if ($null -eq $wingetRecords -or $wingetRecords -isnot [System.Collections.IDictionary]) {
+        $wingetRecords = @{}
+    }
+
+    $pendingInstall = @()
+    $skipped = @()
+    foreach ($entry in $toInstall) {
+        $pkgDir = Join-Path $workFull ('winget\{0}' -f $entry.Id)
+        $yamls = @(Get-ChildItem -LiteralPath $pkgDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+        $info = $null
+        if ($yamls.Count -gt 0) {
+            $info = Get-OSyncWingetManifestInfo -YamlPath $yamls[0].FullName
+        }
+
+        # Case-insensitive key scan (bulletproof across JSON round-trips;
+        # the package count is tiny so a linear scan is fine).
+        $record = $null
+        foreach ($k in $wingetRecords.Keys) {
+            if ([string]::Equals([string]$k, $entry.Id, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $record = $wingetRecords[$k]
+                break
+            }
+        }
+
+        $isMatch = ($null -ne $info) -and
+                   ($null -ne $info.PackageVersion) -and
+                   ($null -ne $info.InstallerSha256) -and
+                   ($null -ne $record) -and
+                   ($record -is [System.Collections.IDictionary]) -and
+                   ([string]::Equals([string]$record['version'], [string]$info.PackageVersion, [System.StringComparison]::OrdinalIgnoreCase)) -and
+                   ([string]::Equals(([string]$record['sha256']).ToLowerInvariant(), [string]$info.InstallerSha256, [System.StringComparison]::Ordinal))
+        if ($isMatch) {
+            $skipped += [pscustomobject]@{
+                Id      = $entry.Id
+                Version = $info.PackageVersion
+                Sha256  = $info.InstallerSha256
+                Reason  = 'state-match'
+            }
+            Write-OSyncLog -Category 'winget' -Level 'Info' `
+                -Message ("winget package {0}@{1} already applied (state match) - install skipped" -f $entry.Id, $info.PackageVersion) `
+                -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256 } -Config $Config | Out-Null
+            continue
+        }
+        $pendingInstall += $entry
+    }
+
+    if ($pendingInstall.Count -eq 0) {
+        Write-OSyncLog -Category 'winget' -Level 'Info' `
+            -Message ("winget apply: all {0} package(s) already applied (state match) - nothing to install, HTTP server not started" -f $skipped.Count) `
+            -Data @{ skipped = $skipped.Count } -Config $Config | Out-Null
+        return [pscustomobject]@{
+            category        = 'winget'
+            wingetExe       = $wingetExe
+            wingetExeVersion = $wingetVersion
+            ok              = @()
+            satisfied       = @()
+            skipped         = $skipped
             failed          = @()
             packagesTxt     = $packagesTxt
         }
@@ -394,7 +475,7 @@ function Invoke-OSyncWingetApply {
             -Message ("winget apply: HTTP server started on port {0} serving {1}" -f $httpPort, $workFull) `
             -Data @{ Port = $httpPort; Root = $workFull } -Config $Config | Out-Null
 
-        foreach ($entry in $toInstall) {
+        foreach ($entry in $pendingInstall) {
             $pkgDir = Join-Path $workFull ('winget\{0}' -f $entry.Id)
 
             # The package directory must contain at least one manifest YAML.
@@ -500,8 +581,8 @@ function Invoke-OSyncWingetApply {
     }
 
     Write-OSyncLog -Category 'winget' -Level 'Info' `
-        -Message ("winget apply round done: {0} ok, {1} satisfied, {2} failed" -f $ok.Count, $satisfied.Count, $failed.Count) `
-        -Data @{ ok = $ok.Count; satisfied = $satisfied.Count; failed = $failed.Count } -Config $Config | Out-Null
+        -Message ("winget apply round done: {0} ok, {1} satisfied, {2} skipped, {3} failed" -f $ok.Count, $satisfied.Count, $skipped.Count, $failed.Count) `
+        -Data @{ ok = $ok.Count; satisfied = $satisfied.Count; skipped = $skipped.Count; failed = $failed.Count } -Config $Config | Out-Null
 
     if ($failed.Count -gt 0) {
         $ids = ($failed | ForEach-Object { $_.Id }) -join ', '
@@ -514,6 +595,7 @@ function Invoke-OSyncWingetApply {
         wingetExeVersion = $wingetVersion
         ok              = $ok
         satisfied       = $satisfied
+        skipped         = $skipped
         failed          = $failed
         packagesTxt     = $packagesTxt
     }

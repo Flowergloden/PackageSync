@@ -127,6 +127,7 @@ Microsoft.PowerToys
 
 - 强烈建议钉版 `Id@version`，保证 A/B 版本一致；查版本用 `winget show --id <Id> -e`（本机 winget 输出为中文，勿 grep 英文 `Version:` 标签，直接正则版本号）。
 - 只有**本轮导出成功**的 Id 才会写进交付清单 `winget\packages.txt`；失败的包仅记入导出报告 `failed` 数组，不中断其他包，也不进 B 端安装清单。
+- **钉版条目启用增量导出（P1）**：钉版版本与上一版已发布载荷一致时直接复用落盘区现有文件、跳过 `winget download`（判定条件见 5.8）；未钉版条目每轮仍全量下载。
 - 换版本 = 改这一行，下次导出自动生效。
 
 ### 4.2 pip requirements.txt（manifests\requirements.txt）
@@ -226,6 +227,24 @@ chezmoi 与 App Installer 四件套（msixbundle/VCLibs/UI.Xaml/VC_redist）都�
 - 计划任务与手动命令一律从 `C:\PakageSync\src\` 执行（任务指向 `bin\` 中永不换名的微启动器）。
 - 每次 apply 在完整性通过后自刷新该副本（先 `.new` 再换名 `.old`，顺序钉死；刷新前重验 `C:\PakageSync` 属主/ACL）——**下一周期生效**。
 - **首次引导必须手工复制**（见 3.2 步 2，已知限制 L12）。
+
+### 5.8 winget 增量同步（跳过未变包）
+
+winget 类别在两端各有一层增量跳过，**信任根链（index.json → files.json → 逐文件 SHA256）完全不变**——增量只省「下载/安装执行」，不省任何校验。
+
+**A 端导出（P1，复用已发布载荷）**：钉版条目 `Id@version` 满足以下全部条件时，直接从落盘区现有 `winget\<Id>\` 复制载荷进 staging，**不调用 `winget download`**（导出报告 `reused` 数组记录）：
+
+1. 条目已钉版（未钉版条目追踪「导出时最新版」，永远全量下载）；
+2. 落盘区存在该包上一版载荷与 `winget\files.json`；
+3. 该包每个文件与上一版 `files.json` 的 bytes/sha256 逐项匹配（**A 机落盘区损坏不会带进下一代**，损坏即回退下载）；
+4. 顶层 YAML 的 `PackageVersion` 与钉版版本一致；
+5. YAML 内烙死的 InstallerUrl 端口/绑定仍等于当前 config `httpBind:httpPort`（改端口自动回退下载并重写，见 5.5）。
+
+任何条件不满足或复用检查自身报错 → 回退正常下载（fail-safe 方向），不视为导出失败。
+
+**B 端 apply（P2，state 匹配跳过）**：安装循环前，比较工作副本 YAML 的 `PackageVersion` + 首个 `InstallerSha256` 与 `system-state.json` 的 `winget[<Id>]` 记录；两者**完全一致**则跳过该包的 `winget install`（记入 apply 报告 `skipped` 数组；全部命中时连本地 HTTP 服务都不启动）。state 记录只在真实安装成功/已满足后写入，因此匹配即证明「B 正运行 exactly 这份载荷」。
+
+> **取舍须知**：B 上**手动卸载**的包在其 state 记录仍匹配时不会自动重装（winget 根本不会被调用）。恢复方法：删除 `C:\ProgramData\PakageSync\state\system-state.json` 中对应的 `winget.<Id>` 记录（或升级钉版版本）后重跑 apply。
 
 ## 六、已知限制
 
