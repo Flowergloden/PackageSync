@@ -58,6 +58,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Register-SyncTask
 
    - 注册任务 `PakageSync-Export`：当前用户、LogonType S4U（注销也运行）、RunLevel Highest、StartWhenAvailable。
    - 也可手动触发验证：`powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-OfflineRepo.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles]`。
+   - 手动运行时控制台**默认实时回显**进度（里程碑日志行 + 节流后的 winget 下载输出），无需另开窗口尾随日志；需要静默（只看日志文件）时加 `-Quiet`。无人值守计划任务不受此开关影响。
 
 ### 3.2 B 端（内网机）
 
