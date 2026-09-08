@@ -154,7 +154,14 @@ function Invoke-OSyncExport {
         [string]$ConfigPath,
 
         [Parameter(Mandatory = $false)]
-        [string]$Category = 'winget,pip,npm,dotfiles'
+        [string]$Category = 'winget,pip,npm,dotfiles',
+
+        # Disables the live console echo (milestone log lines + throttled
+        # winget download output). Echo is ON by default for export runs;
+        # unattended scheduled runs are unaffected either way (Write-Host
+        # with no interactive host is harmless).
+        [Parameter(Mandatory = $false)]
+        [switch]$Quiet
     )
 
     $startedAt = [datetime]::UtcNow.ToString('o')
@@ -163,6 +170,17 @@ function Invoke-OSyncExport {
     $config = Get-OSyncConfig -Path $ConfigPath
     if ($config.role -ne 'A') {
         throw "Export-OfflineRepo: config role must be 'A' (got '$($config.role)') - this script is the A-side export orchestrator."
+    }
+
+    # Console echo flag rides the IN-MEMORY config object only (never written
+    # back to the JSON file). Write-OSyncLog and Invoke-OSyncWingetDownload
+    # read it; absent/false means silent.
+    $echoOn = -not $Quiet.IsPresent
+    if ($config.PSObject.Properties['consoleEcho']) {
+        $config.consoleEcho = $echoOn
+    }
+    else {
+        $config | Add-Member -NotePropertyName consoleEcho -NotePropertyValue $echoOn
     }
 
     # --- parse -Category (comma separated) and intersect with config.categories ---

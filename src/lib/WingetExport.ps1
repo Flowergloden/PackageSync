@@ -399,10 +399,15 @@ function Invoke-OSyncWingetDownload {
     would silently turn every download into a "failed" record. ProcessStartInfo
     populates ExitCode correctly on both PS 5.1 and pwsh 7.
 
-    Output is read from the redirected streams (winget writes localized
-    console output and progress bars that must not pollute the pipeline) and
-    trimmed to the tail before being returned for the export report. On
-    timeout the process is killed and TimedOut is set.
+    Both pipes are consumed line-by-line via DataReceived events handled by
+    the compiled OSyncStreamPump helper (a scriptblock handler is NOT an
+    option: the events fire on threadpool threads without a PowerShell
+    runspace and would crash the process). Every line is appended to an
+    in-memory buffer (trimmed to the tail before being returned for the
+    export report); when -Echo is on, lines are ALSO forwarded to the
+    console, throttled to one per 250ms and collapsed at CR so winget's
+    CR-redrawn progress bars produce a steady trickle instead of a screen
+    flood. On timeout the process is killed and TimedOut is set.
     #>
     [CmdletBinding()]
     param(
@@ -413,7 +418,11 @@ function Invoke-OSyncWingetDownload {
         [string[]]$Arguments,
 
         [Parameter(Mandatory = $false)]
-        [int]$TimeoutMs = 900000
+        [int]$TimeoutMs = 900000,
+
+        # Forward a throttled live view of the winget output to the console.
+        [Parameter(Mandatory = $false)]
+        [bool]$Echo = $false
     )
 
     # Build the command line: quote any argument that contains whitespace and
@@ -434,18 +443,87 @@ function Invoke-OSyncWingetDownload {
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    # winget writes UTF-8 to a redirected pipe regardless of the console
+    # codepage (verified empirically: '已找到' arrives as E5 B7 B2...). The
+    # default reader encoding is the console output codepage (e.g. GBK/936),
+    # which mojibake's that into '宸叉壘鍒' - pin both streams to UTF-8.
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
 
     $proc = [System.Diagnostics.Process]::Start($psi)
 
-    # Drain both pipes concurrently so a chatty winget cannot deadlock on a
-    # full pipe buffer while we wait.
-    $outTask = $proc.StandardOutput.ReadToEndAsync()
-    $errTask = $proc.StandardError.ReadToEndAsync()
+    # Drain both pipes via DataReceived events so a chatty winget cannot
+    # deadlock on a full pipe buffer while we wait. The events fire on
+    # threadpool threads WITHOUT a PowerShell runspace, so a scriptblock
+    # handler would crash the process ("no Runspace available") - the
+    # handler is a compiled C# pump (OSyncStreamPump) instead, with all
+    # shared state lock-guarded and console output via Console.WriteLine.
+    if (-not ('OSyncStreamPump' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Text;
+
+public sealed class OSyncStreamPump
+{
+    private readonly StringBuilder _buffer = new StringBuilder();
+    private readonly object _sync = new object();
+    private readonly bool _echo;
+    private DateTime _lastEcho = DateTime.MinValue;
+    private bool _echoDead;
+
+    public OSyncStreamPump(bool echo) { _echo = echo; }
+
+    public void Attach(Process p)
+    {
+        p.OutputDataReceived += OnData;
+        p.ErrorDataReceived += OnData;
+        p.BeginOutputReadLine();
+        p.BeginErrorReadLine();
+    }
+
+    private void OnData(object sender, DataReceivedEventArgs e)
+    {
+        if (e.Data == null) return;
+        lock (_sync) { _buffer.AppendLine(e.Data); }
+        if (!_echo || _echoDead) return;
+        // winget redraws progress bars with CR: forward only the segment
+        // after the last CR, and at most one line per 250ms.
+        string text = e.Data;
+        int cr = text.LastIndexOf('\r');
+        if (cr >= 0) text = text.Substring(cr + 1);
+        text = text.Trim();
+        if (text.Length == 0) return;
+        bool due = false;
+        lock (_sync)
+        {
+            DateTime now = DateTime.UtcNow;
+            if ((now - _lastEcho).TotalMilliseconds >= 250) { _lastEcho = now; due = true; }
+        }
+        if (due)
+        {
+            try { Console.WriteLine("  winget: " + text); }
+            catch (System.IO.IOException) { _echoDead = true; }
+        }
+    }
+
+    public string GetOutput()
+    {
+        lock (_sync) { return _buffer.ToString(); }
+    }
+}
+'@
+    }
+    $pump = New-Object OSyncStreamPump($Echo)
+    $pump.Attach($proc)
 
     $exited = $proc.WaitForExit($TimeoutMs)
     $exitCode = -1
     $timedOut = $false
     if ($exited) {
+        # Parameterless WaitForExit also waits for the async event pump to
+        # deliver the final buffered lines before the buffer is read.
+        $proc.WaitForExit()
         $exitCode = $proc.ExitCode
     }
     else {
@@ -459,25 +537,10 @@ function Invoke-OSyncWingetDownload {
         }
     }
 
-    $outText = ''
-    $errText = ''
-    try {
-        $outText = $outTask.Result
-    }
-    catch {
-        $outText = ''
-    }
-    try {
-        $errText = $errTask.Result
-    }
-    catch {
-        $errText = ''
-    }
-
     return [pscustomobject]@{
         ExitCode = $exitCode
         TimedOut = $timedOut
-        Output   = ($outText + $errText)
+        Output   = $pump.GetOutput()
     }
 }
 
@@ -583,7 +646,8 @@ function Export-OSyncWinget {
             -Message ("Downloading winget package {0} ({1})" -f $entry.Id, $entry.Version) `
             -Data @{ Id = $entry.Id; Version = $entry.Version } -Config $Config | Out-Null
 
-        $result = Invoke-OSyncWingetDownload -WingetExe $wingetExe -Arguments $downloadArgs
+        $echoOn = ($null -ne $Config -and $Config.PSObject.Properties['consoleEcho'] -and [bool]$Config.consoleEcho)
+        $result = Invoke-OSyncWingetDownload -WingetExe $wingetExe -Arguments $downloadArgs -Echo $echoOn
 
         $yamls = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
 

@@ -83,5 +83,30 @@ function Write-OSyncLog {
     [System.IO.File]::AppendAllText($txtPath, $lineText + [Environment]::NewLine, $utf8)
     [System.IO.File]::AppendAllText($jsonlPath, $jsonLine + [Environment]::NewLine, $utf8)
 
+    # Optional console echo: gives an operator watching a manual run live
+    # progress (the log files are the only output otherwise). Opt-in via the
+    # in-memory config flag 'consoleEcho' (set by Invoke-OSyncExport unless
+    # -Quiet; absent/false = silent, e.g. unattended scheduled tasks on the
+    # B side). Write-Host is the HOST stream - it cannot pollute the success
+    # pipeline, so the "report object is the only output" contract holds.
+    $echo = $false
+    if ($null -ne $Config) {
+        if ($Config -is [System.Collections.IDictionary]) {
+            if ($Config.Contains('consoleEcho')) { $echo = [bool]$Config['consoleEcho'] }
+        }
+        elseif ($Config.PSObject.Properties['consoleEcho']) {
+            $echo = [bool]$Config.consoleEcho
+        }
+    }
+    if ($echo) {
+        $color = switch ($Level) {
+            'Warning' { 'Yellow' }
+            'Error'   { 'Red' }
+            'Debug'   { 'DarkGray' }
+            default   { 'Gray' }
+        }
+        Write-Host $lineText -ForegroundColor $color
+    }
+
     return $jsonlPath
 }

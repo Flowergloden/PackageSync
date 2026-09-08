@@ -3,13 +3,17 @@
   Export-OfflineRepo.ps1 - A-side export orchestrator entry point.
 
   Usage:
-    powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-OfflineRepo.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles]
+    powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-OfflineRepo.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles] [-Quiet]
 
   Thin wrapper around Invoke-OSyncExport (src\lib\ExportOrchestrator.ps1):
   imports the module relative to its own location, resolves the default
   config path (<repo>\config\packagesync.json), and maps the report's
   Success flag to the process exit code (0 = full export -> integrity ->
   publish chain OK, 1 = anything else).
+
+  Manual runs echo live progress to the console by default (milestone log
+  lines plus throttled winget download output); -Quiet restores the old
+  silent behavior (log files only).
 
   Registered as the daily 02:00 scheduled task 'PakageSync-Export' by
   src\Register-SyncTasks.ps1 -Role A.
@@ -20,7 +24,10 @@ param(
     [string]$ConfigPath,
 
     [Parameter(Mandatory = $false)]
-    [string]$Category = 'winget,pip,npm,dotfiles'
+    [string]$Category = 'winget,pip,npm,dotfiles',
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,7 +41,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
 
 try {
-    $result = Invoke-OSyncExport -ConfigPath $ConfigPath -Category $Category
+    $result = Invoke-OSyncExport -ConfigPath $ConfigPath -Category $Category -Quiet:$Quiet
     if ($result.success) {
         exit 0
     }
