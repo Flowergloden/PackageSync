@@ -32,6 +32,8 @@ BeforeAll {
     New-Item -ItemType Directory -Path $script:fakeBin -Force | Out-Null
     $fakeNpm = @'
 @echo off
+rem When FAKE_NPM_ARGSLOG is defined, append this invocation's args to it.
+if defined FAKE_NPM_ARGSLOG echo %*>> "%FAKE_NPM_ARGSLOG%"
 echo %* | findstr /C:"engines" >nul
 if not errorlevel 1 goto engines
 echo %* | findstr /C:"version" >nul
@@ -58,6 +60,7 @@ exit /b %FAKE_NPM_EXIT%
         $env:FAKE_NPM_ENGINES = $null
         $env:FAKE_NPM_VERSION = $null
         $env:FAKE_NPM_EXIT = $null
+        $env:FAKE_NPM_ARGSLOG = $null
     }
 
     function New-NeTempFile {
@@ -415,6 +418,115 @@ Describe 'Export-OSyncNpm pin-in-place flow (no server)' {
         catch { $err = $_ }
         $err | Should -Not -BeNullOrEmpty
         $err.Exception.Message | Should -BeLike '*no *OpenJS.NodeJS*entry*'
+    }
+}
+
+Describe 'Export-OSyncNpm with a UNC staging root (no server)' {
+    BeforeEach { Reset-NewFakeEnv }
+
+    # The UNC-looking stagingRoot ('\\fake-share\osync-staging') is NEVER
+    # created on disk - only the LOCAL temp paths get exercised. FAKE_NPM_EXIT
+    # makes the fake npm abort the verdaccio install, so the export throws
+    # right after the install attempt (before any server/UNC-side write) and
+    # the recorded npm args prove the --prefix was local.
+    It 'installs the one-shot verdaccio with a LOCAL --prefix when stagingRoot is a UNC path' {
+        $env:FAKE_NPM_ENGINES = '{"node":">=22"}'
+        $env:FAKE_NPM_EXIT = '1'
+        $argsLog = Join-Path $script:neRoot 'unc-export\npm-args.log'
+        $env:FAKE_NPM_ARGSLOG = $argsLog
+        $npmList = New-NeTempFile -Name 'unc-export\npm-list.txt' -Content 'is-odd@3.0.1'
+        $runtime = New-NeTempFile -Name 'unc-export\runtime-winget.txt' -Content "OpenJS.NodeJS.LTS@24.19.0`n"
+        $cfg = New-NeConfig -VerdaccioVersion '6.10.2' -NpmListPath $npmList `
+            -RuntimeWhitelistPath $runtime -RepoRoot (Join-Path $script:neRoot 'unc-export\repo') `
+            -StagingRoot '\\fake-share\osync-staging'
+
+        $err = $null
+        try { Export-OSyncNpm -Config $cfg -StagingDir (Join-Path $script:neRoot 'unc-export\gen1') | Out-Null }
+        catch { $err = $_ }
+
+        # The fake npm failed the verdaccio install - the export must have
+        # aborted right there, before starting any server.
+        $err | Should -Not -BeNullOrEmpty
+        $err.Exception.Message | Should -BeLike '*npm install verdaccio@6.10.2*failed*'
+
+        # The failed invocation was the tool install; its --prefix must be a
+        # LOCAL temp path, never a UNC one (npm arborist 'realpathCached'
+        # infinitely recurses on UNC prefixes).
+        $installLine = @(Get-Content -LiteralPath $argsLog -ErrorAction Stop |
+            Where-Object { $_ -like 'install --prefix*' } | Select-Object -Last 1)
+        $installLine.Count | Should -Be 1
+        $prefix = [regex]::Match($installLine[0], 'install --prefix\s+(\S+)').Groups[1].Value
+        $prefix | Should -Not -Be ''
+        $prefix | Should -Not -Match '^\\\\'
+        $prefix.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase) | Should -Be $true
+    }
+
+    It 'resolves PIN-ME and still installs with a LOCAL --prefix under a UNC stagingRoot' {
+        $env:FAKE_NPM_VERSION = '6.10.2'
+        $env:FAKE_NPM_ENGINES = '{"node":">=22"}'
+        # FAKE_NPM_EXIT intentionally left undefined: the version-view call
+        # then exits 0 while the install call exits 1 (last findstr missed) -
+        # same abort-after-install semantics as the existing pin-in-place test.
+        $argsLog = Join-Path $script:neRoot 'unc-export2\npm-args.log'
+        $env:FAKE_NPM_ARGSLOG = $argsLog
+        $cfgPath = New-NeTempFile -Name 'unc-export2\config.json' -Content (New-NeConfigJson 'PIN-ME')
+        $npmList = New-NeTempFile -Name 'unc-export2\npm-list.txt' -Content 'is-odd@3.0.1'
+        $runtime = New-NeTempFile -Name 'unc-export2\runtime-winget.txt' -Content "OpenJS.NodeJS.LTS@24.19.0`n"
+        $cfg = New-NeConfig -VerdaccioVersion 'PIN-ME' -NpmListPath $npmList `
+            -RuntimeWhitelistPath $runtime -RepoRoot (Join-Path $script:neRoot 'unc-export2\repo') `
+            -StagingRoot '\\fake-share\osync-staging'
+
+        $err = $null
+        try { Export-OSyncNpm -Config $cfg -StagingDir (Join-Path $script:neRoot 'unc-export2\gen1') -ConfigPath $cfgPath | Out-Null }
+        catch { $err = $_ }
+
+        # Pin-in-place wrote the resolved version before the install failed.
+        ([System.IO.File]::ReadAllText($cfgPath)) | Should -Match '"verdaccioVersion": "6\.10\.2"'
+        $err | Should -Not -BeNullOrEmpty
+
+        $installLine = @(Get-Content -LiteralPath $argsLog -ErrorAction Stop |
+            Where-Object { $_ -like 'install --prefix*' } | Select-Object -Last 1)
+        $installLine.Count | Should -Be 1
+        $prefix = [regex]::Match($installLine[0], 'install --prefix\s+(\S+)').Groups[1].Value
+        $prefix | Should -Not -Match '^\\\\'
+        $prefix.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase) | Should -Be $true
+    }
+}
+
+Describe 'Get-ONpmExportLocalWorkRoot (npm scratch path selection)' {
+    # Both npm-touching call sites of Export-OSyncNpm (the verdaccio install
+    # and the warm-up installs/cache) place their --prefix/--cache dirs under
+    # this root, so a local result here means every npm prefix stays local
+    # even when stagingRoot is UNC (not reachable in a no-server unit test).
+    # The helper is module-internal (OfflineSync.psm1 only exports *-OSync*
+    # functions), so it is reached via InModuleScope - the same scope from
+    # which Export-OSyncNpm calls it.
+    It 'returns a fresh non-UNC path under the OS temp dir' {
+        $root = InModuleScope OfflineSync { Get-ONpmExportLocalWorkRoot }
+        try {
+            $root | Should -Not -BeNullOrEmpty
+            $root | Should -Not -Match '^\\\\'
+            $root | Should -BeLike ('{0}*' -f [System.IO.Path]::GetTempPath())
+            $root | Should -BeLike '*osync-npm-export-*'
+            Test-Path -LiteralPath $root -PathType Container | Should -Be $true
+        }
+        finally {
+            if (Test-Path -LiteralPath $root -PathType Container) {
+                Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    It 'returns a distinct root on every call' {
+        $a = InModuleScope OfflineSync { Get-ONpmExportLocalWorkRoot }
+        $b = InModuleScope OfflineSync { Get-ONpmExportLocalWorkRoot }
+        try {
+            $a | Should -Not -Be $b
+        }
+        finally {
+            Remove-Item -LiteralPath $a -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $b -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 

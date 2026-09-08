@@ -9,17 +9,21 @@
     1. Version pinning (pin-in-place, Oracle m4): when config.pins.npm.verdaccioVersion
        is 'PIN-ME', the real latest version is resolved via `npm view verdaccio version`
        (A has internet) and written back into the config file before it is used.
-    2. `npm install --prefix <stagingRoot>\.verdaccio-a verdaccio@<pinned>`.
-    3. Generates verdaccio-a.yml next to that install (NOT under <staging>\npm, so the
-       A-side-only config never ships to B): storage -> <staging>\npm\storage, uplink
-       npmjs (https://registry.npmjs.org), listen 127.0.0.1:<npm.aVerdaccioPort>.
-    4. Starts the one-shot instance, waits for the port to LISTEN (30 s timeout), then
-       for every entry of the npm package list runs
-       `npm install <name@ver> --registry http://127.0.0.1:<aPort> --prefix <temp dir>`
-       with a FRESH --cache per export (so every tarball is really pulled through the
-       one-shot registry into storage). The server is then stopped in a finally block
-       so the snapshot is guaranteed still - we never reuse an operator's daily
-       Verdaccio (Metis m7).
+     2. `npm install --prefix <local scratch>\verdaccio-a verdaccio@<pinned>` with a
+        LOCAL prefix - npm's arborist 'realpathCached' infinitely recurses on UNC
+        prefixes (RangeError: Maximum call stack size exceeded) - and the finished
+        tool dir is robocopy-mirrored to <stagingRoot>\.verdaccio-a after the stop.
+     3. Generates verdaccio-a.yml next to that (local) install (NOT under
+        <staging>\npm, so the A-side-only config never ships to B): storage ->
+        <staging>\npm\storage, uplink npmjs (https://registry.npmjs.org), listen
+        127.0.0.1:<npm.aVerdaccioPort>.
+     4. Starts the one-shot instance from the LOCAL install, waits for the port to
+        LISTEN (30 s timeout), then for every entry of the npm package list runs
+        `npm install <name@ver> --registry http://127.0.0.1:<aPort> --prefix <local temp dir>`
+        with a FRESH --cache per export (so every tarball is really pulled through the
+        one-shot registry into storage). The server is then stopped in a finally block
+        so the snapshot is guaranteed still - we never reuse an operator's daily
+        Verdaccio (Metis m7).
     5. Generates <staging>\npm\verdaccio-b.yml: storage is the RELATIVE path ./storage
        (Verdaccio resolves it against the config file location; the B-side local copy
        uses the same layout, Oracle M5). It MUST NOT contain uplinks/proxy keys,
@@ -591,6 +595,25 @@ function Invoke-ONpmInstall {
     }
 }
 
+function Get-ONpmExportLocalWorkRoot {
+    <#
+      Returns a fresh, already-created LOCAL scratch root for one npm export
+      run (<temp>\osync-npm-export-<guid>). Every path npm itself resolves as
+      a --prefix/--cache target must be local: npm's arborist 'realpathCached'
+      infinitely recurses on UNC prefixes (RangeError: Maximum call stack size
+      exceeded - reproduced with a UNC stagingRoot), so the verdaccio install
+      and the warm-up prefixes live here and the finished artifact is later
+      robocopy-mirrored to the staging location. The caller owns the cleanup
+      (long-path \\?\ delete - npm cache paths exceed MAX_PATH).
+    #>
+    [CmdletBinding()]
+    param()
+
+    $root = Join-Path ([System.IO.Path]::GetTempPath()) ('osync-npm-export-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    return $root
+}
+
 function Export-OSyncNpm {
     [CmdletBinding()]
     param(
@@ -650,26 +673,35 @@ function Export-OSyncNpm {
     }
 
     # --- layout ---
+    # <staging>\npm\storage is where the one-shot Verdaccio writes tarballs
+    # (plain node fs IO to UNC is fine); everything npm resolves as a prefix
+    # or cache target lives in the LOCAL scratch root created in step 2.
     $npmDir = Join-Path $StagingDir 'npm'
     $storageDir = Join-Path $npmDir 'storage'
-    $workDir = Join-Path $npmDir 'work'
-    foreach ($dir in @($npmDir, $storageDir, $workDir)) {
+    foreach ($dir in @($npmDir, $storageDir)) {
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
     }
 
     # --- 2. install the one-shot Verdaccio (A has internet) ---
-    # Lives under <stagingRoot>\.verdaccio-a - OUTSIDE the per-generation
-    # staging dir - so the A-side-only tool and config never ship to B.
+    # The FINAL artifact lives under <stagingRoot>\.verdaccio-a - OUTSIDE the
+    # per-generation staging dir - so the A-side-only tool and config never
+    # ship to B. The npm install itself runs with a LOCAL --prefix: npm's
+    # arborist 'realpathCached' infinitely recurses on UNC prefixes
+    # (RangeError: Maximum call stack size exceeded, reproduced with a UNC
+    # stagingRoot). The staging location is only ever written via robocopy
+    # (plain file IO), after the warm-up has stopped the server.
     $aToolDir = Join-Path $Config.stagingRoot '.verdaccio-a'
+    $localWork = Get-ONpmExportLocalWorkRoot
+    $localToolDir = Join-Path $localWork 'verdaccio-a'
     $npmExe = Get-ONpmExe
     $nodeExe = Get-ONodeExe
     # PS 5.1: same EAP=Stop native-stderr guard as Resolve-OSyncNpmVerdaccioVersion.
     $oldEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $installOut = @(& $npmExe install --prefix $aToolDir "verdaccio@$pinned" --no-audit --no-fund --loglevel error 2>&1)
+        $installOut = @(& $npmExe install --prefix $localToolDir "verdaccio@$pinned" --no-audit --no-fund --loglevel error 2>&1)
     }
     finally {
         $ErrorActionPreference = $oldEap
@@ -678,14 +710,14 @@ function Export-OSyncNpm {
         $tail = ((@($installOut) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 5) -join '; ')
         throw "Export-OSyncNpm: 'npm install verdaccio@$pinned' failed (exit $LASTEXITCODE): $tail"
     }
-    $verdaccioBin = Join-Path $aToolDir 'node_modules\verdaccio\bin\verdaccio'
+    $verdaccioBin = Join-Path $localToolDir 'node_modules\verdaccio\bin\verdaccio'
     if (-not (Test-Path -LiteralPath $verdaccioBin -PathType Leaf)) {
         throw "Export-OSyncNpm: verdaccio entry script not found after install: '$verdaccioBin'."
     }
-    Write-OSyncLog -Category 'npm' -Level Info -Message "verdaccio@$pinned installed at '$aToolDir'." -Config $Config | Out-Null
+    Write-OSyncLog -Category 'npm' -Level Info -Message "verdaccio@$pinned installed into local scratch '$localToolDir' (mirrored to '$aToolDir' after the warm-up)." -Config $Config | Out-Null
 
     # --- 3. verdaccio-a.yml ---
-    $aYamlPath = Join-Path $aToolDir 'verdaccio-a.yml'
+    $aYamlPath = Join-Path $localToolDir 'verdaccio-a.yml'
     $aYaml = New-OSyncVerdaccioAYaml -StorageDir $storageDir -Port $aPort -UplinkUrl 'https://registry.npmjs.org'
     [System.IO.File]::WriteAllText($aYamlPath, $aYaml, (New-Object System.Text.UTF8Encoding($false)))
 
@@ -702,17 +734,17 @@ function Export-OSyncNpm {
     try {
         $server = Start-OVerdaccioProcess -NodeExe $nodeExe -VerdaccioBin $verdaccioBin `
             -ConfigPath $aYamlPath `
-            -StdoutLog (Join-Path $workDir 'verdaccio-a.out.log') `
-            -StderrLog (Join-Path $workDir 'verdaccio-a.err.log')
+            -StdoutLog (Join-Path $localWork 'verdaccio-a.out.log') `
+            -StderrLog (Join-Path $localWork 'verdaccio-a.err.log')
         Write-OSyncLog -Category 'npm' -Level Info -Message "one-shot Verdaccio started (pid $($server.Id)) on 127.0.0.1:$aPort." -Config $Config | Out-Null
 
         if (-not (Wait-OSyncPortListening -Port $aPort -TimeoutSeconds 30)) {
-            $tail = Get-OFileTail -Path (Join-Path $workDir 'verdaccio-a.err.log') -Count 10
+            $tail = Get-OFileTail -Path (Join-Path $localWork 'verdaccio-a.err.log') -Count 10
             $detail = if ($tail.Count -gt 0) { ($tail -join '; ') } else { 'no output captured' }
             throw "Export-OSyncNpm: one-shot Verdaccio did not open port $aPort within 30 s. Diagnostics: $detail"
         }
 
-        $cacheDir = Join-Path $workDir 'npm-cache'
+        $cacheDir = Join-Path $localWork 'npm-cache'
         $registryUrl = "http://127.0.0.1:$aPort"
         $i = 0
         foreach ($entry in $entries) {
@@ -723,7 +755,7 @@ function Export-OSyncNpm {
             else {
                 $entry.Name
             }
-            $installDir = Join-Path $workDir ("install-{0}" -f $i)
+            $installDir = Join-Path $localWork ("install-{0}" -f $i)
             New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 
             Write-OSyncLog -Category 'npm' -Level Info -Message "warming $spec through 127.0.0.1:$aPort ..." -Config $Config | Out-Null
@@ -749,6 +781,15 @@ function Export-OSyncNpm {
         Write-OSyncLog -Category 'npm' -Level Info -Message "one-shot Verdaccio stopped (snapshot still)." -Config $Config | Out-Null
     }
 
+    # --- 4b. publish the local tool install to <stagingRoot>\.verdaccio-a ---
+    # The artifact location ExportOrchestrator's generation pruning never
+    # touches and the e2e npm flow expects (node_modules\verdaccio\bin\verdaccio
+    # + verdaccio-a.yml). It is only ever WRITTEN via robocopy (/MIR implies
+    # /E): the destination becomes exactly the local install incl. the yml, and
+    # no npm invocation ever resolves a UNC prefix.
+    Invoke-OSyncRobocopy -Source $localToolDir -Destination $aToolDir -ExtraArgs @('/MIR') | Out-Null
+    Write-OSyncLog -Category 'npm' -Level Info -Message "verdaccio@$pinned mirrored to '$aToolDir'." -Config $Config | Out-Null
+
     # --- 5. verdaccio-b.yml + packages.txt (delivery contract) ---
     $bYamlPath = Join-Path $npmDir 'verdaccio-b.yml'
     $bYaml = New-OSyncVerdaccioBYaml -Port $bPort
@@ -760,17 +801,17 @@ function Export-OSyncNpm {
         throw "Export-OSyncNpm: verdaccio-b.yml failed the leak assertion - it must not contain uplinks/proxy keys and storage must be the relative path './storage'."
     }
 
-    # --- cleanup of the temp work dir (install scratch + logs) ---
+    # --- cleanup of the LOCAL scratch root (install + warm-up + logs) ---
     # The npm cache uses content-addressed files whose paths exceed MAX_PATH
     # (260 chars); Remove-Item -Recurse fails on them under PS 5.1. Delete via
     # the \\?\ long-path prefix instead (verified on this machine).
-    if (Test-Path -LiteralPath $workDir -PathType Container) {
+    if (Test-Path -LiteralPath $localWork -PathType Container) {
         try {
-            $longPath = '\\?\' + (Resolve-Path -LiteralPath $workDir).Path
+            $longPath = '\\?\' + (Resolve-Path -LiteralPath $localWork).Path
             [System.IO.Directory]::Delete($longPath, $true)
         }
         catch {
-            Write-Warning "Export-OSyncNpm: could not remove work dir '$workDir': $($_.Exception.Message)"
+            Write-Warning "Export-OSyncNpm: could not remove local work dir '$localWork': $($_.Exception.Message)"
         }
     }
 
