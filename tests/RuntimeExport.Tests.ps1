@@ -181,6 +181,8 @@ Describe 'RuntimeExport' {
         New-Item -ItemType Directory -Path $script:fakeBin -Force | Out-Null
         $fakeNpm = @'
 @echo off
+rem When FAKE_NPM_ARGSLOG is defined, append this invocation's args to it.
+if defined FAKE_NPM_ARGSLOG echo %*>> "%FAKE_NPM_ARGSLOG%"
 echo %* | findstr /C:"install" >nul
 if errorlevel 1 exit /b %FAKE_NPM_EXIT%
 for %%A in (%*) do set LAST=%%~A
@@ -598,6 +600,86 @@ exit /b %FAKE_NPM_EXIT%
             $report.runtimeWinget.exported.Count | Should -Be 2
             Test-Path -LiteralPath (Join-Path $staging 'winget\Python.Python.3.12') | Should -BeTrue
             Test-Path -LiteralPath (Join-Path $staging 'winget\OpenJS.NodeJS.LTS') | Should -BeTrue
+        }
+    }
+
+    Context 'Export-OSyncRuntime - portable Verdaccio build dir (local npm prefix)' {
+        # The suite's global BeforeAll does NOT dot-source Config.ps1 (that
+        # is the pre-existing 14-failure baseline). This Context needs
+        # Resolve-OSyncConfigPath to exercise the real export flow, so it is
+        # loaded HERE - scoped to this Context only, the other Contexts stay
+        # untouched.
+        BeforeAll {
+            . (Join-Path $PSScriptRoot '..\src\lib\Config.ps1')
+        }
+
+        # npm's arborist 'realpathCached' infinitely recurses on UNC prefixes
+        # (RangeError: Maximum call stack size exceeded), so the portable
+        # Verdaccio npm install must run with a LOCAL --prefix even when the
+        # staging dir is UNC; <staging>\runtime\verdaccio is only ever written
+        # via robocopy. The build-dir selection is a helper so it can be
+        # unit-tested directly (the full flow cannot reach the npm install
+        # with a fake UNC staging - the earlier appInstaller/winget steps
+        # write into staging).
+        It 'derives the build dir as a fresh non-UNC path under the OS temp dir' {
+            $dir = Get-ORuntimeVerdaccioBuildDir
+            try {
+                $dir | Should -Not -BeNullOrEmpty
+                $dir | Should -Not -Match '^\\\\'
+                $dir | Should -BeLike ('{0}*' -f [System.IO.Path]::GetTempPath())
+                $dir | Should -BeLike '*osync-runtime-verdaccio-*'
+                Test-Path -LiteralPath $dir -PathType Container | Should -BeTrue
+            }
+            finally {
+                if (Test-Path -LiteralPath $dir -PathType Container) {
+                    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        It 'returns a distinct build dir on every call' {
+            $a = Get-ORuntimeVerdaccioBuildDir
+            $b = Get-ORuntimeVerdaccioBuildDir
+            try {
+                $a | Should -Not -Be $b
+            }
+            finally {
+                Remove-Item -LiteralPath $a -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $b -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'runs the portable Verdaccio npm install with a LOCAL --prefix (never under staging)' {
+            $argsLogDir = Join-Path $TestDrive 'verdaccio-build'
+            New-Item -ItemType Directory -Path $argsLogDir -Force | Out-Null
+            $argsLog = Join-Path $argsLogDir 'npm-args.log'
+            $env:FAKE_NPM_ARGSLOG = $argsLog
+            try {
+                $staging = Join-Path $TestDrive 'staging-localprefix'
+                $report = Export-OSyncRuntime -Config (New-OTestConfig) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+
+                # The payload still lands at <staging>\runtime\verdaccio via
+                # robocopy, and no build dir remains under staging.
+                $bin = Join-Path $staging 'runtime\verdaccio\node_modules\verdaccio\bin\verdaccio'
+                Test-Path -LiteralPath $bin -PathType Leaf | Should -BeTrue
+                Test-Path -LiteralPath (Join-Path $staging 'runtime\.verdaccio-build') | Should -BeFalse
+                $report.verdaccio.dir | Should -Be (Join-Path $staging 'runtime\verdaccio')
+
+                # The npm invocation's --prefix must be a LOCAL scratch dir:
+                # never under the staging dir (TestDrive itself lives under
+                # %TEMP%, so "under temp" alone would not discriminate).
+                $installLine = @(Get-Content -LiteralPath $argsLog -ErrorAction Stop |
+                    Where-Object { $_ -like 'install *--prefix*' } | Select-Object -Last 1)
+                $installLine.Count | Should -Be 1
+                $prefix = [regex]::Match($installLine[0], '--prefix\s+(\S+)').Groups[1].Value
+                $prefix | Should -Not -Be ''
+                $prefix | Should -Not -Match '^\\\\'
+                $prefix | Should -Not -BeLike ('{0}*' -f $staging)
+                $prefix | Should -BeLike '*osync-runtime-verdaccio-*'
+            }
+            finally {
+                Remove-Item Env:FAKE_NPM_ARGSLOG -ErrorAction SilentlyContinue
+            }
         }
     }
 }

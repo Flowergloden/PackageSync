@@ -50,9 +50,13 @@
        winget category's packages.txt must keep only its own entries
        (todo 13 excludes the runtime IDs from it).
 
-    5. Portable Verdaccio: npm install --prefix <temp build dir>
-       verdaccio@<pins.npm.verdaccioVersion> -> robocopy to
-       <staging>\runtime\verdaccio\ (the build dir is removed afterwards).
+5. Portable Verdaccio: npm install --prefix <LOCAL temp build dir>
+        verdaccio@<pins.npm.verdaccioVersion> -> robocopy to
+        <staging>\runtime\verdaccio\ (the build dir is removed afterwards).
+        The build dir is LOCAL (under %TEMP%): npm's arborist 'realpathCached'
+        infinitely recurses on UNC prefixes (RangeError: Maximum call stack
+        size exceeded) - the staging location is only ever written via
+        robocopy (plain file IO).
        B-side launch entry candidates (layout verified in QA, see learnings):
          primary:  node.exe <dir>\node_modules\verdaccio\bin\verdaccio --config <yml>
          fallback: <dir>\node_modules\.bin\verdaccio.cmd --config <yml>  (.bin shim)
@@ -712,6 +716,25 @@ function Get-ORuntimeNpmExe {
     return $cmd.Source
 }
 
+function Get-ORuntimeVerdaccioBuildDir {
+    <#
+      Returns a fresh, already-created LOCAL scratch dir for the portable
+      Verdaccio npm install (<temp>\osync-runtime-verdaccio-<guid>). npm's
+      arborist 'realpathCached' infinitely recurses on UNC prefixes
+      (RangeError: Maximum call stack size exceeded - reproduced with a UNC
+      stagingRoot), so the --prefix npm sees must be local; the finished
+      build is robocopy-mirrored to <staging>\runtime\verdaccio afterwards.
+      The caller owns the cleanup (long-path \\?\ delete - node_modules
+      paths exceed MAX_PATH).
+    #>
+    [CmdletBinding()]
+    param()
+
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('osync-runtime-verdaccio-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    return $dir
+}
+
 function Invoke-ORuntimeNpmInstall {
     <#
       Runs `npm install verdaccio@<version> --prefix <dir>` with the
@@ -817,7 +840,11 @@ function Export-OSyncRuntime {
     if ([string]::IsNullOrWhiteSpace($verdaccioVersion) -or $verdaccioVersion -eq 'PIN-ME') {
         throw "Export-OSyncRuntime: config key 'pins.npm.verdaccioVersion' must be a pinned x.y.z version (got '$verdaccioVersion')."
     }
-    $buildDir = Join-Path $runtimeDir '.verdaccio-build'
+    # The npm install runs with a LOCAL --prefix: npm's arborist
+    # 'realpathCached' infinitely recurses on UNC prefixes (RangeError:
+    # Maximum call stack size exceeded, reproduced with a UNC stagingRoot).
+    # <staging>\runtime\verdaccio is only ever written via robocopy below.
+    $buildDir = Get-ORuntimeVerdaccioBuildDir
     $verdaccioDir = Join-Path $runtimeDir 'verdaccio'
     $npmExe = Get-ORuntimeNpmExe
     $installResult = Invoke-ORuntimeNpmInstall -NpmExe $npmExe -Version $verdaccioVersion -Prefix $buildDir
@@ -826,7 +853,7 @@ function Export-OSyncRuntime {
         throw "Export-OSyncRuntime: 'npm install verdaccio@$verdaccioVersion' failed (exit $($installResult.ExitCode)): $tail"
     }
     $null = Invoke-OSyncRobocopy -Source $buildDir -Destination $verdaccioDir -ExtraArgs @('/E')
-    # Remove the build dir. node_modules paths can exceed MAX_PATH (260
+    # Remove the LOCAL build dir. node_modules paths can exceed MAX_PATH (260
     # chars); delete via the \\?\ long-path prefix (verified, todo 8).
     if (Test-Path -LiteralPath $buildDir -PathType Container) {
         try {
