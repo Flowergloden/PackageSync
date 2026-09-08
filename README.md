@@ -100,6 +100,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Register-S
 
 ## 四、清单编辑指南
 
+### 4.0 从本机已安装包交互生成清单（Export-Manifests.ps1）
+
+A 端手动运维工具：从本机包管理器采集已安装包（`winget export` / `pip freeze` / `npm ls -g`），在控制台以编号多选方式勾选需要的条目，按**已安装版本钉版**写回对应清单（首建或增补均可）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-Manifests.ps1 [-Category winget,pip,npm]
+```
+
+- 流程：采集已安装包 → 编号多选（`1,3,5-8` / `all` / `none`，回车保持预选）→ 按已装版本钉版回写（winget `Id@version`、pip `name==version`、npm `name@version`）。
+- 既有清单条目默认预选；已安装但不在清单里的条目默认不选；清单里有但本机未安装的条目显示 `(not installed)` 标记。
+- 回写前自动备份为 `<清单>.bak-<yyyyMMddTHHmmssZ>`（UTC）；选中结果与原清单逐行一致时不写不备份。
+- 某类全部不选则该类清单保持原样不动（绝不写空清单）。
+- 需要交互式控制台（计划任务/非交互会话直接报错退出）；仅 A 端使用，不进计划任务。
+
 ### 4.1 winget 白名单（manifests\winget-packages.txt）
 
 每行一个包：`Id` 或 `Id@version`（`#` 注释与空行忽略，自动去重）。
