@@ -77,7 +77,7 @@ Copy-Item -Path C:\OfflineRepo\runtime\tool\* -Destination C:\PakageSync\ -Recur
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Install-OfflineBootstrap.ps1
 ```
 
-   - 引导内容：机器级 VC_redist → App Installer 链（VCLibs/UI.Xaml/msixbundle）→ 本地 HTTP 服务 → winget 方式A 安装 Python/Node → 注册 Verdaccio 常驻任务 → 落位 `C:\PakageSync\`。
+   - 引导内容：机器级 VC_redist → 校验 winget.exe 存在（App Installer 不再由引导安装，现代 Windows 自带）→ 本地 HTTP 服务 → winget 安装 Python/Node → 注册 Verdaccio 常驻任务 → 落位 `C:\PakageSync\`。
    - 完成判断：输出 `SUCCESS (bootstrapped=True ...)` 且 `C:\ProgramData\PakageSync\state\system-state.json` 中 `bootstrapped=true`。
 4. 注册 B 端计划任务：
 
@@ -211,9 +211,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Invoke-Off
 
 ### 5.6 运行时钉版重钉流程（PIN-ME）
 
-chezmoi 与 App Installer 四件套（msixbundle/VCLibs/UI.Xaml/VC_redist）都靠 config `pins.*.sha256` 哈希校验：
+chezmoi 与 VC_redist（App Installer 链不再导出/安装，见 3.2）都靠 config `pins.*.sha256` 哈希校验：
 
-1. 把对应 `XxxSha256`（App Installer 四件）或 `sha256`（chezmoi）置为 `"PIN-ME"`。
+1. 把对应 `XxxSha256`（VC_redist 单件）或 `sha256`（chezmoi）置为 `"PIN-ME"`。
 2. 重跑 A 端导出 → 下载真实文件、打印实际 sha256 并**非零退出**（提示钉入）。
 3. 把打印的 64 位 hex 写回 config 对应键。
 4. 重跑导出 → 哈希校验通过后正常继续（文件已下载，不重复下载）。
@@ -251,7 +251,7 @@ winget 类别在两端各有一层增量跳过，**信任根链（index.json →
 ## 六、已知限制
 
 1. **L1. winget 包依赖离线解析仅经合成 fixture 验证**：`Dependencies` 子目录依赖的端到端离线解析只用合成清单 fixture 覆盖，未经真实复杂依赖包实测（真实 7zip 无依赖，未出现 `Dependencies\` 目录）。
-2. **L2. SYSTEM 上下文需机器级 VC_redist**：Appx 版 VCLibs 不覆盖 SYSTEM；SYSTEM 计划任务运行 winget 的前提是机器级 VC++ 运行库（bootstrap 步骤⓪在 App Installer 链之前静默安装）。
+2. **L2. SYSTEM 上下文需机器级 VC_redist**：SYSTEM 计划任务运行 winget 的前提是机器级 VC++ 运行库（bootstrap 步骤⓪静默安装 VC_redist；Appx 版 VCLibs 已随 App Installer 安装链移除而不再相关）。
 3. **L3. LocalManifestFiles 为 per-user 设置**：bootstrap 按**双上下文分别启用**（管理员 + 一次性 SYSTEM 任务）。winget v1.29.290 上它位于 `C:\ProgramData\Microsoft\WinGet\<SID>\settings\pkg\Microsoft.DesktopAppInstaller\admin_settings`（哈希保护文件，用 `winget settings export` 查看/备份）；SYSTEM 上下文路径不同：`C:\ProgramData\Microsoft\WinGet\S-1-5-18\settings\win\defaultState\admin_settings`——两处均以首次真实安装验证生效。
 4. **L4. winget 版 Python 的 PATH 注册由 bootstrap 步骤③显式验证**：装后重读 machine PATH 验证 python.exe 可解析并记录，失败即明确报错（提示 bootstrap 未完成），绝不静默。
 5. **L5. 离线 B 上 winget source 更新超时只记日志**：`winget install` 的 source 自动更新失败仅记日志，不阻断安装。
@@ -260,14 +260,14 @@ winget 类别在两端各有一层增量跳过，**信任根链（index.json →
 8. **L8. B 端 `C:\PakageSync\config` 归本地所有**：自刷新永不覆盖它；A 侧 config schema 变更需人工合并。
 9. **L9. chezmoi 首轮语义**：首轮无基线时，预存且内容与源不同的文件一律视为本地改动，**保守跳过并报告**，绝不覆盖。
 10. **L10. 升级运行时钉版后 B 须手动重跑 bootstrap**：Python/Node/Verdaccio/chezmoi 版本升级后手动重跑（幂等）；此外 packages 任务有内容漂移自愈兜底——`runtimeWingetHash`/`runtimeFilesHash` 相对 system-state 记录漂移时自动重跑 bootstrap ③④（SYSTEM 自愈路径见 L13）。
-11. **L11. App Installer 三件套真实安装链在 A 机不可执行**：A 上只能静态校验（解包读 AppxManifest 依赖版本与 VCLibs/UI.Xaml 比对）；**B 端首次安装即首次真实测试**。
+11. **L11. App Installer 安装链已移除（2026-09 决策）**：bootstrap 不再安装 msixbundle/VCLibs/UI.Xaml（现代 Windows 自带 App Installer/winget），步骤①仅校验 winget.exe 存在；原「三件套真实安装链在 A 机不可执行」的限制随移除而关闭。
 12. **L12. B 端首次引导必须先手工复制 runtime\tool**：`Copy-Item C:\OfflineRepo\runtime\tool\* C:\PakageSync\` 后再从本地副本运行 bootstrap（见 3.2 / 5.7）。
 13. **L13. SYSTEM 自愈 bootstrap 路径未经完整 QA**：该自动路径仅作自愈兜底，QA 不覆盖完整链；失败不阻断完成判定（手动 bootstrap 仍是受支持路径）。
-14. **L14.（todo-10 QA）App Installer 依赖版本缺口**：aka.ms 钉定的 VCLibs（14.0.33321.0）**旧于** App Installer 1.29.290 的 bundle 需求（14.0.33728.0），且 UI.Xaml 2.8 已不是当前 bundle 依赖（改为 WindowsAppRuntime 1.8）；Windows 10/11 一般自带 VCLibs，但**全新 B 上钉定 VCLibs 可能不满足 bundle**——若 B 安装失败请换新 URL 重钉（PIN-ME 流程见 5.6）。
+14. **L14.（todo-10 QA）App Installer 依赖版本缺口：已随安装链移除而解决（2026-09 决策）**：原缺口是钉定 VCLibs（14.0.33321.0）旧于 App Installer 1.29.290 的 bundle 需求（14.0.33728.0），且 UI.Xaml 2.8 已不是当前 bundle 依赖（改为 WindowsAppRuntime 1.8）；bootstrap 不再安装这些件，WindowsAppRuntime 依赖缺口不再相关——B 端仅要求系统自带 winget.exe。
 15. **L15.（todo-13 QA）`winget install --manifest <dir>` 拒绝非 YAML 文件/子目录**：winget 会把目录里每个文件当清单解析，二进制安装器会触发 `0x8a150004`；工具在 apply/bootstrap 前把每个包 staging 成**纯清单扁平目录**（只含 `*.yaml`）再传 `--manifest`，安装器保留在工作副本供本地 HTTP 服务读取（本限制仅在相关报错排查时涉及）。
 
 
 16. **L16. Node MSI 同名修复限制（todo-20 QA）**：导出会把安装器改名为 YAML 主干名（如 Node.js_26.7.0_Machine_X64_wix_zh-CN.msi）；实测该改名后的 Node MSI 在"同版本已装"的修复路径上以 1603 失败（Wix4RollbackInternetShortcuts 动作返回 3），原名（node-v26.7.0-x64.msi）则成功——B 端首次引导（全新安装）预期不受影响（失败动作仅在修复/卸载序列运行），但 B 端对已装 Node 的重复引导会命中同一 1603，属部署期验证项。
-17. **L17. SYSTEM 自愈 bootstrap 幂等冒烟在 A 机 QA 中失败（todo-20）**：临时 SYSTEM 任务重跑 bootstrap 在步骤 1 失败（Add-AppxPackage 在 SYSTEM 上下文被拒，0x80073CF9——本地系统账户不允许执行部署 Add 操作）；该自动路径仍仅作自愈兜底，手动 bootstrap 是受支持路径（详见 task-20 evidence）。
+17. **L17. SYSTEM 自愈 bootstrap 幂等冒烟在 A 机 QA 中失败（todo-20）**：临时 SYSTEM 任务重跑 bootstrap 在步骤 1 失败（旧版 Add-AppxPackage 在 SYSTEM 上下文被拒，0x80073CF9——本地系统账户不允许执行部署 Add 操作；步骤①已改为仅检测 winget.exe，不再执行 Add-AppxPackage）；该自动路径仍仅作自愈兜底，手动 bootstrap 是受支持路径（详见 task-20 evidence）。
 18. **L18. SYSTEM 上下文 winget 安装失败（todo-20 QA 结论）**：A 机上 SYSTEM 主体执行 winget install --manifest 在"Starting package install..."处挂起（未生成 msiexec、无安装日志；直接 msiexec 在 SYSTEM 下可正常安装，挂起点在 winget 的安装器执行环节）——SYSTEM 主体 apply 路径在本机不可用，降级路径 Register-SyncTasks -Role B -PackagesTaskPrincipal User（管理员账户 S4U/Highest）实测可用；真实 B 机若 SYSTEM 安装同样挂起，请使用 User 降级注册（README 3.3）。
 19. **L19. 离线模拟限制（todo-20 QA）**：A 机上 winget.exe 为打包应用（App Installer），其流量豁免 Windows 防火墙规则（程序/端口/全协议规则均实测无效），且 winget source update 对抓取失败吞错返回 0——离线 source 更新失败场景无法在 A 机复现；manifest 安装路径已实测不依赖 source 连通性（安装日志无 source 活动，仅需 loopback HTTP），真实离线 B 的 source 更新行为仍属部署期验证项。

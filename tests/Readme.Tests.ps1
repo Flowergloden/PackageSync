@@ -54,10 +54,10 @@ Describe 'README.md mandatory sections (plan todo 19)' {
             'L8. B 端 `C:\PakageSync\config` 归本地所有',
             'L9. chezmoi 首轮语义',
             'L10. 升级运行时钉版后 B 须手动重跑 bootstrap',
-            'L11. App Installer 三件套真实安装链在 A 机不可执行',
+            'L11. App Installer 安装链已移除（2026-09 决策）',
             'L12. B 端首次引导必须先手工复制 runtime\tool',
             'L13. SYSTEM 自愈 bootstrap 路径未经完整 QA',
-            'L14.（todo-10 QA）App Installer 依赖版本缺口',
+            'L14.（todo-10 QA）App Installer 依赖版本缺口：已随安装链移除而解决（2026-09 决策）',
             'L15.（todo-13 QA）`winget install --manifest <dir>` 拒绝非 YAML 文件/子目录'
         )
     }
