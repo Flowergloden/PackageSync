@@ -218,9 +218,35 @@ function Test-OSyncTrustedDirOwner {
 function Invoke-OSyncBootstrapGrantAcl {
     # Applies the fixed per-role grants to a directory using SID-based icacls
     # (localization-proof). 0x1200a9 = (OI)(CI)RX, 0x1200bf = (OI)(CI)M.
+    #
+    # VERIFICATION (B-side incident 2026-09 - a non-elevated bootstrap
+    # reached work-copy creation): icacls can return exit code 0 while STILL
+    # printing "Access is denied" when the process lacks the rights to change
+    # the DACL. The old code discarded both invocations' output and trusted
+    # only $LASTEXITCODE of the SECOND call, so a non-elevated run "passed"
+    # step 5's ACL hardening and later died at New-Item with a misleading
+    # "Access to the path ... is denied". Hardening is now triple-checked:
+    #   (1) BOTH icacls invocations (/reset then /grant:r) are captured with
+    #       their own exit codes - a non-zero exit from EITHER is a failure;
+    #   (2) the combined output is scanned for failure indicators ('denied',
+    #       '拒绝', 'Failed processing') - icacls reports such errors even
+    #       when its exit code is 0;
+    #   (3) after the grants the ACL is READ BACK (Get-Acl) and the expected
+    #       principals are verified to actually hold the expected rights for
+    #       the policy (SYSTEM/Administrators FullControl-or-Modify per
+    #       policy, Users presence per policy).
+    # Any check that fails throws with the directory, the icacls exit codes
+    # and a hint that the process is probably not elevated.
     param(
         [Parameter(Mandatory = $true)][string]$Dir,
-        [Parameter(Mandatory = $true)][ValidateSet('SystemAdminsRead', 'UsersModify', 'SystemAdminsRWUsersRX')][string]$Policy
+        [Parameter(Mandatory = $true)][ValidateSet('SystemAdminsRead', 'UsersModify', 'SystemAdminsRWUsersRX')][string]$Policy,
+        # Test seams (production uses the defaults - real icacls.exe + real
+        # Get-Acl read-back): a QA run injects fakes so the failure / denial
+        # / read-back paths can be exercised WITHOUT elevation or a real
+        # hardened ACL (same injectable-parameter style as $VcRedistExe /
+        # $VcRuntimePresent / $LandingRoot elsewhere in this file).
+        [Parameter(Mandatory = $false)][scriptblock]$IcaclsInvoker = $null,
+        [Parameter(Mandatory = $false)][scriptblock]$AclVerifier = $null
     )
     $sids = @('*S-1-5-18', '*S-1-5-32-544')   # SYSTEM, Administrators
     $users = '*S-1-5-32-545'                    # Users
@@ -234,14 +260,67 @@ function Invoke-OSyncBootstrapGrantAcl {
     # apply the explicit grants. /grant:r replaces, so re-running is a no-op.
     $oldEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    $codeReset = 0
+    $codeGrant = 0
+    $out = @()
     try {
-        $null = @(& icacls.exe $Dir /reset 2>&1)
-        $null = @(& icacls.exe @argsList 2>&1)
-        $code = $LASTEXITCODE
+        if ($null -ne $IcaclsInvoker) {
+            # Test seam: the fake owns the whole icacls phase and controls
+            # $LASTEXITCODE (both phases share its single exit code).
+            $out = @(& $IcaclsInvoker $Dir $Policy 2>&1)
+            $codeReset = $LASTEXITCODE
+            $codeGrant = $LASTEXITCODE
+        }
+        else {
+            $outReset = @(& icacls.exe $Dir /reset 2>&1)
+            $codeReset = $LASTEXITCODE
+            $outGrant = @(& icacls.exe @argsList 2>&1)
+            $codeGrant = $LASTEXITCODE
+            $out = @($outReset) + @($outGrant)
+        }
     }
     finally { $ErrorActionPreference = $oldEap }
-    if ($code -ne 0) {
-        throw "Bootstrap.ps1: icacls failed (exit $code) hardening '$Dir'."
+
+    $code = if ($codeReset -ne 0) { $codeReset } else { $codeGrant }
+    $text = ($out -join "`n")
+    if ($code -ne 0 -or $text -match 'denied|拒绝|Failed processing') {
+        throw ("Bootstrap.ps1: icacls hardening of '{0}' FAILED (reset exit {1}, grant exit {2}): {3} - the process is probably not elevated; re-run from an elevated prompt." -f $Dir, $codeReset, $codeGrant, ([string]($text.Trim())))
+    }
+
+    # Read the ACL back and verify the principals actually hold the expected
+    # rights for the policy (B-side incident 2026-09 hardening).
+    if ($null -ne $AclVerifier) {
+        # Test seam: the fake decides pass/fail by throwing (it replaces the
+        # real Get-Acl read-back, which needs a real hardened ACL).
+        & $AclVerifier $Dir $Policy
+        return
+    }
+    $expected = switch ($Policy) {
+        'SystemAdminsRead'     { @{ 'S-1-5-18' = 'FullControl'; 'S-1-5-32-544' = 'FullControl'; 'S-1-5-32-545' = 'ReadAndExecute' } }
+        'UsersModify'          { @{ 'S-1-5-18' = 'Modify'; 'S-1-5-32-544' = 'Modify'; 'S-1-5-32-545' = 'Modify' } }
+        'SystemAdminsRWUsersRX'{ @{ 'S-1-5-18' = 'Modify'; 'S-1-5-32-544' = 'Modify'; 'S-1-5-32-545' = 'ReadAndExecute' } }
+    }
+    $acl = $null
+    try { $acl = Get-Acl -LiteralPath $Dir -ErrorAction Stop } catch { $acl = $null }
+    if ($null -eq $acl) {
+        throw ("Bootstrap.ps1: ACL read-back for '{0}' (policy '{1}') could not be read - the directory may not exist or the process is probably not elevated." -f $Dir, $Policy)
+    }
+    $missing = @()
+    foreach ($sid in $expected.Keys) {
+        $requiredRights = [System.Security.AccessControl.FileSystemRights]$expected[$sid]
+        $held = [System.Security.AccessControl.FileSystemRights]0
+        foreach ($rule in $acl.Access) {
+            if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+            $ruleSid = $null
+            try { $ruleSid = ([System.Security.Principal.SecurityIdentifier]$rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])).Value } catch { }
+            if ($ruleSid -eq $sid) { $held = $held -bor $rule.FileSystemRights }
+        }
+        if (($held -band $requiredRights) -ne $requiredRights) {
+            $missing += ("SID {0} missing {1} (held: {2})" -f $sid, $expected[$sid], $held)
+        }
+    }
+    if ($missing.Count -gt 0) {
+        throw ("Bootstrap.ps1: ACL read-back verification FAILED for '{0}' (policy '{1}', icacls reset exit {2}, grant exit {3}): {4} - the process is probably not elevated; re-run from an elevated prompt." -f $Dir, $Policy, $codeReset, $codeGrant, ($missing -join '; '))
     }
 }
 
@@ -1298,6 +1377,13 @@ function Invoke-OSyncBootstrap {
         WhatIf        = [bool]$WhatIf
     }
 
+    # The per-step log is initialized BEFORE the try so a catch can always
+    # report the real last step. B-side incident 2026-09: the entry script's
+    # 'FAILED (step ...)' printed '' because $result.Steps was only assigned
+    # on the success path - the steps that completed before a failure were
+    # lost, so the operator could not see where the bootstrap actually died.
+    $steps = @()
+
     try {
         if ($Config.role -ne 'B') {
             throw "Install-OfflineBootstrap: config role must be 'B' (got '$($Config.role)') - the bootstrap is a B-side operation."
@@ -1316,8 +1402,6 @@ function Invoke-OSyncBootstrap {
         if (-not $WhatIf) {
             New-OSyncStateDirSkeleton -Config $Config
         }
-
-        $steps = @()
 
         # Step 5 (stateDir layout + ACLs) runs FIRST, before every other
         # step: the work copy lives under <stateDir>\work, and step 2 places
@@ -1421,6 +1505,11 @@ function Invoke-OSyncBootstrap {
         $result.Success = $false
         $result.Bootstrapped = $false
         $result.Error = $_.Exception.Message
+        # Preserve the steps that completed before the failure so the entry
+        # script's 'FAILED (step ...)' names the REAL last step (B-side
+        # incident 2026-09: it used to print '' because $result.Steps was
+        # only assigned on the success path).
+        $result.Steps = $steps
         Write-OSyncLog -Category 'bootstrap' -Level Error -Message ("bootstrap FAILED: {0}" -f $result.Error) -Config $Config | Out-Null
         return $result
     }

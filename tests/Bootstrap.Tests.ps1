@@ -762,6 +762,96 @@ Describe 'Bootstrap: step 5 - stateDir layout and ACLs' {
     }
 }
 
+Describe 'Bootstrap: GrantAcl hardening verification (B-side incident 2026-09)' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Bootstrap.ps1')
+
+        # Read-back seam that passes: the real read-back needs a real hardened
+        # ACL, which unit tests cannot rely on under $TestDrive, so the pure
+        # icacls tests stub it (production default = real Get-Acl).
+        $script:PassAcl = { param($Dir, $Policy) }
+    }
+
+    It 'throws when icacls exits non-zero' {
+        $dir = Join-Path $TestDrive 'ga1'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        # -IcaclsInvoker seam: emits output and sets $LASTEXITCODE via
+        # cmd.exe /c exit N (no .cmd echo / codepage pitfalls, CJK-safe).
+        $invoker = { param($Dir, $Policy) 'A real failure happened.'; & cmd.exe /c exit 5 }
+
+        $err = $null
+        try { Invoke-OSyncBootstrapGrantAcl -Dir $dir -Policy 'SystemAdminsRead' -IcaclsInvoker $invoker | Out-Null } catch { $err = $_.Exception.Message }
+        $err | Should -Not -BeNullOrEmpty
+        $err | Should -BeLike "*$dir*"
+        $err | Should -BeLike '*not elevated*'
+    }
+
+    It 'throws when icacls returns 0 but the output contains "Access is denied" (B-side incident)' {
+        $dir = Join-Path $TestDrive 'ga2'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $invoker = { param($Dir, $Policy) 'Access is denied.'; & cmd.exe /c exit 0 }
+
+        $err = $null
+        try { Invoke-OSyncBootstrapGrantAcl -Dir $dir -Policy 'SystemAdminsRead' -IcaclsInvoker $invoker | Out-Null } catch { $err = $_.Exception.Message }
+        $err | Should -Not -BeNullOrEmpty
+        $err | Should -BeLike '*denied*'
+        $err | Should -BeLike '*not elevated*'
+    }
+
+    It 'throws when icacls output contains the localized Chinese denial text' {
+        $dir = Join-Path $TestDrive 'ga3'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $invoker = { param($Dir, $Policy) '拒绝访问。'; & cmd.exe /c exit 0 }
+
+        $err = $null
+        try { Invoke-OSyncBootstrapGrantAcl -Dir $dir -Policy 'UsersModify' -IcaclsInvoker $invoker | Out-Null } catch { $err = $_.Exception.Message }
+        $err | Should -Not -BeNullOrEmpty
+        $err | Should -BeLike '*not elevated*'
+    }
+
+    It 'passes when icacls is clean and the read-back seam passes' {
+        $dir = Join-Path $TestDrive 'ga4'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $invoker = { param($Dir, $Policy) 'Successfully processed 1 files.'; & cmd.exe /c exit 0 }
+
+        { Invoke-OSyncBootstrapGrantAcl -Dir $dir -Policy 'SystemAdminsRWUsersRX' -IcaclsInvoker $invoker -AclVerifier $script:PassAcl } | Should -Not -Throw
+    }
+
+    It 'real read-back passes when the directory actually holds the expected grants' {
+        $dir = Join-Path $TestDrive 'rb-ok'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        # Harden the dir for real with the SystemAdminsRead policy. This works
+        # non-elevated because the test process owns the dir (WRITE_DAC), and
+        # it lets the PRODUCTION Get-Acl read-back be exercised for real.
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $null = @(& icacls.exe $dir /inheritance:r "/grant:r" "*S-1-5-18:(OI)(CI)F" "/grant:r" "*S-1-5-32-544:(OI)(CI)F" "/grant:r" "*S-1-5-32-545:(OI)(CI)RX" 2>&1)
+        $ErrorActionPreference = $old
+        $invoker = { param($Dir, $Policy) 'Successfully processed 1 files.'; & cmd.exe /c exit 0 }
+
+        { Invoke-OSyncBootstrapGrantAcl -Dir $dir -Policy 'SystemAdminsRead' -IcaclsInvoker $invoker } | Should -Not -Throw
+    }
+
+    It 'real read-back throws when the directory does NOT hold the expected grants' {
+        $dir = Join-Path $TestDrive 'rb-bad'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        # Harden with Users granted R (read) but NOT RX: SystemAdminsRead
+        # requires ReadAndExecute (incl. ExecuteFile), so the real read-back
+        # must catch the gap. Users keep list access, so TestDrive cleanup
+        # (AfterAll re-grant) still works.
+        $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $null = @(& icacls.exe $dir /inheritance:r "/grant:r" "*S-1-5-18:(OI)(CI)F" "/grant:r" "*S-1-5-32-544:(OI)(CI)F" "/grant:r" "*S-1-5-32-545:(OI)(CI)R" 2>&1)
+        $ErrorActionPreference = $old
+        $invoker = { param($Dir, $Policy) 'Successfully processed 1 files.'; & cmd.exe /c exit 0 }
+
+        $err = $null
+        try { Invoke-OSyncBootstrapGrantAcl -Dir $dir -Policy 'SystemAdminsRead' -IcaclsInvoker $invoker | Out-Null } catch { $err = $_.Exception.Message }
+        $err | Should -Not -BeNullOrEmpty
+        $err | Should -BeLike "*$dir*"
+        $err | Should -BeLike '*probably not elevated*'
+    }
+}
+
 Describe 'Bootstrap: step 6 - tool landing (hermetic mocks, never touches C:\PakageSync)' {
     BeforeAll {
         . (Join-Path $PSScriptRoot '..\src\lib\RepoContract.ps1')
@@ -1006,6 +1096,28 @@ Describe 'Bootstrap: step 7 + orchestration invariants' {
         $state.bootstrapped | Should -Be $false
     }
 
+    It 'orchestration: a forced failure after step 5 still leaves Steps populated (real last step reported)' {
+        # B-side incident 2026-09: the entry script's 'FAILED (step ...)'
+        # printed '' because $result.Steps was only assigned on the success
+        # path. After a failure the catch must expose the steps that already
+        # completed so the last step name is the REAL one.
+        $repo = Join-Path $TestDrive 'repo-steps'
+        & $script:NewRepo $repo
+        $stateDir = Join-Path $TestDrive 'os-steps'
+        $cfg = & $script:NewConfig $stateDir
+        $cfg.repoRoot = $repo
+        $cfg.categories.npm = $false
+        & $script:MockAllSteps
+        Mock Invoke-OSyncBootstrapStepRuntimeWinget { throw 'runtime winget FAILED (mocked)' }
+
+        $result = Invoke-OSyncBootstrap -Config $cfg -VerdaccioTaskName 'PakageSync-Verdaccio-QA'
+
+        $result.Success | Should -Be $false
+        $result.Steps.Count | Should -BeGreaterThan 0
+        $result.Steps[-1].Step | Should -Not -BeNullOrEmpty
+        $result.Steps[-1].Step | Should -Be '2-localmanifest'
+    }
+
     It 'orchestration: corrupt repository aborts before any step, bootstrapped=false' {
         $repo = Join-Path $TestDrive 'repo-corrupt'
         & $script:NewRepo $repo
@@ -1082,6 +1194,18 @@ Describe 'Bootstrap: apply.lock helpers' {
         Test-OSyncAcquireBootstrapLock -StateDir $stateDir -TimeoutSeconds 1 | Should -Be $false
     }
 }
+
+# NOTE - elevation-gate test exclusion (B-side incident 2026-09): the
+# elevation gate lives in the THIN entry script src\Install-OfflineBootstrap
+# .ps1, NOT in the lib orchestrator this suite tests (it is a 5-line
+# WindowsPrincipal check that exits 1 BEFORE any directory creation, lock
+# acquisition or Invoke-OSyncBootstrap call). Entry scripts are deliberately
+# not unit-tested here - invoking one would import the module, resolve a real
+# config path and take the real apply.lock, none of which is hermetic. That
+# matches the existing precedent: tests\ApplyOrchestrator.Tests.ps1 tests the
+# lib-level orchestrator (Invoke-OSyncApply) and never invokes its entry
+# script either. The lib layer the gate protects (steps, ACL hardening,
+# failure reporting) is fully covered above.
 
 # The real step-5 ACL hardening leaves Users-RX dirs inside TestDrive; the test
 # process (a non-elevated / filtered token) could not remove them, so re-grant
