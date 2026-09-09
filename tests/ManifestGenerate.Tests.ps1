@@ -73,14 +73,8 @@ Describe 'ManifestGenerate' {
                         sha256  = ('a' * 64)
                     }
                     appInstaller = [ordered]@{
-                        msixbundleUrl    = 'https://example.invalid/msixbundle'
-                        msixbundleSha256 = ('b' * 64)
-                        vcLibsUrl        = 'https://example.invalid/vclibs'
-                        vcLibsSha256     = ('c' * 64)
-                        uiXamlUrl        = 'https://example.invalid/uixaml'
-                        uiXamlSha256     = ('d' * 64)
-                        vcRedistUrl      = 'https://example.invalid/vcredist'
-                        vcRedistSha256   = ('e' * 64)
+                        vcRedistUrl    = 'https://example.invalid/vcredist'
+                        vcRedistSha256 = ('e' * 64)
                     }
                     npm = [ordered]@{ verdaccioVersion = '6.10.2' }
                 }

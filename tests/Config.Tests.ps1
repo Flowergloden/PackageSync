@@ -31,8 +31,8 @@ Describe 'OfflineSync config loading (Get-OSyncConfig)' {
             $config | Should -Not -BeNullOrEmpty
             $config.schemaVersion | Should -Be 1
             $config.role | Should -Be 'A'
-            $config.repoRoot | Should -Be 'D:\OfflineRepo'
-            $config.stagingRoot | Should -Be 'D:\PakageSync-staging'
+            $config.repoRoot | Should -Be '\\10.40.28.151\home\OfflineRepo'
+            $config.stagingRoot | Should -Be '\\10.40.28.151\home\PakageSync-staging'
             $config.httpBind | Should -Be '127.0.0.1'
             $config.httpPort | Should -Be 8788
             $config.verdaccioPort | Should -Be 4873
@@ -68,12 +68,12 @@ Describe 'OfflineSync config loading (Get-OSyncConfig)' {
         }
 
         It 'throws when a nested key is missing and the message names the key' {
-            $bad = Join-Path $testRoot 'no-msixbundle.json'
-            New-TestConfig -OutFile $bad -Mutate { param($o) $o.pins.appInstaller.PSObject.Properties.Remove('msixbundleUrl') }
+            $bad = Join-Path $testRoot 'no-vcredist.json'
+            New-TestConfig -OutFile $bad -Mutate { param($o) $o.pins.appInstaller.PSObject.Properties.Remove('vcRedistUrl') }
             $err = $null
             try { Get-OSyncConfig -Path $bad } catch { $err = $_ }
             $err | Should -Not -BeNullOrEmpty
-            $err.Exception.Message | Should -BeLike '*msixbundleUrl*'
+            $err.Exception.Message | Should -BeLike '*vcRedistUrl*'
         }
 
         It 'throws when the role is invalid and the message names the key' {

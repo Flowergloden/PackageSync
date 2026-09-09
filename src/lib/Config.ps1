@@ -81,9 +81,6 @@ function Get-OSyncConfig {
         'paths.wingetWhitelist', 'paths.runtimeWhitelist', 'paths.requirements',
         'paths.npmList', 'paths.dotfilesSource',
         'pins.chezmoi.version', 'pins.chezmoi.url', 'pins.chezmoi.sha256',
-        'pins.appInstaller.msixbundleUrl', 'pins.appInstaller.msixbundleSha256',
-        'pins.appInstaller.vcLibsUrl', 'pins.appInstaller.vcLibsSha256',
-        'pins.appInstaller.uiXamlUrl', 'pins.appInstaller.uiXamlSha256',
         'pins.appInstaller.vcRedistUrl', 'pins.appInstaller.vcRedistSha256',
         'pins.npm.verdaccioVersion'
     )
