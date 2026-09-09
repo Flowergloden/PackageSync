@@ -220,7 +220,7 @@ Describe 'Bootstrap: step 0 - VC++ runtime detection and exit-code policy' {
     }
 }
 
-Describe 'Bootstrap: step 1 - App Installer version gates and winget.exe' {
+Describe 'Bootstrap: step 1 - App Installer detect-only (winget.exe presence)' {
     BeforeAll {
         . (Join-Path $PSScriptRoot '..\src\lib\RepoContract.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
@@ -245,187 +245,45 @@ Describe 'Bootstrap: step 1 - App Installer version gates and winget.exe' {
                 categories = [pscustomobject]@{ winget = $true; pip = $true; npm = $true; dotfiles = $true };
                 winget = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' } }
         }
-
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
-
-        $script:ZipDir = {
-            param([string]$Dir, [string]$ZipPath)
-            if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
-            [System.IO.Compression.ZipFile]::CreateFromDirectory($Dir, $ZipPath)
-        }
-
-        # Appx/bundle with AppxManifest.xml at the zip root.
-        $script:NewAppx = {
-            param([string]$Path, [string]$Name, [string]$Version)
-            $dir = Join-Path $TestDrive ('bld-' + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-            $manifest = "<?xml version=`"1.0`" encoding=`"utf-8`"?>`n<Package xmlns=`"http://schemas.microsoft.com/appx/manifest/foundation/windows10`"><Identity Name=`"$Name`" Version=`"$Version`" Publisher=`"CN=Microsoft`"/></Package>"
-            [System.IO.File]::WriteAllText((Join-Path $dir 'AppxManifest.xml'), $manifest)
-            & $script:ZipDir $dir $Path
-            Remove-Item -LiteralPath $dir -Recurse -Force
-        }
-
-        # A bundle whose manifest lives ONLY inside the inner AppInstaller_x64.msix.
-        $script:NewBundleInner = {
-            param([string]$Path, [string]$Name, [string]$Version)
-            $innerDir = Join-Path $TestDrive ('inner-' + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $innerDir -Force | Out-Null
-            $manifest = "<?xml version=`"1.0`" encoding=`"utf-8`"?>`n<Package xmlns=`"http://schemas.microsoft.com/appx/manifest/foundation/windows10`"><Identity Name=`"$Name`" Version=`"$Version`" Publisher=`"CN=Microsoft`"/></Package>"
-            [System.IO.File]::WriteAllText((Join-Path $innerDir 'AppxManifest.xml'), $manifest)
-            $innerMsix = Join-Path $TestDrive ('inner-' + [guid]::NewGuid().ToString('N') + '.msix')
-            & $script:ZipDir $innerDir $innerMsix
-            Remove-Item -LiteralPath $innerDir -Recurse -Force
-            $bundleDir = Join-Path $TestDrive ('bdl-' + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
-            Copy-Item -LiteralPath $innerMsix -Destination (Join-Path $bundleDir 'AppInstaller_x64.msix')
-            & $script:ZipDir $bundleDir $Path
-            Remove-Item -LiteralPath $bundleDir -Recurse -Force
-            Remove-Item -LiteralPath $innerMsix -Force
-        }
-
-        # Builds a runtime payload dir with the three pieces + files.json.
-        $script:NewPayload = {
-            param([string]$Root, [switch]$InnerBundle)
-            $dir = Join-Path $Root 'runtime\appinstaller'
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-            [System.IO.File]::WriteAllBytes((Join-Path $dir 'VC_redist.x64.exe'), [byte[]]@(1, 2, 3))
-            & $script:NewAppx (Join-Path $dir 'Microsoft.VCLibs.x64.14.00.Desktop.appx') 'Microsoft.VCLibs.140.00.UWPDesktop' '14.0.33321.0'
-            & $script:NewAppx (Join-Path $dir 'Microsoft.UI.Xaml.2.8.appx') 'Microsoft.UI.Xaml.2.8' '8.2310.30001.0'
-            if ($InnerBundle) {
-                & $script:NewBundleInner (Join-Path $dir 'Microsoft.DesktopAppInstaller.msixbundle') 'Microsoft.DesktopAppInstaller' '1.29.290.0'
-            }
-            else {
-                & $script:NewAppx (Join-Path $dir 'Microsoft.DesktopAppInstaller.msixbundle') 'Microsoft.DesktopAppInstaller' '1.29.290.0'
-            }
-            $null = New-OSyncFilesManifest -Dir (Join-Path $Root 'runtime')
-        }
     }
 
-    It 'per-piece version gate skips installed-newer pieces and installs missing ones' {
-        $root = Join-Path $TestDrive 'p1'
-        & $script:NewPayload $root
-        $cfg = & $script:NewConfig (Join-Path $TestDrive 'p1state')
-
-        Mock Get-OSyncInstalledAppxVersion {
-            param($PackageName)
-            if ($PackageName -like '*VCLibs*') { return [version]'14.0.33728.0' }   # OS-shipped newer -> skip
-            if ($PackageName -like '*UI.Xaml*') { return $null }                    # absent -> install
-            if ($PackageName -like '*DesktopAppInstaller*') { return [version]'1.29.290.0' }  # equal -> skip
-            return $null
-        }
-
-        $decisions = @(Get-OSyncAppInstallerDecisions -Config $cfg -Root $root)
-        $decisions.Count | Should -Be 3
-        ($decisions | Where-Object { $_.Piece -eq 'vclibs' }).InstallNeeded | Should -Be $false
-        ($decisions | Where-Object { $_.Piece -eq 'uixaml' }).InstallNeeded | Should -Be $true
-        ($decisions | Where-Object { $_.Piece -eq 'msixbundle' }).InstallNeeded | Should -Be $false
-    }
-
-    It 'parses the bundle version from the inner x64 msix (root-less bundle)' {
-        $root = Join-Path $TestDrive 'p2'
-        & $script:NewPayload $root -InnerBundle
-        $cfg = & $script:NewConfig (Join-Path $TestDrive 'p2state')
-        Mock Get-OSyncInstalledAppxVersion { return $null }
-
-        $decisions = @(Get-OSyncAppInstallerDecisions -Config $cfg -Root $root)
-        $bundle = $decisions | Where-Object { $_.Piece -eq 'msixbundle' }
-        $bundle.PayloadVersion | Should -Be '1.29.290.0'
-        $bundle.InstallNeeded | Should -Be $true
-    }
-
-    It 'throws when a piece sha256 no longer matches files.json' {
-        $root = Join-Path $TestDrive 'p3'
-        & $script:NewPayload $root
-        # Tamper AFTER the manifest was written (garbage bytes -> hash mismatch
-        # is detected before any manifest parse attempt).
-        [System.IO.File]::WriteAllBytes((Join-Path $root 'runtime\appinstaller\Microsoft.UI.Xaml.2.8.appx'), [byte[]]@(9, 9, 9))
-        $cfg = & $script:NewConfig (Join-Path $TestDrive 'p3state')
-
-        $err = $null
-        try { Get-OSyncAppInstallerDecisions -Config $cfg -Root $root | Out-Null } catch { $err = $_.Exception.Message }
-        $err | Should -Not -BeNullOrEmpty
-        $err | Should -BeLike '*sha256 mismatch*'
-    }
-
-    It 'throws when a piece is missing' {
-        $root = Join-Path $TestDrive 'p4'
-        & $script:NewPayload $root
-        Remove-Item -LiteralPath (Join-Path $root 'runtime\appinstaller\Microsoft.VCLibs.x64.14.00.Desktop.appx') -Force
-        $cfg = & $script:NewConfig (Join-Path $TestDrive 'p4state')
-
-        $err = $null
-        try { Get-OSyncAppInstallerDecisions -Config $cfg -Root $root | Out-Null } catch { $err = $_.Exception.Message }
-        $err | Should -Not -BeNullOrEmpty
-        $err | Should -BeLike '*not found*'
-    }
-
-    It 'step 1 installs needed pieces in VCLibs -> UI.Xaml -> msixbundle order and records winget.exe' {
-        $root = Join-Path $TestDrive 'p5'
-        & $script:NewPayload $root
-        $stateDir = Join-Path $TestDrive 'p5state'
+    It 'step 1 records winget.exe into state when resolvable (no pieces installed)' {
+        $stateDir = Join-Path $TestDrive 'p1'
         $cfg = & $script:NewConfig $stateDir
-
-        Mock Get-OSyncInstalledAppxVersion { return $null }   # all three need install
-        $script:addOrder = @()
-        Mock Add-AppxPackage { param($Path) $script:addOrder += $Path }
         Mock Resolve-OSyncWingetExePath { return 'C:\fake\winget.exe' }
 
-        $s = Invoke-OSyncBootstrapStepAppInstaller -Config $cfg -Root $root
+        $s = Invoke-OSyncBootstrapStepAppInstaller -Config $cfg -Root $TestDrive
 
+        $s.Step | Should -Be '1-appinstaller'
         $s.Status | Should -Be 'done'
-        $script:addOrder.Count | Should -Be 3
-        (Split-Path -Leaf $script:addOrder[0]) | Should -Be 'Microsoft.VCLibs.x64.14.00.Desktop.appx'
-        (Split-Path -Leaf $script:addOrder[1]) | Should -Be 'Microsoft.UI.Xaml.2.8.appx'
-        (Split-Path -Leaf $script:addOrder[2]) | Should -Be 'Microsoft.DesktopAppInstaller.msixbundle'
+        $s.Data.WingetExe | Should -Be 'C:\fake\winget.exe'
         $state = Get-OSyncState -Category winget -StateDir $stateDir
         $state.wingetExePath | Should -Be 'C:\fake\winget.exe'
     }
 
-It 'step 1 WhatIf adds nothing and records nothing' {
-        $root = Join-Path $TestDrive 'p6'
-        & $script:NewPayload $root
-        $stateDir = Join-Path $TestDrive 'p6state'
+    It 'step 1 WhatIf resolves nothing and records nothing' {
+        $stateDir = Join-Path $TestDrive 'p2'
         $cfg = & $script:NewConfig $stateDir
-        Mock Get-OSyncInstalledAppxVersion { return $null }
-        $script:addCount = 0
-        Mock Add-AppxPackage { $script:addCount++ }
-        Mock Resolve-OSyncWingetExePath { return 'C:\fake\winget.exe' }
-
-        $s = Invoke-OSyncBootstrapStepAppInstaller -Config $cfg -Root $root -WhatIf
-        $s.Status | Should -Be 'done'
-        $script:addCount | Should -Be 0
-        (Test-Path -LiteralPath (Join-Path $stateDir 'state\system-state.json')) | Should -Be $false
-    }
-
-    It 'step 1 WhatIf with ALL pieces skipped still records nothing (regression)' {
-        $root = Join-Path $TestDrive 'p6b'
-        & $script:NewPayload $root
-        $stateDir = Join-Path $TestDrive 'p6bstate'
-        $cfg = & $script:NewConfig $stateDir
-        # Every piece installed-newer -> all skipped -> the old code fell
-        # through to the winget resolution + state write even under WhatIf.
-        Mock Get-OSyncInstalledAppxVersion { return [version]'99.0.0.0' }
         $script:resolveCount = 0
         Mock Resolve-OSyncWingetExePath { $script:resolveCount++; return 'C:\fake\winget.exe' }
 
-        $s = Invoke-OSyncBootstrapStepAppInstaller -Config $cfg -Root $root -WhatIf
+        $s = Invoke-OSyncBootstrapStepAppInstaller -Config $cfg -Root $TestDrive -WhatIf
         $s.Status | Should -Be 'done'
-        $s.Message | Should -BeLike '*all pieces skipped*'
+        $s.Message | Should -BeLike '*WhatIf*'
         $script:resolveCount | Should -Be 0
         (Test-Path -LiteralPath (Join-Path $stateDir 'state\system-state.json')) | Should -Be $false
     }
 
     It 'step 1 throws explicitly when winget.exe cannot be resolved' {
-        $root = Join-Path $TestDrive 'p7'
-        & $script:NewPayload $root
-        $cfg = & $script:NewConfig (Join-Path $TestDrive 'p7state')
-        Mock Get-OSyncInstalledAppxVersion { return [version]'99.0.0.0' }   # all installed-newer -> all skip
+        $stateDir = Join-Path $TestDrive 'p3'
+        $cfg = & $script:NewConfig $stateDir
         Mock Resolve-OSyncWingetExePath { return $null }
 
         $err = $null
-        try { Invoke-OSyncBootstrapStepAppInstaller -Config $cfg -Root $root | Out-Null } catch { $err = $_.Exception.Message }
+        try { Invoke-OSyncBootstrapStepAppInstaller -Config $cfg -Root $TestDrive | Out-Null } catch { $err = $_.Exception.Message }
         $err | Should -Not -BeNullOrEmpty
         $err | Should -BeLike '*winget.exe not found*'
+        $err | Should -BeLike '*no longer installs*'
     }
 }
 

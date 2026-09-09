@@ -38,8 +38,8 @@
        error that clearly names the port.
 
   NOTE (documented deviation): the full orchestrator (Export-OfflineRepo.ps1)
-  ALWAYS re-runs the runtime category, which re-downloads the ~216 MB
-  msixbundle + Python/Node payloads into a FRESH staging dir every run. The
+  ALWAYS re-runs the runtime category, which re-downloads the Python/Node
+  payloads (plus VC_redist) into a FRESH staging dir every run. The
   runtime payload is a bootstrap artifact that the pip/npm apply chains never
   consume, and aka.ms was observed flaky during QA (HTTP 503 + connection
   reset on consecutive runs). The E2E therefore publishes only the categories
@@ -323,8 +323,8 @@ function Get-E2EFreshNpmRegistry {
 # root - the same trust-root contract the B-side apply consumes.
 #
 # NOTE (documented deviation): the full orchestrator ALWAYS re-runs the
-# runtime category, which re-downloads the ~216 MB msixbundle + Python/Node
-# payloads into a FRESH staging dir every run (download-if-missing is
+# runtime category, which re-downloads the Python/Node payloads (plus
+# VC_redist) into a FRESH staging dir every run (download-if-missing is
 # per-staging-dir). The runtime payload is a bootstrap artifact that todo-21's
 # pip/npm apply chains never consume, and aka.ms was observed flaky during QA
 # (HTTP 503 + connection reset on consecutive runs). The E2E therefore

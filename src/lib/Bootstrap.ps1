@@ -28,18 +28,15 @@
           /install /quiet /norestart runs (acceptable exit codes {0,3010,
           1638}, Oracle m8 - 3010 = reboot required, 1638 = another version
           already installed, both success).
-      [1] App Installer: installed Microsoft.DesktopAppInstaller version >=
-          payload msixbundle version skips the whole step; otherwise the
-          VCLibs -> UI.Xaml -> msixbundle pieces are added IN ORDER, each
-          with its own existence + sha256 check (against the verified work
-          copy) AND its own version gate: installed identity version >=
-          payload identity version skips that piece (Momus m7 / Oracle
-          r5-m2 - the VCLibs version mismatch observed in todo-10 QA is
-          handled by this gate: the OS-shipped 14.0.33728 >= payload
-          14.0.33321 skips the piece). After the pieces, winget.exe is
-          resolved (Resolve-OSyncWingetExePath, newest WindowsApps glob) and
-          recorded into state.wingetExePath; an empty glob is an explicit
-          error (Metis B1).
+      [1] App Installer: DETECT-ONLY (user decision, 2026-09 - the bootstrap
+          NO LONGER installs the App Installer chain; modern Windows ships
+          App Installer / winget preinstalled, so the msixbundle/VCLibs/
+          UI.Xaml payload is no longer carried at all). winget.exe is resolved
+          (Resolve-OSyncWingetExePath, newest WindowsApps glob) and recorded
+          into state.wingetExePath (diagnostic only); an empty glob is an
+          explicit, fast error telling the operator App Installer must be
+          present on this machine (Metis B1). No Add-AppxPackage is ever run
+          here.
       [2] LocalManifestFiles, PER-USER semantics in BOTH contexts (Momus
           r3-M4 / Oracle r3-M5): enabled as the admin with
           `winget settings --enable LocalManifestFiles`, AND a ONE-SHOT
@@ -195,23 +192,6 @@ function Get-OSyncBootstrapManifestEntry {
         }
     }
     return $null
-}
-
-function Get-OSyncInstalledAppxVersion {
-    # Highest installed version of an Appx package by Identity Name, or $null.
-    param([Parameter(Mandatory = $true)][string]$PackageName)
-    $pkgs = @(Get-AppxPackage -Name $PackageName -ErrorAction SilentlyContinue)
-    if ($pkgs.Count -eq 0) { return $null }
-    $best = $null
-    foreach ($p in $pkgs) {
-        $v = $null
-        try { $v = [version]$p.Version } catch { $v = $null }
-        if ($null -ne $v) {
-            if ($null -eq $best -or $v -gt $best) { $best = $v }
-        }
-    }
-    if ($null -eq $best) { return $null }
-    return $best
 }
 
 function Test-OSyncTrustedDirOwner {
@@ -517,159 +497,36 @@ function Invoke-OSyncBootstrapStepVcRuntime {
     return (New-OSyncBootstrapStepResult -Step '0-vcruntime' -Status 'done' -Message "VC_redist.x64.exe completed (exit $code)." -Data @{ ExitCode = $code })
 }
 
-# ---- step 1: App Installer pieces + winget.exe ------------------------------
-
-function Get-OSyncAppxIdentity {
-    # Reads Identity {Name, Version} from an .appx/.msix (AppxManifest.xml at
-    # the zip root). Throws when unreadable.
-    param([Parameter(Mandatory = $true)][string]$AppxPath)
-    $manifest = Read-OSyncZipEntryText -ZipPath $AppxPath -EntryName 'AppxManifest.xml'
-    if ($null -eq $manifest) { throw "Bootstrap.ps1: no AppxManifest.xml inside '$AppxPath'." }
-    $nameM = [regex]::Match($manifest, '<Identity\b[^>]*\bName="([^"]+)"')
-    $verM = [regex]::Match($manifest, '<Identity\b[^>]*\bVersion="([^"]+)"')
-    if (-not $nameM.Success -or -not $verM.Success) {
-        throw "Bootstrap.ps1: cannot parse Identity Name/Version from '$AppxPath'."
-    }
-    return [pscustomobject]@{ Name = $nameM.Groups[1].Value; Version = $verM.Groups[1].Value }
-}
-
-function Get-OSyncBundleIdentity {
-    # Reads Identity {Name, Version} from an App Installer msixbundle (the
-    # manifest may live inside the inner x64 msix - Get-OSyncBundleManifestText
-    # handles both layouts, todo-10 QA).
-    param([Parameter(Mandatory = $true)][string]$BundlePath)
-    $manifest = Get-OSyncBundleManifestText -BundlePath $BundlePath
-    if ($null -eq $manifest) { throw "Bootstrap.ps1: no AppxManifest.xml found in the msixbundle '$BundlePath'." }
-    $nameM = [regex]::Match($manifest, '<Identity\b[^>]*\bName="([^"]+)"')
-    $verM = [regex]::Match($manifest, '<Identity\b[^>]*\bVersion="([^"]+)"')
-    if (-not $nameM.Success -or -not $verM.Success) {
-        throw "Bootstrap.ps1: cannot parse Identity Name/Version from the msixbundle '$BundlePath'."
-    }
-    return [pscustomobject]@{ Name = $nameM.Groups[1].Value; Version = $verM.Groups[1].Value }
-}
-
-function Get-OSyncAppInstallerDecisions {
-    <#
-      Builds the per-piece install decisions for step 1:
-        piece = 'vclibs' | 'uixaml' | 'msixbundle'
-        File, PayloadName, PayloadVersion, InstalledVersion, InstallNeeded
-      Every piece must exist AND its sha256 must match the verified work
-      copy's runtime files.json (existence + sha256 check before
-      Add-AppxPackage). The version gate (Momus m7 / Oracle r5-m2): a piece
-      whose installed identity version >= payload version is skipped.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]$Config,
-        [Parameter(Mandatory = $true)][string]$Root
-    )
-    $appInstallerDir = Join-Path $Root 'runtime\appinstaller'
-    if (-not (Test-Path -LiteralPath $appInstallerDir -PathType Container)) {
-        throw "Bootstrap.ps1 step 1: runtime\appinstaller missing in '$Root' (runtime category incomplete)."
-    }
-    $filesJson = Join-Path $Root 'runtime\files.json'
-    if (-not (Test-Path -LiteralPath $filesJson -PathType Leaf)) {
-        throw "Bootstrap.ps1 step 1: runtime\files.json missing - cannot verify the appInstaller pieces."
-    }
-
-    $pieces = @(
-        [pscustomobject]@{ Piece = 'vclibs'; File = 'Microsoft.VCLibs.x64.14.00.Desktop.appx'; Bundle = $false },
-        [pscustomobject]@{ Piece = 'uixaml'; File = 'Microsoft.UI.Xaml.2.8.appx'; Bundle = $false },
-        [pscustomobject]@{ Piece = 'msixbundle'; File = 'Microsoft.DesktopAppInstaller.msixbundle'; Bundle = $true }
-    )
-
-    $decisions = @()
-    foreach ($piece in $pieces) {
-        $path = Join-Path $appInstallerDir $piece.File
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-            throw "Bootstrap.ps1 step 1: appInstaller piece '$($piece.File)' not found at '$path'."
-        }
-        $actualHash = Get-OSyncFileSha256 -Path $path
-        $expected = Get-OSyncBootstrapManifestEntry -FilesJsonPath $filesJson -RelPath ('appinstaller/' + $piece.File)
-        if ($null -ne $expected -and $expected.Sha256 -ne $actualHash) {
-            throw ("Bootstrap.ps1 step 1: appInstaller piece '{0}' sha256 mismatch (files.json '{1}' vs actual '{2}')." -f $piece.File, $expected.Sha256, $actualHash)
-        }
-        $identity = if ($piece.Bundle) {
-            Get-OSyncBundleIdentity -BundlePath $path
-        }
-        else {
-            Get-OSyncAppxIdentity -AppxPath $path
-        }
-        $installed = Get-OSyncInstalledAppxVersion -PackageName $identity.Name
-        $installNeeded = $false
-        if ($null -ne $installed) {
-            $payloadV = $null
-            try { $payloadV = [version]$identity.Version } catch { }
-            if ($null -ne $payloadV -and $installed -ge $payloadV) {
-                $installNeeded = $false
-            }
-            else {
-                $installNeeded = $true
-            }
-        }
-        else {
-            $installNeeded = $true
-        }
-        $decisions += [pscustomobject]@{
-            Piece            = $piece.Piece
-            File             = $piece.File
-            Path             = $path
-            PayloadName      = $identity.Name
-            PayloadVersion   = $identity.Version
-            InstalledVersion = if ($null -ne $installed) { $installed.ToString() } else { $null }
-            InstallNeeded    = $installNeeded
-        }
-    }
-    return $decisions
-}
+# ---- step 1: App Installer detect-only (winget.exe presence) ----------------
 
 function Invoke-OSyncBootstrapStepAppInstaller {
+    <#
+      DETECT-ONLY step (user decision, 2026-09): the bootstrap NO LONGER
+      installs the App Installer chain (msixbundle/VCLibs/UI.Xaml) - modern
+      Windows ships App Installer / winget preinstalled, so there is nothing
+      to install and no payload to verify. This step only resolves winget.exe
+      (Resolve-OSyncWingetExePath, newest WindowsApps glob) and records it
+      into state.wingetExePath (RECORD ONLY / diagnostic - apply re-derives
+      every run). An empty glob is an explicit, fast error telling the
+      operator this machine must have App Installer (Metis B1).
+    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Config,
         [Parameter(Mandatory = $true)][string]$Root,
         [switch]$WhatIf
     )
-    $decisions = @(Get-OSyncAppInstallerDecisions -Config $Config -Root $Root)
-
-    # Install order: VCLibs -> UI.Xaml -> msixbundle. Only pieces whose gate
-    # says install-needed are added (per-piece version gate, Oracle r5-m2).
-    $order = @{ 'vclibs' = 0; 'uixaml' = 1; 'msixbundle' = 2 }
-    $needed = @($decisions | Where-Object { $_.InstallNeeded } | Sort-Object { $order[$_.Piece] })
-    $skipped = @($decisions | Where-Object { -not $_.InstallNeeded })
-
-    foreach ($d in $skipped) {
-        $verText = if ($null -ne $d.InstalledVersion) { "installed $($d.InstalledVersion) >= payload $($d.PayloadVersion)" } else { 'installed version unknown' }
-        Write-OSyncLog -Category 'bootstrap' -Level Info `
-            -Message ("step 1: skipping Appx piece {0} ({1}, {2})" -f $d.Piece, $d.PayloadName, $verText) `
-            -Data $d -Config $Config | Out-Null
-    }
-
-    # WhatIf returns BEFORE any state write - even when every piece is
-    # skipped (the common case on an already-provisioned machine), the
-    # winget.exe resolution + state.wingetExePath record must NOT happen.
+    # WhatIf returns BEFORE any state write - the winget.exe resolution +
+    # state.wingetExePath record must NOT happen (zero-change guarantee).
     if ($WhatIf) {
-        $names = if ($needed.Count -gt 0) { ($needed | ForEach-Object { $_.File }) -join ', ' } else { '(none - all pieces skipped by version gate)' }
         return (New-OSyncBootstrapStepResult -Step '1-appinstaller' -Status 'done' `
-            -Message "WhatIf: would Add-AppxPackage (in order VCLibs -> UI.Xaml -> msixbundle): $names" -Data @{ Needed = $needed })
-    }
-
-    foreach ($d in $needed) {
-        Write-OSyncLog -Category 'bootstrap' -Level Info `
-            -Message ("step 1: Add-AppxPackage {0} ({1}@{2}) from '{3}'" -f $d.Piece, $d.PayloadName, $d.PayloadVersion, $d.Path) `
-            -Data $d -Config $Config | Out-Null
-        try {
-            Add-AppxPackage -Path $d.Path -ErrorAction Stop
-        }
-        catch {
-            throw "Bootstrap.ps1 step 1: Add-AppxPackage failed for '$($d.File)': $($_.Exception.Message)"
-        }
+            -Message 'WhatIf: would verify winget.exe presence (Resolve-OSyncWingetExePath) and record state.wingetExePath. The bootstrap no longer installs App Installer.' -Data @{})
     }
 
     # winget.exe resolution (Metis B1) - re-derived this run, never from state.
     $wingetExe = Resolve-OSyncWingetExePath
     if ($null -eq $wingetExe) {
-        throw "Bootstrap.ps1 step 1: winget.exe not found under C:\Program Files\WindowsApps (the App Installer install appears to have failed or the glob is empty)."
+        throw "Bootstrap.ps1 step 1: winget.exe not found under C:\Program Files\WindowsApps - this machine has no App Installer / winget. The bootstrap no longer installs it: install App Installer (preinstalled on modern Windows) and re-run."
     }
     # Record wingetExePath (RECORD ONLY / diagnostic - apply re-derives each run).
     $state = Get-OSyncState -Category 'winget' -Config $Config
@@ -680,8 +537,8 @@ function Invoke-OSyncBootstrapStepAppInstaller {
         -Data @{ WingetExe = $wingetExe } -Config $Config | Out-Null
 
     return (New-OSyncBootstrapStepResult -Step '1-appinstaller' -Status 'done' `
-        -Message ("App Installer step done: {0} piece(s) skipped by version gate, {1} installed." -f $skipped.Count, $needed.Count) `
-        -Data @{ Skipped = @($skipped); Installed = @($needed); WingetExe = $wingetExe })
+        -Message ("App Installer detect-only: winget.exe present at '{0}' (no pieces installed - the bootstrap no longer installs App Installer)." -f $wingetExe) `
+        -Data @{ WingetExe = $wingetExe })
 }
 
 # ---- step 2: LocalManifestFiles (both contexts) -----------------------------
