@@ -23,13 +23,19 @@
         and set the MACHINE-level env var NPM_CONFIG_REGISTRY as
         belt-and-braces. nodeInstallDir is RE-DERIVED every run from the HKLM
         machine PATH (node.exe location; never from state, Oracle r3-B1).
-    4.  Verify: `npm view <first entry of <WorkDir>\npm\packages.txt>
-        --registry http://127.0.0.1:<port>` returns a version; a
-        guaranteed-nonexistent package name FAILS FAST within 30 s (proves no
-        uplink hang, Metis M4); and a NEW PROCESS WITHOUT FLAGS
-        `npm config get registry` returns the local registry (flag-carrying
-        checks cannot catch config fallback, Oracle B1).
-    5.  state.npm = { registryOk: $true, at }.
+     4.  Verify: `npm view <first entry of <WorkDir>\npm\packages.txt>
+         --registry http://127.0.0.1:<port>` returns a version; a
+         guaranteed-nonexistent package name FAILS FAST within 30 s (proves no
+         uplink hang, Metis M4); and a NEW PROCESS WITHOUT FLAGS
+         `npm config get registry` returns the local registry (flag-carrying
+         checks cannot catch config fallback, Oracle B1). When the bun
+         frontend is installed (<stateDir>\bun\bun.exe exists - landed by
+         bootstrap), verify the SAME registry from bun's perspective: `bun
+         info <spec> version` returns a version and a bun ghost package FAILS
+         FAST within 30 s; BUN_CONFIG_REGISTRY is injected EXPLICITLY into the
+         child env (never rely on inherited process env blocks).
+     5.  state.npm = { registryOk: $true, at }; after a bun verification also
+         state.npm.bun = { bunOk: $true, at }.
 
   QA SEAM (documented): the real scheduled task 'PakageSync-Verdaccio' is
   registered by Install-OfflineBootstrap (plan todo 12) / Register-SyncTasks
@@ -314,6 +320,69 @@ function Invoke-ONpmCli {
     return [pscustomobject]@{ ExitCode = $proc.ExitCode; Output = @($lines); TimedOut = $false }
 }
 
+function Invoke-OBunCli {
+    <#
+      Runs bun.exe DIRECTLY (a real PE executable - no cmd.exe wrapper) with
+      a hard timeout. Returns { ExitCode, Output (stdout+stderr lines),
+      TimedOut } - the same contract as Invoke-ONpmCli; the timeout path kills
+      the whole process tree (taskkill /T) so a hung bun cannot leave an
+      orphan behind.
+
+      BUN_CONFIG_REGISTRY is injected EXPLICITLY into the child process
+      environment block: scheduled-task/process env blocks may be stale -
+      NEVER rely on inheritance (Momus M5). The URL MUST end in '/' (bun bug
+      #25450); the caller builds it from config.verdaccioPort.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BunExe,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 3600)]
+        [int]$TimeoutSeconds = 120,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RegistryUrl
+    )
+
+    $argText = ($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $BunExe
+    $psi.Arguments = $argText
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.EnvironmentVariables['BUN_CONFIG_REGISTRY'] = $RegistryUrl
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $exited = $proc.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $exited) {
+        $oldEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $null = & taskkill.exe /PID $proc.Id /T /F 2>&1
+        }
+        catch { }
+        finally {
+            $ErrorActionPreference = $oldEap
+        }
+        $proc.WaitForExit(5000) | Out-Null
+        return [pscustomobject]@{ ExitCode = -1; Output = @(); TimedOut = $true }
+    }
+
+    $lines = @()
+    $lines += ($outTask.Result -split "`r?`n")
+    $lines += ($errTask.Result -split "`r?`n")
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Output = @($lines); TimedOut = $false }
+}
+
 function Invoke-OSyncNpmApply {
     [CmdletBinding()]
     param(
@@ -483,6 +552,74 @@ function Invoke-OSyncNpmApply {
     }
     Write-OSyncLog -Category 'npm' -Level Info -Message "new-process 'npm config get registry' = '$cfgValue' (config fallback verified)." -Config $Config | Out-Null
 
+    # --- 4d/4e. bun frontend verification (parallel client on the SAME
+    # registry). Gate = <stateDir>\bun\bun.exe: bootstrap lands it there, so
+    # its presence is the operator's intent to have bun (absent = legacy
+    # deployment: skip every bun step, NO state.npm.bun). Any bun verification
+    # failure THROWS - the gate makes bun part of the apply contract.
+    $bunExe = Join-Path $Config.stateDir 'bun\bun.exe'
+    $bunRan = $false
+    $bunReport = [pscustomobject]@{ enabled = $false }
+    if (Test-Path -LiteralPath $bunExe -PathType Leaf) {
+        # The child-process registry URL must END in '/' (bun bug #25450); the
+        # caller builds it from config.verdaccioPort (or the endpoint seam).
+        $registryUrlWithSlash = $registryUrl + '/'
+
+        # Package selection: the delivered bun list (first entry) wins - the
+        # registry content is identical regardless of the frontend - otherwise
+        # reuse the packages.txt spec already selected in 4a.
+        $bunSpec = $spec
+        $bunListPath = Join-Path $npmDir 'bun-packages.txt'
+        if (Test-Path -LiteralPath $bunListPath -PathType Leaf) {
+            $bunEntries = @(Read-OSyncNpmList -Path $bunListPath)
+            if ($bunEntries.Count -gt 0) {
+                $bunFirst = $bunEntries[0]
+                $bunSpec = if ($null -ne $bunFirst.Version -and $bunFirst.Version.Length -gt 0) { "$($bunFirst.Name)@$($bunFirst.Version)" } else { $bunFirst.Name }
+            }
+        }
+
+        # 4d. `bun info <spec> version` proves the local registry works from
+        # bun's perspective. BUN_CONFIG_REGISTRY is injected EXPLICITLY into
+        # the child process env: scheduled-task/process env blocks may be
+        # stale - never rely on inheritance.
+        $bunInfo = Invoke-OBunCli -BunExe $bunExe -Arguments @('info', $bunSpec, 'version') -RegistryUrl $registryUrlWithSlash -TimeoutSeconds 60
+        $bunInfoText = ($bunInfo.Output -join "`n")
+        if ($bunInfo.TimedOut -or $bunInfo.ExitCode -ne 0) {
+            $bunTail = ((@($bunInfo.Output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 5) -join '; ')
+            throw "Invoke-OSyncNpmApply: 'bun info $bunSpec version' failed (exit $($bunInfo.ExitCode)): $bunTail"
+        }
+        if ($bunInfoText -notmatch '\d+\.\d+\.\d+') {
+            throw "Invoke-OSyncNpmApply: 'bun info $bunSpec version' returned no version: $bunInfoText"
+        }
+        Write-OSyncLog -Category 'npm' -Level Info -Message "bun info $bunSpec version hit the local registry (version found)." -Config $Config | Out-Null
+
+        # 4e. ghost package must FAIL FAST within 30 s from bun's perspective
+        # too (a bun client on a leaked uplink would hang forever).
+        $bunGhost = 'osync-nonexistent-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $bunSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $bunGhostResult = Invoke-OBunCli -BunExe $bunExe -Arguments @('info', $bunGhost, 'version') -RegistryUrl $registryUrlWithSlash -TimeoutSeconds 30
+        $bunSw.Stop()
+        if ($bunGhostResult.TimedOut) {
+            throw "Invoke-OSyncNpmApply: 'bun info $bunGhost version' did not fail fast - it hung for 30 s. An uplink would hang forever; verdaccio-b.yml must have no uplinks."
+        }
+        if ($bunGhostResult.ExitCode -eq 0) {
+            throw "Invoke-OSyncNpmApply: 'bun info $bunGhost version' unexpectedly succeeded - the registry served a nonexistent package."
+        }
+        Write-OSyncLog -Category 'npm' -Level Info -Message "nonexistent package '$bunGhost' failed fast in $([Math]::Round($bunSw.Elapsed.TotalSeconds, 2)) s (exit $($bunGhostResult.ExitCode)) from bun - no uplink hang." -Config $Config | Out-Null
+
+        $bunRan = $true
+        $bunReport = [pscustomobject]@{
+            enabled         = $true
+            bunExe          = $bunExe
+            viewSpec        = $bunSpec
+            ghostName       = $bunGhost
+            ghostElapsedSec = [Math]::Round($bunSw.Elapsed.TotalSeconds, 2)
+        }
+    }
+    else {
+        Write-OSyncLog -Category 'npm' -Level Info -Message 'bun frontend not installed - skipping bun verification.' -Config $Config | Out-Null
+    }
+
     # --- 5. state.npm = { registryOk: $true, at } ---
     $state = Get-OSyncState -Category 'npm' -Config $Config
     if ($null -eq $state['npm'] -or $state['npm'] -isnot [System.Collections.IDictionary]) {
@@ -491,6 +628,9 @@ function Invoke-OSyncNpmApply {
     $at = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     $state['npm']['registryOk'] = $true
     $state['npm']['at'] = $at
+    if ($bunRan) {
+        $state['npm']['bun'] = [ordered]@{ bunOk = $true; at = $at }
+    }
     Save-OSyncState -Category 'npm' -State $state -Config $Config | Out-Null
     Write-OSyncLog -Category 'npm' -Level Info -Message "state.npm = { registryOk: true, at: $at }." -Config $Config | Out-Null
 
@@ -507,6 +647,7 @@ function Invoke-OSyncNpmApply {
         ghostElapsedSec   = [Math]::Round($sw.Elapsed.TotalSeconds, 2)
         configGetRegistry = $cfgValue
         registryOk        = $true
+        bun               = $bunReport
         at                = $at
     }
 }

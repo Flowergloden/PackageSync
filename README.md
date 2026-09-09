@@ -10,22 +10,24 @@
 ```
 [外网机 A]                                        [内网机 B]
   Export-OfflineRepo.ps1                             (SMB 单向镜像后)
-  读取四份人读清单 ──┐                                  |
+  读取五份人读清单 ──┐                                  |
   + winget 白名单    │                                 v
   + requirements.txt │                          Test-OSyncRepoIntegrity 校验
   + npm 清单         │                          (index.json → files.json → 逐文件 SHA256)
-  + dotfiles 源态    │                                 |  失败 → 该类别整体跳过
-                     v                                 v
-  构建 staging 仓库 ─┼─► 落盘区 D:\OfflineRepo     robocopy → 本地工作副本
-  (winget YAML 改    │   (含 index.json 信任根、     <stateDir>\work\<exportedAtUtc>\
-   写为 localhost    │    runtime\tool\ 工具本体)        |  逐文件复核 hash → .verified
-   URL + files.json) │                                 v
-                     v                                 |  一律从工作副本执行
+  + bun 清单（可空）  │                                 |  失败 → 该类别整体跳过
+  + dotfiles 源态    │                                 v
+                     v                          robocopy → 本地工作副本
+  构建 staging 仓库 ─┼─► 落盘区 D:\OfflineRepo     <stateDir>\work\<exportedAtUtc>\
+  (winget YAML 改    │   (含 index.json 信任根、         |  逐文件复核 hash → .verified
+   写为 localhost    │    runtime\tool\ 工具本体)        v
+   URL + files.json) │                                 |  一律从工作副本执行
+                     v
    既有 SMB 单向服务 ───────────────► B 落盘区 C:\OfflineRepo
                                               Invoke-OfflineApply.ps1
                                               winget --manifest（本地 HTTP 8788）
                                               pip --no-index --find-links
                                               npm 本地 Verdaccio（4873）
+                                              bun add -g（按需，同一 registry 4873）
                                               chezmoi apply（用户上下文）
 ```
 
@@ -48,8 +50,8 @@
 ### 3.1 A 端（外网机）
 
 1. 安装 Node.js/npm（npm 类别导出与预热需要；B 端 runtime 的 Node 由 winget 管线安装，A 侧自身需可用 npm）。
-2. 按「四、清单编辑指南」编辑四份清单：`manifests\winget-packages.txt`、`manifests\requirements.txt`、`manifests\npm-packages.txt`、`manifests\dotfiles\`（chezmoi 源态）。
-3. （可选）核对 `config\packagesync.json`：`repoRoot`、`stagingRoot`、端口（8788/4873/4874）、`categories`、运行时钉版 `pins.*`。
+2. 按「四、清单编辑指南」编辑五份清单：`manifests\winget-packages.txt`、`manifests\requirements.txt`、`manifests\npm-packages.txt`、`manifests\bun-packages.txt`（可空，见 4.5）、`manifests\dotfiles\`（chezmoi 源态）。
+3. （可选）核对 `config\packagesync.json`：`repoRoot`、`stagingRoot`、端口（8788/4873/4874）、`categories`、运行时钉版 `pins.*`（含 `pins.bun`——bun 运行时本体的钉版下载，`sha256` 走 5.6 的 PIN-ME 流程；**整节删除 `pins.bun` 即整体关闭 bun**，旧 config 无 bun 键不受影响）。
 4. 注册 A 端计划任务（每日 02:00 自动导出）：
 
 ```powershell
@@ -77,7 +79,7 @@ Copy-Item -Path C:\OfflineRepo\runtime\tool\* -Destination C:\PakageSync\ -Recur
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Install-OfflineBootstrap.ps1
 ```
 
-   - 引导内容：机器级 VC_redist → 校验 winget.exe 存在（App Installer 不再由引导安装，现代 Windows 自带）→ 本地 HTTP 服务 → winget 安装 Python/Node → 注册 Verdaccio 常驻任务 → 落位 `C:\PakageSync\`。
+   - 引导内容：机器级 VC_redist → 校验 winget.exe 存在（App Installer 不再由引导安装，现代 Windows 自带）→ 本地 HTTP 服务 → winget 安装 Python/Node → 注册 Verdaccio 常驻任务 → （仓库含 bun 载荷时）bun 运行时落位 `<stateDir>\bun` + 机器 PATH + 机器级 `BUN_CONFIG_REGISTRY` → 落位 `C:\PakageSync\`。
    - 完成判断：输出 `SUCCESS (bootstrapped=True ...)` 且 `C:\ProgramData\PakageSync\state\system-state.json` 中 `bootstrapped=true`。
 4. 注册 B 端计划任务：
 
@@ -151,6 +153,7 @@ is-odd@3.0.1
 
 - A 端用一次性 Verdaccio（4874）预热整棵依赖树并快照 storage；B 端由常驻本地 Verdaccio（4873）从**校验过的本地副本**供给（`verdaccio-b.yml` 无 `uplinks`/`proxy`，绝无外网依赖）。
 - **B 端不自动全局安装 npm 包**（SYSTEM 上下文装全局包会落错用户 profile）——registry 供给即交付语义；B 上按需 `npm install`（默认已指向本地 registry，见 5.2 内置 npmrc）。
+- bun 是本类别的**并行前端**：bun 与 npm 消费同一棵 Verdaccio 依赖树（同一 storage 快照），bun 专属补充包见 4.5。
 
 ### 4.4 chezmoi dotfiles 源态（manifests\dotfiles\）
 
@@ -158,6 +161,22 @@ is-odd@3.0.1
 - **externals 禁用**：源态内不得出现任何 `.chezmoiexternal*` 文件，导出直接报错「离线不支持 externals」（空气隔离机 externals 不可用）。
 - 模板变量：`chezmoi.toml` 的 `[data]` 节映射到模板数据根，用 `{{ .name }}`（不是 `{{ .data.name }}`）。
 - 维护流程：A 上编辑 `manifests\dotfiles\` 源态 → 下次导出自动打包（`robocopy /MIR`）→ SMB 同步 → B 上 `chezmoi apply`。**B 上被本地改过的目标文件会被保守跳过并记录，绝不覆盖**（见 5.3）。
+
+### 4.5 bun 清单（manifests\bun-packages.txt）
+
+bun 是 **npm 类别的并行前端**，不是独立类别：格式与 npm 清单完全相同（`name`、`name@version`、`@scope/name[@version]`，包名小写，`#` 注释）：
+
+```
+# 示例（本清单默认为空）
+is-odd@3.0.1
+```
+
+- **共享供给**：A 端导出时 bun 条目与 npm 条目**合并去重**（npm 优先）后经同一个一次性 Verdaccio 预热进**同一个 storage 快照**——bun 在 B 上可安装 npm 清单里的**所有**包，本清单只列 bun 专属补充包。**空清单（仅注释）合法**：bun 运行时照样交付，只是没有额外预热包。
+- **运行时本体**：A 端按 `pins.bun`（version/url/sha256）钉版下载 `bun-windows-x64.zip`（sha256 哈希门，PIN-ME 流程见 5.6），随 `runtime\bun\` 载荷交付；B 端 bootstrap 落位 `<stateDir>\bun\bun.exe` + 机器 PATH + 机器级 `BUN_CONFIG_REGISTRY=http://127.0.0.1:4873/`（尾部斜杠必须；npm apply 设的 `NPM_CONFIG_REGISTRY` 对 bun 同样有效，天然双保险）。**工具不写任何 bunfig.toml/.npmrc**。
+- **B 端只供给、不自动安装**（同 npm 语义）：用户按需 `bun add -g <pkg>`（无需 lockfile）；全局可执行入口落在 `%USERPROFILE%\.bun\bin`，首次使用前自行加入**用户** PATH（一次性，见 L22）。
+- npm apply 顺带做 bun 视角验证：`bun info <包> version` 命中本地 registry + 不存在包 30s 内快速失败（无 uplink 挂起证明）；失败则整个 npm apply 失败。
+- **关闭 bun**：删除 config 的 `pins.bun` 整节（`paths.bunList` 可一并删）——旧部署/旧 B config 无 bun 键时行为与之前完全一致（bun 全是 presence-gated）。
+- Export-Manifests.ps1 暂不支持从本机 `bun pm ls -g` 采集 bun 清单（后续迭代），bun 清单手工编辑。
 
 ## 五、运维手册
 
@@ -211,14 +230,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Invoke-Off
 
 ### 5.6 运行时钉版重钉流程（PIN-ME）
 
-chezmoi 与 VC_redist（App Installer 链不再导出/安装，见 3.2）都靠 config `pins.*.sha256` 哈希校验：
+chezmoi、bun 与 VC_redist（App Installer 链不再导出/安装，见 3.2）都靠 config `pins.*.sha256` 哈希校验：
 
-1. 把对应 `XxxSha256`（VC_redist 单件）或 `sha256`（chezmoi）置为 `"PIN-ME"`。
+1. 把对应 `XxxSha256`（VC_redist 单件）或 `sha256`（chezmoi / bun）置为 `"PIN-ME"`。
 2. 重跑 A 端导出 → 下载真实文件、打印实际 sha256 并**非零退出**（提示钉入）。
 3. 把打印的 64 位 hex 写回 config 对应键。
 4. 重跑导出 → 哈希校验通过后正常继续（文件已下载，不重复下载）。
 
-- 升级**运行时钉版**（Python/Node/Verdaccio/chezmoi 版本）后，B 端须**手动重跑一次 bootstrap**（幂等；packages 任务也有内容漂移自愈兜底，见已知限制 L10）。
+- 升级**运行时钉版**（Python/Node/Verdaccio/chezmoi/bun 版本）后，B 端须**手动重跑一次 bootstrap**（幂等；packages 任务也有内容漂移自愈兜底，见已知限制 L10）。
 
 ### 5.7 工具本体到 B 的部署渠道（runtime\tool → C:\PakageSync\）
 
@@ -271,3 +290,6 @@ winget 类别在两端各有一层增量跳过，**信任根链（index.json →
 17. **L17. SYSTEM 自愈 bootstrap 幂等冒烟在 A 机 QA 中失败（todo-20）**：临时 SYSTEM 任务重跑 bootstrap 在步骤 1 失败（旧版 Add-AppxPackage 在 SYSTEM 上下文被拒，0x80073CF9——本地系统账户不允许执行部署 Add 操作；步骤①已改为仅检测 winget.exe，不再执行 Add-AppxPackage）；该自动路径仍仅作自愈兜底，手动 bootstrap 是受支持路径（详见 task-20 evidence）。
 18. **L18. SYSTEM 上下文 winget 安装失败（todo-20 QA 结论）**：A 机上 SYSTEM 主体执行 winget install --manifest 在"Starting package install..."处挂起（未生成 msiexec、无安装日志；直接 msiexec 在 SYSTEM 下可正常安装，挂起点在 winget 的安装器执行环节）——SYSTEM 主体 apply 路径在本机不可用，降级路径 Register-SyncTasks -Role B -PackagesTaskPrincipal User（管理员账户 S4U/Highest）实测可用；真实 B 机若 SYSTEM 安装同样挂起，请使用 User 降级注册（README 3.3）。
 19. **L19. 离线模拟限制（todo-20 QA）**：A 机上 winget.exe 为打包应用（App Installer），其流量豁免 Windows 防火墙规则（程序/端口/全协议规则均实测无效），且 winget source update 对抓取失败吞错返回 0——离线 source 更新失败场景无法在 A 机复现；manifest 安装路径已实测不依赖 source 连通性（安装日志无 source 活动，仅需 loopback HTTP），真实离线 B 的 source 更新行为仍属部署期验证项。
+20. **L20. bun 的 registry 配置仅经机器级环境变量**：bootstrap 设 `BUN_CONFIG_REGISTRY`，npm apply 已设的 `NPM_CONFIG_REGISTRY` 对 bun 同样有效（bun 源码确认三个键都认）；工具不管理任何 bunfig.toml/.npmrc——项目级 bunfig.toml、`.npmrc` 或 CLI `--registry` 可按 bun 优先级（CLI > env > bunfig > npmrc）覆盖它。
+21. **L21. 含 `bundleDependencies` 的包 bun 可能装不上**：bun 会向 registry 索取 bundled 依赖的 manifest（bun 已知行为差异，oven-sh/bun#27418），若该内部依赖不在 Verdaccio 快照中则 `bun add` 404；npm 安装同包不受影响。遇此包改用 npm 安装，或把其内部依赖补进清单重新导出。
+22. **L22. bun 全局安装的 bin 目录需用户自助加 PATH**：`bun add -g` 的可执行入口落在 `%USERPROFILE%\.bun\bin`（per-user，机器 PATH 无法覆盖），用户首次使用前自行加入用户 PATH（一次性）；bun.exe 本体已由 bootstrap 落位机器 PATH（`<stateDir>\bun`），无需任何手动步骤。

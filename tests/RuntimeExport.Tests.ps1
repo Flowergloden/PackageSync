@@ -3,7 +3,7 @@
 .SYNOPSIS
     Pester 5 unit tests for src\lib\RuntimeExport.ps1 - the A-side runtime
     bootstrap payload export (VC_redist, portable Verdaccio, runtime-winget
-    entries, tool self-bootstrap snapshot).
+    entries, bun payload, tool self-bootstrap snapshot).
 
 .DESCRIPTION
     All downloads are MOCKED (Mock Invoke-OSyncDownload / Mock
@@ -43,6 +43,27 @@ Describe 'RuntimeExport' {
 
         # The hash that gets pinned into the test config.
         $script:FakeVcredistHash = Get-OSyncFileSha256 -Path $script:FakeVcredist
+
+        # --- fake bun release zip (a real zip containing bun.exe, built via
+        # System.IO.Compression - the download mock serves it on the bun URI) ---
+        $script:FakeBunZip = Join-Path $TestDrive 'fake-bun.zip'
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zipFs = [System.IO.Compression.ZipFile]::Open($script:FakeBunZip, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            $bunEntry = $zipFs.CreateEntry('bun.exe')
+            $bunWriter = New-Object System.IO.StreamWriter($bunEntry.Open(), [System.Text.Encoding]::ASCII)
+            try {
+                $bunWriter.Write('fake bun binary payload')
+                $bunWriter.Flush()
+            }
+            finally {
+                $bunWriter.Dispose()
+            }
+        }
+        finally {
+            $zipFs.Dispose()
+        }
+        $script:FakeBunZipHash = Get-OSyncFileSha256 -Path $script:FakeBunZip
 
         # --- runtime-winget.txt fixtures ---
         $script:ValidRuntimeWinget = Join-Path $TestDrive 'runtime-winget-valid.txt'
@@ -120,8 +141,32 @@ exit /b %FAKE_NPM_EXIT%
                 [string[]]$PipDownloadArgs = @('--only-binary=:all:', '--platform', 'win_amd64', '--python-version', '3.12', '--implementation', 'cp', '--abi', 'cp312'),
                 [string]$VcRedistSha256 = $script:FakeVcredistHash,
                 [bool]$PipEnabled = $true,
-                [bool]$NpmEnabled = $true
+                [bool]$NpmEnabled = $true,
+                # Bun is DISABLED by default ($null/empty = no pins.bun
+                # section, like the real legacy/B configs); pass a sha256 to
+                # enable the pins.bun payload ('PIN-ME' or the fake zip's
+                # hash). NOTE: a [string] parameter default of $null coerces
+                # to '' in PowerShell, so the guard is IsNullOrEmpty, NOT
+                # $null comparison.
+                [AllowNull()]
+                [string]$BunSha256 = $null,
+                [string]$BunVersion = '1.4.2',
+                [string]$BunUrl = 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip'
             )
+            $pins = [ordered]@{
+                appInstaller = [pscustomobject]@{
+                    vcRedistUrl    = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+                    vcRedistSha256 = $VcRedistSha256
+                }
+                npm = [pscustomobject]@{ verdaccioVersion = '6.10.2' }
+            }
+            if (-not [string]::IsNullOrEmpty($BunSha256)) {
+                $pins['bun'] = [pscustomobject]@{
+                    version = $BunVersion
+                    url     = $BunUrl
+                    sha256  = $BunSha256
+                }
+            }
             return [pscustomobject]@{
                 role       = 'A'
                 repoRoot   = $RepoRoot
@@ -131,13 +176,7 @@ exit /b %FAKE_NPM_EXIT%
                 paths      = [pscustomobject]@{ runtimeWhitelist = $RuntimeWhitelistPath }
                 winget     = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
                 pip        = [pscustomobject]@{ downloadArgs = @($PipDownloadArgs) }
-                pins       = [pscustomobject]@{
-                    appInstaller = [pscustomobject]@{
-                        vcRedistUrl    = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
-                        vcRedistSha256 = $VcRedistSha256
-                    }
-                    npm = [pscustomobject]@{ verdaccioVersion = '6.10.2' }
-                }
+                pins       = [pscustomobject]$pins
             }
         }
 
@@ -166,6 +205,9 @@ exit /b %FAKE_NPM_EXIT%
             }
             if ($Uri -match 'vc_redist') {
                 Copy-Item -LiteralPath $script:FakeVcredist -Destination $OutFile -Force
+            }
+            elseif ($Uri -match 'bun') {
+                Copy-Item -LiteralPath $script:FakeBunZip -Destination $OutFile -Force
             }
             else {
                 throw "unexpected download URI in test mock: $Uri"
@@ -506,6 +548,90 @@ exit /b %FAKE_NPM_EXIT%
             finally {
                 Remove-Item Env:FAKE_NPM_ARGSLOG -ErrorAction SilentlyContinue
             }
+        }
+    }
+
+    Context 'Export-OSyncRuntime - bun payload (pins.bun)' {
+        It 'PIN-ME prints the actual hash and throws naming pins.bun.sha256 BEFORE any winget download' {
+            $staging = Join-Path $TestDrive 'staging-bun-pinme'
+            # Behavior proof: if the export tried to download winget packages
+            # before the bun PIN-ME gate, this mock throws and the test fails.
+            Mock Invoke-OSyncWingetDownload { throw 'Invoke-OSyncWingetDownload must not be called before the bun PIN-ME gate' }
+
+            $err = Invoke-OTestThrowing {
+                Export-OSyncRuntime -Config (New-OTestConfig -BunSha256 'PIN-ME') -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+            }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -Match 'PIN-ME'
+            $err.Exception.Message | Should -Match 'pins\.bun\.sha256'
+            $err.Exception.Message | Should -Match $script:FakeBunZipHash
+            # No exe may be extracted from an unpinned download.
+            Test-Path -LiteralPath (Join-Path $staging 'runtime\bun\bun.exe') | Should -BeFalse
+        }
+
+        It 'aborts on a sha256 mismatch - bun.exe NOT extracted' {
+            $staging = Join-Path $TestDrive 'staging-bun-mismatch'
+            $wrong = ('a' * 64)
+            $err = Invoke-OTestThrowing {
+                Export-OSyncRuntime -Config (New-OTestConfig -BunSha256 $wrong) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+            }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -Match 'mismatch'
+            $err.Exception.Message | Should -Match $wrong
+            $err.Exception.Message | Should -Match $script:FakeBunZipHash
+            Test-Path -LiteralPath (Join-Path $staging 'runtime\bun\bun.exe') | Should -BeFalse
+        }
+
+        It 'extracts bun.exe and writes version.txt (UTF8 no BOM) on a hash match' {
+            $staging = Join-Path $TestDrive 'staging-bun-match'
+            $report = Export-OSyncRuntime -Config (New-OTestConfig -BunSha256 $script:FakeBunZipHash) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+
+            $bunDir = Join-Path $staging 'runtime\bun'
+            Test-Path -LiteralPath (Join-Path $bunDir 'bun.zip') -PathType Leaf | Should -BeTrue
+            $exe = Join-Path $bunDir 'bun.exe'
+            Test-Path -LiteralPath $exe -PathType Leaf | Should -BeTrue
+            [System.IO.File]::ReadAllText($exe, [System.Text.Encoding]::ASCII) | Should -Be 'fake bun binary payload'
+
+            $versionTxt = Join-Path $bunDir 'version.txt'
+            Test-Path -LiteralPath $versionTxt -PathType Leaf | Should -BeTrue
+            [System.IO.File]::ReadAllText($versionTxt) | Should -Be '1.4.2'
+            # UTF8 WITHOUT BOM (UTF8Encoding($false)) - a BOM would trip a
+            # naive B-side string comparison.
+            ([System.IO.File]::ReadAllBytes($versionTxt))[0] | Should -Not -Be 0xEF
+
+            $report.bun | Should -Not -BeNullOrEmpty
+            $report.bun.version | Should -Be '1.4.2'
+            $report.bun.url | Should -Be 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip'
+            $report.bun.sha256 | Should -Be $script:FakeBunZipHash
+            $report.bun.zipPath | Should -Be (Join-Path $bunDir 'bun.zip')
+            $report.bun.exePath | Should -Be $exe
+            $report.bun.versionTxt | Should -Be $versionTxt
+        }
+
+        It 'reuses an existing bun.zip - the second run performs NO download (mock call count)' {
+            $staging = Join-Path $TestDrive 'staging-bun-reuse'
+            $config = New-OTestConfig -BunSha256 $script:FakeBunZipHash
+            $null = Export-OSyncRuntime -Config $config -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+            # Run 1 downloaded exactly 2 artifacts: the appInstaller piece
+            # and bun.zip (both missing from the fresh staging dir).
+            Should -Invoke Invoke-OSyncDownload -Times 2 -Exactly
+
+            $report = Export-OSyncRuntime -Config $config -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+            # Run 2 downloaded nothing more (both artifacts already present):
+            # the call count is unchanged, proving the reuse-on-existing path.
+            Should -Invoke Invoke-OSyncDownload -Times 2 -Exactly
+            $report.status | Should -Be 'ok'
+        }
+
+        It 'skips the bun payload when pins.bun is absent - no bun dir, no error, report.bun is $null' {
+            $staging = Join-Path $TestDrive 'staging-bun-disabled'
+            $report = Export-OSyncRuntime -Config (New-OTestConfig) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+
+            $report.status | Should -Be 'ok'
+            # The report still carries the bun key (contract) - just $null.
+            $report.PSObject.Properties.Name -contains 'bun' | Should -BeTrue
+            $report.bun | Should -BeNullOrEmpty
+            Test-Path -LiteralPath (Join-Path $staging 'runtime\bun') | Should -BeFalse
         }
     }
 }

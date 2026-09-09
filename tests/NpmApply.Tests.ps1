@@ -460,4 +460,158 @@ Describe 'Invoke-OSyncNpmApply' {
         $result.registryUrl | Should -Be 'http://127.0.0.1:4899'
         Should -Invoke Set-OSyncMachineEnvVar -Times 1 -Exactly -ParameterFilter { $Value -eq 'http://127.0.0.1:4899/' }
     }
+
+    Context 'bun frontend verification' {
+        BeforeEach {
+            # bun frontend present: an empty dummy file under <stateDir>\bun
+            # passes the Test-Path gate (the apply never executes a real bun -
+            # Invoke-OBunCli is mocked).
+            $script:naBunExe = Join-Path $script:naStateDir 'bun\bun.exe'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $script:naBunExe) -Force | Out-Null
+            [System.IO.File]::WriteAllText($script:naBunExe, 'x')
+
+            Mock Invoke-OBunCli {
+                param([string]$BunExe, [string[]]$Arguments, [string]$RegistryUrl)
+                if ($Arguments[0] -eq 'info' -and $Arguments[1] -like 'osync-nonexistent*') {
+                    return [pscustomobject]@{ ExitCode = 1; Output = @('error: package not found (404)'); TimedOut = $false }
+                }
+                if ($Arguments[0] -eq 'info') {
+                    return [pscustomobject]@{ ExitCode = 0; Output = @('3.0.1'); TimedOut = $false }
+                }
+                throw "unexpected Invoke-OBunCli args: $($Arguments -join ' ')"
+            }
+        }
+
+        It 'gate: no bun.exe -> bun section disabled, Invoke-OBunCli never called, apply still succeeds' {
+            Remove-Item -LiteralPath $script:naBunExe -Force
+            Mock Invoke-OBunCli { throw 'Invoke-OBunCli must not be called when bun.exe is absent' }
+            $result = Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg
+            $result.registryOk | Should -Be $true
+            $result.bun.enabled | Should -Be $false
+            Should -Invoke Invoke-OBunCli -Times 0 -Exactly
+            # skipped bun leaves state.npm.bun untouched
+            $state = Get-OSyncState -Category 'npm' -StateDir $script:naStateDir
+            $state.npm.Contains('bun') | Should -Be $false
+        }
+
+        It 'picks the first bun-packages.txt entry when the delivered bun list exists' {
+            [System.IO.File]::WriteAllText((Join-Path $script:naNpmDir 'bun-packages.txt'), "left-pad@1.3.0`nis-odd@3.0.1`n", (New-Object System.Text.UTF8Encoding($false)))
+            Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg | Out-Null
+            Should -Invoke Invoke-OBunCli -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'info' -and $Arguments[1] -eq 'left-pad@1.3.0' -and $Arguments[2] -eq 'version' }
+        }
+
+        It 'falls back to the packages.txt spec when no bun list was delivered' {
+            Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg | Out-Null
+            Should -Invoke Invoke-OBunCli -Times 1 -Exactly -ParameterFilter { $Arguments[0] -eq 'info' -and $Arguments[1] -eq 'is-odd@3.0.1' -and $Arguments[2] -eq 'version' }
+        }
+
+        It 'success: bun info + ghost fail-fast persist state.npm.bun.bunOk and the report carries the bun section' {
+            $result = Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg
+            $result.bun.enabled | Should -Be $true
+            $result.bun.bunExe | Should -Be $script:naBunExe
+            $result.bun.viewSpec | Should -Be 'is-odd@3.0.1'
+            $result.bun.ghostName | Should -Match '^osync-nonexistent-[0-9a-f]{8}$'
+            $result.bun.ghostElapsedSec | Should -Not -BeNullOrEmpty
+            # ghost package ran with the version subcommand and exited fast non-zero
+            Should -Invoke Invoke-OBunCli -Times 1 -Exactly -ParameterFilter { $Arguments[1] -like 'osync-nonexistent*' -and $Arguments[2] -eq 'version' }
+            $state = Get-OSyncState -Category 'npm' -StateDir $script:naStateDir
+            $state.npm['bun']['bunOk'] | Should -Be $true
+            $state.npm['bun']['at'] | Should -Not -BeNullOrEmpty
+        }
+
+        It 'throws when bun info fails (exit != 0)' {
+            Mock Invoke-OBunCli {
+                param([string[]]$Arguments)
+                return [pscustomobject]@{ ExitCode = 1; Output = @('error: GET http://127.0.0.1:4873/is-odd - 500'); TimedOut = $false }
+            }
+            $err = $null
+            try { Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg | Out-Null }
+            catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*bun info is-odd@3.0.1 version*'
+        }
+
+        It 'throws when bun info times out' {
+            Mock Invoke-OBunCli {
+                param([string[]]$Arguments)
+                return [pscustomobject]@{ ExitCode = -1; Output = @(); TimedOut = $true }
+            }
+            $err = $null
+            try { Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg | Out-Null }
+            catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*bun info is-odd@3.0.1 version*'
+        }
+
+        It 'throws when bun info returns no version in its output' {
+            Mock Invoke-OBunCli {
+                param([string[]]$Arguments)
+                return [pscustomobject]@{ ExitCode = 0; Output = @('npm notice'); TimedOut = $false }
+            }
+            $err = $null
+            try { Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg | Out-Null }
+            catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*returned no version*'
+        }
+
+        It 'throws when the bun ghost package hangs (uplink suspicion)' {
+            Mock Invoke-OBunCli {
+                param([string[]]$Arguments)
+                if ($Arguments[1] -like 'osync-nonexistent*') {
+                    return [pscustomobject]@{ ExitCode = -1; Output = @(); TimedOut = $true }
+                }
+                return [pscustomobject]@{ ExitCode = 0; Output = @('3.0.1'); TimedOut = $false }
+            }
+            $err = $null
+            try { Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg | Out-Null }
+            catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*fail fast*'
+        }
+
+        It 'throws when the bun ghost package unexpectedly succeeds' {
+            Mock Invoke-OBunCli {
+                param([string[]]$Arguments)
+                if ($Arguments[1] -like 'osync-nonexistent*') {
+                    return [pscustomobject]@{ ExitCode = 0; Output = @('1.0.0'); TimedOut = $false }
+                }
+                return [pscustomobject]@{ ExitCode = 0; Output = @('3.0.1'); TimedOut = $false }
+            }
+            $err = $null
+            try { Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg | Out-Null }
+            catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*unexpectedly succeeded*'
+        }
+
+        It 'injects the registry URL ending in "/" and carrying the config port into every bun call' {
+            Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg | Out-Null
+            Should -Invoke Invoke-OBunCli -Times 2 -Exactly -ParameterFilter { $RegistryUrl -eq 'http://127.0.0.1:4873/' }
+        }
+
+        It '-VerdaccioEndpoint: the bun registry URL honors the endpoint override' {
+            Mock Get-OSyncVerdaccioTaskState { throw 'task functions must not be called with -VerdaccioEndpoint' }
+            Mock Start-OSyncVerdaccioTask { throw 'task functions must not be called with -VerdaccioEndpoint' }
+            Mock Stop-OSyncVerdaccioTask { throw 'task functions must not be called with -VerdaccioEndpoint' }
+            Mock Invoke-OSyncRobocopy { throw 'robocopy must not be called with -VerdaccioEndpoint' }
+            Mock Wait-OSyncPortListening { throw 'port wait must not be called with -VerdaccioEndpoint' }
+            Mock Invoke-ONpmCli {
+                param([string[]]$Arguments)
+                if ($Arguments[0] -eq 'view' -and $Arguments[1] -like 'osync-nonexistent*') {
+                    return [pscustomobject]@{ ExitCode = 1; Output = @('E404'); TimedOut = $false }
+                }
+                if ($Arguments[0] -eq 'view') {
+                    return [pscustomobject]@{ ExitCode = 0; Output = @('{ "version": "3.0.1" }'); TimedOut = $false }
+                }
+                if ($Arguments[0] -eq 'config') {
+                    return [pscustomobject]@{ ExitCode = 0; Output = @('http://127.0.0.1:4999/'); TimedOut = $false }
+                }
+                throw 'unexpected'
+            }
+            $result = Invoke-OSyncNpmApply -WorkDir $script:naWork -Config $script:naCfg -VerdaccioEndpoint 'http://127.0.0.1:4999'
+            $result.bun.enabled | Should -Be $true
+            Should -Invoke Invoke-OBunCli -Times 2 -Exactly -ParameterFilter { $RegistryUrl -eq 'http://127.0.0.1:4999/' }
+        }
+    }
 }

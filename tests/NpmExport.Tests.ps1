@@ -8,7 +8,10 @@
   cross-assertion, the pin-in-place write-back) run against a fake npm.cmd
   that is prepended to PATH for the duration of the suite. The real warm-up
   (real npm install through a real one-shot Verdaccio) is covered by the QA
-  evidence log, not here.
+  evidence log, not here. The bun parallel-frontend coverage additionally
+  drives Export-OSyncNpm through its warm-up loop with the server/robocopy
+  machinery MOCKED via InModuleScope, asserting the merged warm sequence and
+  the bun-packages.txt delivery contract.
 
   Run:
     powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Pester tests\NpmExport.Tests.ps1 -PassThru"
@@ -107,14 +110,37 @@ exit /b %FAKE_NPM_EXIT%
     # A synthetic in-memory config object for Export-OSyncNpm. All paths are
     # absolute so Resolve-OSyncConfigPath uses them verbatim (absolute paths
     # never resolve against the tool root).
+    # Optional bun parallel-frontend fixture: -BunEnabled mirrors the bun
+    # section of config\packagesync.json (version 1.4.2 / sha256 PIN-ME) and
+    # -BunListPath adds the 'paths.bunList' key. An absent 'pins.bun' section
+    # (= the current baseline config shape) means bun is disabled.
     function New-NeConfig {
         param(
             [string]$VerdaccioVersion,
             [string]$NpmListPath,
             [string]$RuntimeWhitelistPath,
             [string]$RepoRoot,
-            [string]$StagingRoot
+            [string]$StagingRoot,
+            [string]$BunListPath,
+            [switch]$BunEnabled
         )
+        $paths = [pscustomobject]@{
+            npmList          = $NpmListPath
+            runtimeWhitelist = $RuntimeWhitelistPath
+        }
+        if (-not [string]::IsNullOrWhiteSpace($BunListPath)) {
+            $paths | Add-Member -NotePropertyName bunList -NotePropertyValue $BunListPath -Force
+        }
+        $pins = [pscustomobject]@{
+            npm = [pscustomobject]@{ verdaccioVersion = $VerdaccioVersion }
+        }
+        if ($BunEnabled) {
+            $pins | Add-Member -NotePropertyName bun -NotePropertyValue ([pscustomobject]@{
+                version = '1.4.2'
+                url     = 'https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip'
+                sha256  = 'PIN-ME'
+            }) -Force
+        }
         return [pscustomobject]@{
             schemaVersion  = 1
             role           = 'A'
@@ -122,13 +148,8 @@ exit /b %FAKE_NPM_EXIT%
             stagingRoot    = $StagingRoot
             verdaccioPort  = 4873
             npm            = [pscustomobject]@{ aVerdaccioPort = 4874 }
-            paths          = [pscustomobject]@{
-                npmList          = $NpmListPath
-                runtimeWhitelist = $RuntimeWhitelistPath
-            }
-            pins           = [pscustomobject]@{
-                npm = [pscustomobject]@{ verdaccioVersion = $VerdaccioVersion }
-            }
+            paths          = $paths
+            pins           = $pins
         }
     }
 }
@@ -557,5 +578,172 @@ Describe 'port checks' {
         $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
         $listener.Stop()
         Wait-OSyncPortListening -Port $port -TimeoutSeconds 1 | Should -Be $false
+    }
+}
+
+Describe 'Export-OSyncNpm bun parallel frontend' {
+    # bun is a PARALLEL FRONTEND of the npm category: its manifest entries are
+    # merged into the SAME one-shot Verdaccio warm list (npm entries first,
+    # bun-only entries after, dedup by package name - npm wins) and the bun
+    # manifest is shipped verbatim to <staging>\npm\bun-packages.txt. A
+    # missing/empty bun list or a config without pins.bun skips bun entirely -
+    # never an error (an empty bun list is legal: bun on B installs everything
+    # from the npm list through the same registry).
+    #
+    # These run the REAL Export-OSyncNpm (the fake npm.cmd answers the engines
+    # cross-assertion and the verdaccio install), but the server/robocopy
+    # machinery is MOCKED so no server starts and nothing touches the network.
+    # The module-internal calls (Invoke-ONpmInstall, Start/Stop-OVerdaccioProcess,
+    # Get-ONpmExportLocalWorkRoot, ...) are intercepted via InModuleScope -
+    # Pester cannot mock non-exported module functions from the test scope, and
+    # the mocks DO intercept when the exported function is invoked from here.
+    BeforeEach {
+        Reset-NewFakeEnv
+        $env:FAKE_NPM_ENGINES = '{"node":">=22"}'
+        $env:FAKE_NPM_EXIT = '0'
+        InModuleScope OfflineSync {
+            $script:BunSpecs = @()
+            Mock Get-ONodeExe { return 'C:\dummy\node.exe' }
+            Mock Test-OSyncPortListening { return $false }
+            Mock Wait-OSyncPortListening { return $true }
+            Mock Start-OVerdaccioProcess { return [pscustomobject]@{ Id = 12345 } }
+            Mock Stop-OVerdaccioProcess { }
+            Mock Start-Sleep { }
+            Mock Invoke-OSyncRobocopy { }
+            Mock Get-ONpmExportLocalWorkRoot {
+                # The fake verdaccio install "lands" here: pre-seed the entry
+                # script the export checks right after the (fake, exit-0) install.
+                $script:BunLocalWork = Join-Path $TestDrive ('lw-' + [guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Path (Join-Path $script:BunLocalWork 'verdaccio-a\node_modules\verdaccio\bin') -Force | Out-Null
+                [System.IO.File]::WriteAllText((Join-Path $script:BunLocalWork 'verdaccio-a\node_modules\verdaccio\bin\verdaccio'), 'fake entry', (New-Object System.Text.UTF8Encoding($false)))
+                return $script:BunLocalWork
+            }
+            Mock Invoke-ONpmInstall {
+                param([string]$NpmExe, [string]$Spec, [string]$Registry, [string]$Prefix, [string]$CacheDir)
+                $script:BunSpecs += $Spec
+                return [pscustomobject]@{ ExitCode = 0; Output = 'ok' }
+            }
+        }
+    }
+
+    It 'merges bun-only entries after the npm list, warms a shared name once and delivers bun-packages.txt' {
+        $npmList = New-NeTempFile -Name 'bun-a\npm-list.txt' -Content "is-odd@3.0.1`nleft-pad@1.3.0"
+        $bunList = New-NeTempFile -Name 'bun-a\bun-list.txt' -Content "is-odd@3.0.1`nbun-only-pkg@1.0.0"
+        $runtime = New-NeTempFile -Name 'bun-a\runtime-winget.txt' -Content "OpenJS.NodeJS.LTS@24.19.0`n"
+        $stagingDir = Join-Path $script:neRoot 'bun-a\gen1'
+        $cfg = New-NeConfig -VerdaccioVersion '6.10.2' -NpmListPath $npmList `
+            -RuntimeWhitelistPath $runtime -RepoRoot (Join-Path $script:neRoot 'bun-a\repo') `
+            -StagingRoot (Join-Path $script:neRoot 'bun-a\staging-root') `
+            -BunListPath $bunList -BunEnabled
+
+        $report = Export-OSyncNpm -Config $cfg -StagingDir $stagingDir
+
+        # Warm sequence: npm entries first, then the bun-only entry; the name
+        # present in BOTH lists (is-odd) is warmed exactly once (npm wins).
+        $specs = @(InModuleScope OfflineSync { @($script:BunSpecs) })
+        ($specs -join ',') | Should -Be 'is-odd@3.0.1,left-pad@1.3.0,bun-only-pkg@1.0.0'
+
+        # Report bun section.
+        $report.bun.enabled | Should -Be $true
+        $report.bun.listPath | Should -Be $bunList
+        $report.bun.entriesAdded | Should -Be 1
+        $report.bun.delivered | Should -Be (Join-Path $stagingDir 'npm\bun-packages.txt')
+
+        # Contract file delivered with the bun list content (verbatim copy).
+        $delivered = Join-Path $stagingDir 'npm\bun-packages.txt'
+        (Test-Path -LiteralPath $delivered) | Should -BeTrue
+        ([System.IO.File]::ReadAllText($delivered)) | Should -BeExactly ([System.IO.File]::ReadAllText($bunList))
+    }
+
+    It 'skips bun warming and delivery when the bun list file is missing (no error)' {
+        $npmList = New-NeTempFile -Name 'bun-b\npm-list.txt' -Content "is-odd@3.0.1"
+        $bunList = Join-Path $script:neRoot 'bun-b\missing-bun-list.txt'
+        $runtime = New-NeTempFile -Name 'bun-b\runtime-winget.txt' -Content "OpenJS.NodeJS.LTS@24.19.0`n"
+        $stagingDir = Join-Path $script:neRoot 'bun-b\gen1'
+        $cfg = New-NeConfig -VerdaccioVersion '6.10.2' -NpmListPath $npmList `
+            -RuntimeWhitelistPath $runtime -RepoRoot (Join-Path $script:neRoot 'bun-b\repo') `
+            -StagingRoot (Join-Path $script:neRoot 'bun-b\staging-root') `
+            -BunListPath $bunList -BunEnabled
+
+        $report = Export-OSyncNpm -Config $cfg -StagingDir $stagingDir
+
+        # No extra warming - only the npm entry was warmed.
+        $specs = @(InModuleScope OfflineSync { @($script:BunSpecs) })
+        ($specs -join ',') | Should -Be 'is-odd@3.0.1'
+
+        $report.bun.enabled | Should -Be $true
+        $report.bun.listPath | Should -Be $bunList
+        $report.bun.entriesAdded | Should -Be 0
+        $report.bun.delivered | Should -BeNullOrEmpty
+        (Test-Path -LiteralPath (Join-Path $stagingDir 'npm\bun-packages.txt')) | Should -BeFalse
+    }
+
+    It 'skips bun warming and delivery when the bun list is empty (comments only)' {
+        $npmList = New-NeTempFile -Name 'bun-c\npm-list.txt' -Content "is-odd@3.0.1"
+        $bunList = New-NeTempFile -Name 'bun-c\bun-list.txt' -Content "# comments only`n# an empty bun list is legal"
+        $runtime = New-NeTempFile -Name 'bun-c\runtime-winget.txt' -Content "OpenJS.NodeJS.LTS@24.19.0`n"
+        $stagingDir = Join-Path $script:neRoot 'bun-c\gen1'
+        $cfg = New-NeConfig -VerdaccioVersion '6.10.2' -NpmListPath $npmList `
+            -RuntimeWhitelistPath $runtime -RepoRoot (Join-Path $script:neRoot 'bun-c\repo') `
+            -StagingRoot (Join-Path $script:neRoot 'bun-c\staging-root') `
+            -BunListPath $bunList -BunEnabled
+
+        $report = Export-OSyncNpm -Config $cfg -StagingDir $stagingDir
+
+        $specs = @(InModuleScope OfflineSync { @($script:BunSpecs) })
+        ($specs -join ',') | Should -Be 'is-odd@3.0.1'
+
+        $report.bun.enabled | Should -Be $true
+        $report.bun.entriesAdded | Should -Be 0
+        $report.bun.delivered | Should -BeNullOrEmpty
+        (Test-Path -LiteralPath (Join-Path $stagingDir 'npm\bun-packages.txt')) | Should -BeFalse
+    }
+
+    It 'behaves like the baseline when the config has no pins.bun (bun disabled, no delivery)' {
+        $npmList = New-NeTempFile -Name 'bun-d\npm-list.txt' -Content "is-odd@3.0.1"
+        $bunList = New-NeTempFile -Name 'bun-d\bun-list.txt' -Content "bun-only-pkg@1.0.0"
+        $runtime = New-NeTempFile -Name 'bun-d\runtime-winget.txt' -Content "OpenJS.NodeJS.LTS@24.19.0`n"
+        $stagingDir = Join-Path $script:neRoot 'bun-d\gen1'
+        # Even with paths.bunList configured, an absent pins.bun section keeps
+        # the export identical to the pre-bun baseline: the bun list is never
+        # read, nothing extra is warmed, nothing is delivered.
+        $cfg = New-NeConfig -VerdaccioVersion '6.10.2' -NpmListPath $npmList `
+            -RuntimeWhitelistPath $runtime -RepoRoot (Join-Path $script:neRoot 'bun-d\repo') `
+            -StagingRoot (Join-Path $script:neRoot 'bun-d\staging-root') `
+            -BunListPath $bunList
+
+        $report = Export-OSyncNpm -Config $cfg -StagingDir $stagingDir
+
+        $specs = @(InModuleScope OfflineSync { @($script:BunSpecs) })
+        ($specs -join ',') | Should -Be 'is-odd@3.0.1'
+
+        $report.bun.enabled | Should -Be $false
+        $report.bun.listPath | Should -BeNullOrEmpty
+        $report.bun.entriesAdded | Should -Be 0
+        $report.bun.delivered | Should -BeNullOrEmpty
+        (Test-Path -LiteralPath (Join-Path $stagingDir 'npm\bun-packages.txt')) | Should -BeFalse
+    }
+
+    It 'skips bun when enabled but the config has no paths.bunList key (no error)' {
+        $npmList = New-NeTempFile -Name 'bun-e\npm-list.txt' -Content "is-odd@3.0.1"
+        $runtime = New-NeTempFile -Name 'bun-e\runtime-winget.txt' -Content "OpenJS.NodeJS.LTS@24.19.0`n"
+        $stagingDir = Join-Path $script:neRoot 'bun-e\gen1'
+        # pins.bun present (bun enabled) but no paths.bunList key:
+        # Resolve-OSyncConfigPath returns $null and the merge is skipped.
+        $cfg = New-NeConfig -VerdaccioVersion '6.10.2' -NpmListPath $npmList `
+            -RuntimeWhitelistPath $runtime -RepoRoot (Join-Path $script:neRoot 'bun-e\repo') `
+            -StagingRoot (Join-Path $script:neRoot 'bun-e\staging-root') `
+            -BunEnabled
+
+        $report = Export-OSyncNpm -Config $cfg -StagingDir $stagingDir
+
+        $specs = @(InModuleScope OfflineSync { @($script:BunSpecs) })
+        ($specs -join ',') | Should -Be 'is-odd@3.0.1'
+
+        $report.bun.enabled | Should -Be $true
+        $report.bun.listPath | Should -BeNullOrEmpty
+        $report.bun.entriesAdded | Should -Be 0
+        $report.bun.delivered | Should -BeNullOrEmpty
+        (Test-Path -LiteralPath (Join-Path $stagingDir 'npm\bun-packages.txt')) | Should -BeFalse
     }
 }

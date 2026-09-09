@@ -47,6 +47,8 @@ Describe 'OfflineSync config loading (Get-OSyncConfig)' {
             $config.pip.upgradeOnApply | Should -BeTrue
             $config.pip.allowSdist | Should -BeFalse
             $config.pins.chezmoi.version | Should -Be '2.72.0'
+            $config.pins.bun.version | Should -Be '1.4.2'
+            $config.paths.bunList | Should -Be 'manifests\bun-packages.txt'
         }
 
         It 'loads the B-role template config' {
@@ -127,6 +129,42 @@ Describe 'OfflineSync config loading (Get-OSyncConfig)' {
             try { Get-OSyncConfig -Path $bad } catch { $err = $_ }
             $err | Should -Not -BeNullOrEmpty
             $err.Exception.Message | Should -BeLike '*valid JSON*'
+        }
+    }
+
+    Context 'bun section (optional, presence-gated)' {
+        It 'validates a legacy config WITHOUT any bun keys (B-side compatibility red line)' {
+            $legacy = Join-Path $testRoot 'legacy-no-bun.json'
+            New-TestConfig -OutFile $legacy -Mutate { param($o)
+                $o.pins.PSObject.Properties.Remove('bun')
+                $o.paths.PSObject.Properties.Remove('bunList')
+            }
+            $config = Get-OSyncConfig -Path $legacy
+            $config | Should -Not -BeNullOrEmpty
+            Test-OSyncBunEnabled -Config $config | Should -BeFalse
+        }
+
+        It 'Test-OSyncBunEnabled returns true when pins.bun is present' {
+            $config = Get-OSyncConfig -Path $configPath
+            Test-OSyncBunEnabled -Config $config | Should -BeTrue
+        }
+
+        It 'throws when pins.bun is present but a sub-key is missing, naming the key' {
+            $bad = Join-Path $testRoot 'bun-no-url.json'
+            New-TestConfig -OutFile $bad -Mutate { param($o) $o.pins.bun.PSObject.Properties.Remove('url') }
+            $err = $null
+            try { Get-OSyncConfig -Path $bad } catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*pins.bun.url*'
+        }
+
+        It 'throws when a pins.bun sub-key is empty, naming the key' {
+            $bad = Join-Path $testRoot 'bun-empty-sha.json'
+            New-TestConfig -OutFile $bad -Mutate { param($o) $o.pins.bun.sha256 = '  ' }
+            $err = $null
+            try { Get-OSyncConfig -Path $bad } catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*pins.bun.sha256*'
         }
     }
 

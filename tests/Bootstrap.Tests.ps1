@@ -709,6 +709,183 @@ Describe 'Bootstrap: step 4 - Verdaccio task registration and port wait' {
     }
 }
 
+Describe 'Bootstrap: step 4.5 - bun runtime landing' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\RepoContract.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\ManifestParse.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\HttpServer.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\State.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\PipExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\PipApply.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\NpmExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\NpmApply.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\DotfilesExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\RuntimeExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetApply.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Bootstrap.ps1')
+
+        $script:NewConfig = {
+            param([string]$StateDir, [hashtable]$Overrides = @{}, [int]$VerdaccioPort = 4873)
+            $cfg = [pscustomobject]@{
+                role       = 'B'
+                stateDir   = $StateDir
+                repoRoot   = 'C:\unused\repo'
+                httpPort   = 8788
+                verdaccioPort = $VerdaccioPort
+                categories = [pscustomobject]@{ winget = $true; pip = $true; npm = $true; dotfiles = $true }
+                winget     = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
+            }
+            foreach ($k in $Overrides.Keys) { $cfg.$k = $Overrides[$k] }
+            return $cfg
+        }
+        # Builds a work-copy-style root with the runtime\bun payload
+        # (bun.exe + version.txt, plus a bun.zip that must NEVER be copied).
+        # -WithPayload $false leaves the payload out entirely (gate test).
+        $script:NewBunRoot = {
+            param([string]$Root, [string]$Version = '1.4.2', [bool]$WithPayload = $true)
+            $bunDir = Join-Path (Join-Path $Root 'runtime') 'bun'
+            if ($WithPayload) {
+                New-Item -ItemType Directory -Path $bunDir -Force | Out-Null
+                [System.IO.File]::WriteAllBytes((Join-Path $bunDir 'bun.exe'), [byte[]]@(1, 2, 3))
+                [System.IO.File]::WriteAllBytes((Join-Path $bunDir 'bun.zip'), [byte[]]@(9, 9, 9))
+                [System.IO.File]::WriteAllText((Join-Path $bunDir 'version.txt'), $Version + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+            }
+        }
+    }
+
+    It 'gate: skips (never fails) when the bun payload is absent from the work copy' {
+        $root = Join-Path $TestDrive 'bun-root-absent'
+        & $script:NewBunRoot $root -WithPayload $false
+        $stateDir = Join-Path $TestDrive 'bun-state-absent'
+        $cfg = & $script:NewConfig $stateDir
+
+        $s = Invoke-OSyncBootstrapStepBun -Config $cfg -Root $root
+
+        $s.Step | Should -Be '4.5-bun'
+        $s.Status | Should -Be 'skipped'
+        $s.Message | Should -BeLike '*payload absent*'
+    }
+
+    It 'gate: skips when the npm category is disabled even with the payload present' {
+        $root = Join-Path $TestDrive 'bun-root-npmoff'
+        & $script:NewBunRoot $root
+        $stateDir = Join-Path $TestDrive 'bun-state-npmoff'
+        $cfg = & $script:NewConfig $stateDir @{ categories = [pscustomobject]@{ winget = $true; pip = $true; npm = $false; dotfiles = $true } }
+
+        $s = Invoke-OSyncBootstrapStepBun -Config $cfg -Root $root
+
+        $s.Status | Should -Be 'skipped'
+        $s.Message | Should -BeLike '*npm category disabled*'
+    }
+
+    It 'happy path: lands bun.exe (never bun.zip), appends the PATH entry, sets BUN_CONFIG_REGISTRY and verifies the version' {
+        $root = Join-Path $TestDrive 'bun-root-ok'
+        & $script:NewBunRoot $root -Version '1.4.2'
+        $stateDir = Join-Path $TestDrive 'bun-state-ok'
+        $cfg = & $script:NewConfig $stateDir @{} 4999
+        Mock Set-OSyncMachinePathEntry { return $true }
+        Mock Set-OSyncMachineEnvVar { }
+
+        $s = Invoke-OSyncBootstrapStepBun -Config $cfg -Root $root -VersionQuerier { param($Exe) '1.4.2' }
+
+        $s.Step | Should -Be '4.5-bun'
+        $s.Status | Should -Be 'done'
+        (Test-Path -LiteralPath (Join-Path $stateDir 'bun\bun.exe') -PathType Leaf) | Should -Be $true
+        (Test-Path -LiteralPath (Join-Path $stateDir 'bun\bun.zip')) | Should -Be $false
+        Should -Invoke Set-OSyncMachinePathEntry -Times 1 -Exactly -ParameterFilter { $PathEntry -eq (Join-Path $stateDir 'bun') }
+        Should -Invoke Set-OSyncMachineEnvVar -Times 1 -Exactly -ParameterFilter { $Name -eq 'BUN_CONFIG_REGISTRY' -and $Value -eq 'http://127.0.0.1:4999/' }
+        $s.Data.BunExe | Should -Be (Join-Path $stateDir 'bun\bun.exe')
+        $s.Data.PathChanged | Should -Be $true
+        $s.Data.Registry | Should -Be 'http://127.0.0.1:4999/'
+        $s.Data.Version | Should -Be '1.4.2'
+    }
+
+    It 'PATH idempotency: an already-present entry returns $false and writes nothing (case-insensitive, trimmed)' {
+        $script:envWrites = @()
+        Mock Set-OSyncMachineEnvVar { param($Name, $Value) $script:envWrites += "$Name=$Value" }
+
+        $changed = Set-OSyncMachinePathEntry -PathEntry 'c:\windows' -MachinePath 'C:\Windows;C:\Tools; '
+
+        $changed | Should -Be $false
+        $script:envWrites.Count | Should -Be 0
+    }
+
+    It 'PATH idempotency: an absent entry returns $true and appends without trailing/leading artifacts' {
+        $script:envWrites = @()
+        Mock Set-OSyncMachineEnvVar { param($Name, $Value) $script:envWrites += "$Name=$Value" }
+
+        $changed = Set-OSyncMachinePathEntry -PathEntry 'C:\bun' -MachinePath 'C:\Windows;'
+
+        $changed | Should -Be $true
+        $script:envWrites.Count | Should -Be 1
+        $script:envWrites[0] | Should -Be 'Path=C:\Windows;C:\bun'
+    }
+
+    It "PATH idempotency: an empty machine PATH appends the bare entry (no leading ';')" {
+        $script:envWrites = @()
+        Mock Set-OSyncMachineEnvVar { param($Name, $Value) $script:envWrites += "$Name=$Value" }
+
+        $changed = Set-OSyncMachinePathEntry -PathEntry 'C:\bun' -MachinePath '   '
+
+        $changed | Should -Be $true
+        $script:envWrites.Count | Should -Be 1
+        $script:envWrites[0] | Should -Be 'Path=C:\bun'
+    }
+
+    It 'version mismatch between bun --version and version.txt throws naming step 4.5-bun' {
+        $root = Join-Path $TestDrive 'bun-root-mismatch'
+        & $script:NewBunRoot $root -Version '1.4.2'
+        $stateDir = Join-Path $TestDrive 'bun-state-mismatch'
+        $cfg = & $script:NewConfig $stateDir
+        Mock Set-OSyncMachinePathEntry { return $true }
+        Mock Set-OSyncMachineEnvVar { }
+
+        $err = $null
+        try { Invoke-OSyncBootstrapStepBun -Config $cfg -Root $root -VersionQuerier { param($Exe) '9.9.9' } | Out-Null } catch { $err = $_.Exception.Message }
+
+        $err | Should -Not -BeNullOrEmpty
+        $err | Should -BeLike '*4.5-bun*'
+        $err | Should -BeLike "*'9.9.9'*"
+        $err | Should -BeLike "*'1.4.2'*"
+    }
+
+    It 'WhatIf reports the planned actions with zero changes (no copy, no PATH/env writes)' {
+        $root = Join-Path $TestDrive 'bun-root-wi'
+        & $script:NewBunRoot $root
+        $stateDir = Join-Path $TestDrive 'bun-state-wi'
+        $cfg = & $script:NewConfig $stateDir
+        $script:pathCalls = 0
+        $script:envCalls = 0
+        Mock Set-OSyncMachinePathEntry { $script:pathCalls++; return $true }
+        Mock Set-OSyncMachineEnvVar { $script:envCalls++ }
+
+        $s = Invoke-OSyncBootstrapStepBun -Config $cfg -Root $root -WhatIf
+
+        $s.Status | Should -Be 'done'
+        $s.Message | Should -BeLike '*WhatIf*'
+        $s.Message | Should -BeLike '*BUN_CONFIG_REGISTRY*'
+        $script:pathCalls | Should -Be 0
+        $script:envCalls | Should -Be 0
+        (Test-Path -LiteralPath (Join-Path $stateDir 'bun')) | Should -Be $false
+    }
+
+    It 'step 5 layout WhatIf and the stateDir skeleton both include the bun dir (SystemAdminsRead)' {
+        $cfg = & $script:NewConfig (Join-Path $TestDrive 'bun-layout-wi')
+        $s = Invoke-OSyncBootstrapStepStateDirLayout -Config $cfg -WhatIf
+        $s.Status | Should -Be 'done'
+        $s.Message | Should -BeLike '*bun=SystemAdminsRead*'
+
+        $stateDir = Join-Path $TestDrive 'bun-skeleton'
+        $cfg2 = & $script:NewConfig $stateDir
+        New-OSyncStateDirSkeleton -Config $cfg2
+        (Test-Path -LiteralPath (Join-Path $stateDir 'bun') -PathType Container) | Should -Be $true
+    }
+}
+
 Describe 'Bootstrap: step 5 - stateDir layout and ACLs' {
     BeforeAll {
         . (Join-Path $PSScriptRoot '..\src\lib\RepoContract.ps1')
@@ -741,7 +918,7 @@ Describe 'Bootstrap: step 5 - stateDir layout and ACLs' {
         $cfg = & $script:NewConfig $stateDir
         $s = Invoke-OSyncBootstrapStepStateDirLayout -Config $cfg
         $s.Status | Should -Be 'done'
-        foreach ($sub in @('state', 'run', 'bin', 'work', 'verdaccio', 'verdaccio-bin')) {
+        foreach ($sub in @('state', 'run', 'bin', 'work', 'verdaccio', 'verdaccio-bin', 'bun')) {
             (Test-Path -LiteralPath (Join-Path $stateDir $sub) -PathType Container) | Should -Be $true
         }
         (Test-Path -LiteralPath (Join-Path $stateDir 'run\logs') -PathType Container) | Should -Be $true
@@ -1002,6 +1179,7 @@ Describe 'Bootstrap: step 7 + orchestration invariants' {
             Mock Invoke-OSyncBootstrapStepLocalManifest { New-OSyncBootstrapStepResult -Step '2-localmanifest' -Status 'skipped' -Message 'mocked' }
             Mock Invoke-OSyncBootstrapStepRuntimeWinget { New-OSyncBootstrapStepResult -Step '3-runtime-winget' -Status 'done' -Message 'mocked' -Data @{ PythonExe = 'C:\Python312\python.exe'; NodeExe = 'C:\node\node.exe' } }
             Mock Invoke-OSyncBootstrapStepNpm { New-OSyncBootstrapStepResult -Step '4-verdaccio' -Status 'done' -Message 'mocked' }
+            Mock Invoke-OSyncBootstrapStepBun { New-OSyncBootstrapStepResult -Step '4.5-bun' -Status 'skipped' -Message 'mocked' }
             # Step 5 is REAL in the dedicated 'stateDir layout' describe; here it
             # is mocked because the real icacls hardening makes state\ Users-RX -
             # the TEST process (a non-elevated/filtered token) could then no
@@ -1059,7 +1237,7 @@ Describe 'Bootstrap: step 7 + orchestration invariants' {
         $result.WingetExe | Should -Be 'C:\fake\winget.exe'
         $state = Get-OSyncState -Category winget -StateDir $stateDir
         $state.bootstrapped | Should -Be $true
-        $result.Steps.Count | Should -Be 7     # 0,1,2,3 (winget) + 5,6,7 (unconditional)
+        $result.Steps.Count | Should -Be 8     # 0,1,2,3 (winget) + 4.5-bun (unconditional, gate->skipped) + 5,6,7
     }
 
     It 'orchestration: WhatIf makes no state writes' {

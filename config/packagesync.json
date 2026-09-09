@@ -20,6 +20,7 @@
     "runtimeWhitelist": "manifests\\runtime-winget.txt",
     "requirements": "manifests\\requirements.txt",
     "npmList": "manifests\\npm-packages.txt",
+    "bunList": "manifests\\bun-packages.txt",
     "dotfilesSource": "manifests\\dotfiles"
   },
   "winget": {
@@ -54,6 +55,11 @@
     },
     "npm": {
       "verdaccioVersion": "6.10.2"
+    },
+    "bun": {
+      "version": "1.4.2",
+      "url": "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-windows-x64.zip",
+      "sha256": "PIN-ME"
     }
   }
 }

@@ -27,11 +27,29 @@
            non-zero (the operator pins it and re-runs),
          - hash mismatch -> aborts naming the file (expected vs actual),
          - match -> proceeds.
-       The App Installer chain (msixbundle/VCLibs/UI.Xaml) is NO LONGER
-       exported at all (user decision, 2026-09): modern Windows ships App
-       Installer / winget preinstalled, so the B-side bootstrap only
-       verifies winget.exe presence and never installs the pieces. The
-       appinstaller dir now carries ONLY VC_redist.x64.exe.
+        The App Installer chain (msixbundle/VCLibs/UI.Xaml) is NO LONGER
+        exported at all (user decision, 2026-09): modern Windows ships App
+        Installer / winget preinstalled, so the B-side bootstrap only
+        verifies winget.exe presence and never installs the pieces. The
+        appinstaller dir now carries ONLY VC_redist.x64.exe.
+
+     3.5. bun runtime payload (config.pins.bun - presence-gated; bun is NOT
+        a category): when pins.bun is present the pinned Windows bun
+        release zip is downloaded into <staging>\runtime\bun\bun.zip
+        (reuse-on-existing, so a PIN-ME run followed by a pinned re-run
+        performs exactly ONE download) and the same PIN-ME sha256 gate as
+        chezmoi is enforced:
+          - 'PIN-ME' -> prints the actual hash and exits non-zero,
+          - mismatch -> aborts (the download is not the pinned artifact),
+          - match -> extracts bun.exe (Expand-OSyncBunZip) and writes
+            version.txt = pins.bun.version (UTF8, no BOM) - the B-side
+            version-expectation source (the B config carries no pins.bun).
+        When pins.bun is absent the payload is skipped (Info log) and the
+        report carries bun = $null. Runs BETWEEN the appInstaller PIN-ME
+        gate and the heavy Python/Node winget downloads so a PIN-ME
+        iteration never re-downloads them. No files.json / trust-root
+        change is needed: New-OSyncFilesManifest enumerates whole category
+        dirs.
 
     4. Runtime winget entries: REUSES todo 6's download+rewrite functions
        (Invoke-OSyncWingetDownload / ConvertTo-OSyncWingetYamlContent /
@@ -312,6 +330,42 @@ function Assert-OSyncAppInstallerHashes {
     return $results
 }
 
+function Expand-OSyncBunZip {
+    <#
+      Extracts the bun.exe entry from the pinned bun release zip into
+      <Destination>\bun.exe. The bun Windows release zip contains only
+      bun.exe, but the entry is matched by Name (case-insensitive) like the
+      chezmoi helper for robustness. Throws when the entry is missing.
+      Modeled on Expand-OSyncChezmoiZip (DotfilesExport.ps1).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZipPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        $entry = $zip.Entries | Where-Object { $_.Name -ieq 'bun.exe' } | Select-Object -First 1
+        if ($null -eq $entry) {
+            throw "Expand-OSyncBunZip: no 'bun.exe' entry found in '$ZipPath'."
+        }
+        if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
+            New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+        }
+        $target = Join-Path $Destination 'bun.exe'
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+        return $target
+    }
+    finally {
+        $zip.Dispose()
+    }
+}
+
 function Invoke-OSyncRuntimeWingetExport {
     <#
       Exports every runtime-winget.txt entry into <StagingDir>\winget\<Id>\
@@ -572,6 +626,70 @@ function Export-OSyncRuntime {
     $appInstallerDir = Join-Path $runtimeDir 'appinstaller'
     $pieceResults = Assert-OSyncAppInstallerHashes -Config $Config -Dir $appInstallerDir
 
+    # --- 3.5 bun payload (config.pins.bun - presence-gated; bun is NOT a
+    # category, and pins.bun is NEVER a required key: its absence disables
+    # bun entirely). Runs BEFORE the heavy Python/Node winget downloads so a
+    # PIN-ME iteration never re-downloads them. Mirrors the chezmoi PIN-ME
+    # flow (DotfilesExport.ps1 step 4) exactly. ---
+    $bunResult = $null
+    if (Test-OSyncBunEnabled -Config $Config) {
+        $runtimeBunDir = Join-Path $runtimeDir 'bun'
+        $zipPath = Join-Path $runtimeBunDir 'bun.zip'
+        if (-not (Test-Path -LiteralPath $runtimeBunDir -PathType Container)) {
+            New-Item -ItemType Directory -Path $runtimeBunDir -Force | Out-Null
+        }
+        $bunUrl = [string]$Config.pins.bun.url
+        $bunVersion = [string]$Config.pins.bun.version
+        $expected = [string]$Config.pins.bun.sha256
+        $isPinMe = ($expected -eq 'PIN-ME')
+
+        # Download only when the zip is missing: a PIN-ME run followed by a
+        # pinned re-run (same staging dir) performs exactly ONE download,
+        # and a retry after a hash failure does not re-fetch the same bytes.
+        if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            Write-OSyncLog -Category 'runtime' -Level Info -Message "Downloading bun from '$bunUrl' -> '$zipPath'" -Config $Config | Out-Null
+            $null = Invoke-OSyncDownload -Uri $bunUrl -OutFile $zipPath
+        }
+        else {
+            Write-OSyncLog -Category 'runtime' -Level Info -Message "Reusing existing download '$zipPath'" -Config $Config | Out-Null
+        }
+
+        $actualHash = Get-OSyncFileSha256 -Path $zipPath
+
+        if ($isPinMe) {
+            # PIN-ME: print the actual hash and exit non-zero (prompt to pin).
+            Write-Host "Export-OSyncRuntime: config.pins.bun.sha256 is 'PIN-ME'."
+            Write-Host "Actual sha256 of '$zipPath' is: $actualHash"
+            Write-Host 'Pin it into config\packagesync.json (pins.bun.sha256) and re-run.'
+            Write-OSyncLog -Category 'runtime' -Level Error -Message "PIN-ME: actual bun sha256 is $actualHash - pin it into the config and re-run." -Data @{ actualSha256 = $actualHash } -Config $Config | Out-Null
+            throw "Export-OSyncRuntime: config.pins.bun.sha256 is 'PIN-ME' - pin the real sha256 ($actualHash) into config\packagesync.json and re-run."
+        }
+
+        if ($actualHash -ne $expected) {
+            Write-OSyncLog -Category 'runtime' -Level Error -Message "bun sha256 mismatch: expected '$expected', got '$actualHash'." -Data @{ expected = $expected; actual = $actualHash } -Config $Config | Out-Null
+            throw "Export-OSyncRuntime: bun sha256 mismatch for '$zipPath': expected '$expected', got '$actualHash'. Aborting - the download is not the pinned artifact."
+        }
+
+        $bunExePath = Expand-OSyncBunZip -ZipPath $zipPath -Destination $runtimeBunDir
+        $versionTxt = Join-Path $runtimeBunDir 'version.txt'
+        # UTF8 with NO BOM (UTF8Encoding($false)): version.txt is the B-side
+        # version-expectation source (the B config has no pins.bun).
+        [System.IO.File]::WriteAllText($versionTxt, $bunVersion, (New-Object System.Text.UTF8Encoding($false)))
+        Write-OSyncLog -Category 'runtime' -Level Info -Message "bun.exe extracted to '$bunExePath' (sha256 $actualHash, version $bunVersion)" -Data @{ sha256 = $actualHash; version = $bunVersion } -Config $Config | Out-Null
+
+        $bunResult = [pscustomobject]@{
+            version    = $bunVersion
+            url        = $bunUrl
+            sha256     = $actualHash
+            zipPath    = $zipPath
+            exePath    = $bunExePath
+            versionTxt = $versionTxt
+        }
+    }
+    else {
+        Write-OSyncLog -Category 'runtime' -Level Info -Message 'bun payload skipped (pins.bun absent)' -Config $Config | Out-Null
+    }
+
     # --- 4. runtime winget entries (reuse todo 6 download+rewrite) ---
     $entries = @(Read-OSyncWingetList -Path $runtimeWingetPath)
     $wingetResult = Invoke-OSyncRuntimeWingetExport -ParsedList $entries -StagingDir $StagingDir -Config $Config -WingetExePath $WingetExePath
@@ -647,6 +765,7 @@ function Export-OSyncRuntime {
             dir    = $appInstallerDir
             pieces = @($pieceResults)
         }
+        bun = $bunResult
         verdaccio = [pscustomobject]@{
             version = $verdaccioVersion
             dir     = $verdaccioDir

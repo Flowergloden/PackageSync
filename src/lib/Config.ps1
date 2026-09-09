@@ -139,6 +139,21 @@ function Get-OSyncConfig {
         throw "Get-OSyncConfig: config key 'categories.winget' must be enabled when 'categories.pip' or 'categories.npm' is enabled (the runtime bootstrap payload lives in the winget category directory)."
     }
 
+    # --- optional bun section (presence-gated feature; NEVER a required key) ---
+    # The B-side config is locally owned and the tool self-refresh never
+    # overwrites it, so an old config WITHOUT any bun keys MUST keep
+    # validating (bun simply stays off). When pins.bun IS present its three
+    # sub-keys must be non-empty.
+    $bunPins = Get-ONestedValue -Object $config -Path 'pins.bun'
+    if ($null -ne $bunPins) {
+        foreach ($key in @('pins.bun.version', 'pins.bun.url', 'pins.bun.sha256')) {
+            $value = Get-ONestedValue -Object $config -Path $key
+            if ($null -eq $value -or ($value -is [string] -and $value.Trim().Length -eq 0)) {
+                throw "Get-OSyncConfig: config key '$key' is missing or empty (required when 'pins.bun' is present; remove the whole 'pins.bun' section to disable bun)."
+            }
+        }
+    }
+
     # --- stamp the derived tool root (path-resolution fix) ---
     # config.paths.* are operator-edited INPUT files living in the TOOL repo
     # (manifests\...), NOT in the output landing dir config.repoRoot. The tool
@@ -154,6 +169,21 @@ function Get-OSyncConfig {
     $config | Add-Member -NotePropertyName toolRoot -NotePropertyValue $toolRoot -Force
 
     return $config
+}
+
+function Test-OSyncBunEnabled {
+    <#
+      Presence-gated feature switch: bun support (the npm-category parallel
+      frontend) is ON exactly when the config carries a 'pins.bun' section.
+      'pins.bun' is NEVER a required key - an old, locally-owned B config
+      without bun keys must keep validating and behaving exactly as before.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+    return ($null -ne (Get-ONestedValue -Object $Config -Path 'pins.bun'))
 }
 
 function Resolve-OSyncConfigPath {

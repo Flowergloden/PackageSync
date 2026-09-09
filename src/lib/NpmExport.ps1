@@ -25,16 +25,25 @@
         so the snapshot is guaranteed still - we never reuse an operator's daily
         Verdaccio (Metis m7).
     5. Generates <staging>\npm\verdaccio-b.yml: storage is the RELATIVE path ./storage
-       (Verdaccio resolves it against the config file location; the B-side local copy
-       uses the same layout, Oracle M5). It MUST NOT contain uplinks/proxy keys,
-       packages '**' has only access: $all, listen 127.0.0.1:<verdaccioPort>, web UI
-       disabled. Copies manifests\npm-packages.txt -> <staging>\npm\packages.txt
-       (delivery contract, the B-side health check reads it).
+        (Verdaccio resolves it against the config file location; the B-side local copy
+        uses the same layout, Oracle M5). It MUST NOT contain uplinks/proxy keys,
+        packages '**' has only access: $all, listen 127.0.0.1:<verdaccioPort>, web UI
+        disabled. Copies manifests\npm-packages.txt -> <staging>\npm\packages.txt
+        (delivery contract, the B-side health check reads it).
+    5b. bun parallel frontend (presence-gated on pins.bun): when enabled, the bun
+        manifest (paths.bunList) is merged into the SAME one-shot warm list - npm
+        entries first, then bun-only entries (dedup by name, case-insensitive, npm
+        wins). The merged list shares the one storage snapshot with npm (zero extra
+        pipeline). When bun entries were merged, the bun manifest is copied verbatim
+        to <staging>\npm\bun-packages.txt (delivery contract, the B-side apply reads
+        it to pick the verification package). A missing/empty bun list skips both
+        warming and delivery with an Info log - NOT an error (an empty bun list is
+        legal: bun installs everything from the npm list via the same registry).
     6. Export-time assertion: verdaccio-b.yml content must not match uplinks|proxy and
-       must contain a line matching ^\s*storage:\s*\./storage\s*$ (Oracle M5).
+        must contain a line matching ^\s*storage:\s*\./storage\s*$ (Oracle M5).
     7. Cross-assertion (fail-fast, before any heavy work): `npm view verdaccio@<pinned>
-       engines` node requirement must be compatible with the pinned Node major in
-       manifests\runtime-winget.txt. Mismatch -> export fails (Oracle r4-m4).
+        engines` node requirement must be compatible with the pinned Node major in
+        manifests\runtime-winget.txt. Mismatch -> export fails (Oracle r4-m4).
 
     Per-package failures are recorded in the report (failed array) and do not abort
     the remaining packages, mirroring the winget/pip export contract.
@@ -44,7 +53,10 @@
   Returns a report object:
     category, verdaccioVersion, nodeEngines, nodeCompat, aPort, storageDir,
     bConfig, packagesTxt, warmed (array of ok entries), failed (array of failed
-    entries with error text).
+    entries with error text), bun (enabled / listPath / entriesAdded / delivered
+    - the bun parallel-frontend merge result; entriesAdded is the bun-only count
+    merged into the warm list, delivered is <staging>\npm\bun-packages.txt or
+    $null when no bun entries were merged).
 #>
 
 function Get-ONpmExe {
@@ -672,6 +684,65 @@ function Export-OSyncNpm {
         throw "Export-OSyncNpm: npm package list '$listPath' is empty - nothing to warm."
     }
 
+    # --- bun parallel frontend: merge bun-only entries into the same warm list ---
+    # bun is a PARALLEL FRONTEND of the npm category: it consumes the SAME
+    # Verdaccio dependency tree (shared storage snapshot, zero extra pipeline).
+    # Enabled exactly when the config carries a 'pins.bun' section
+    # (Test-OSyncBunEnabled - presence-gated; 'pins.bun' is never a required
+    # key, so an old config without it keeps behaving exactly as before).
+    # A missing 'paths.bunList' key, a missing bun list FILE, or an empty
+    # (comments-only) bun list are all LEGAL and NOT errors - bun on B can
+    # install every package from the npm list through the shared registry, so
+    # an empty bun list simply means "no bun-specific extras to warm".
+    $bunEnabled = Test-OSyncBunEnabled -Config $Config
+    $bunListPath = $null
+    $bunAdded = @()
+    $bunMerged = $false
+    if ($bunEnabled) {
+        # Resolve-OSyncConfigPath takes a MANDATORY path string and throws on
+        # an empty/absent value, so probe the optional 'paths.bunList' key
+        # first via the module's nested-value helper (bun is never a required
+        # config key) - an absent key means "no bun list configured", which
+        # skips the merge, NOT an error.
+        $bunListRaw = Get-ONestedValue -Object $Config -Path 'paths.bunList'
+        if ([string]::IsNullOrWhiteSpace([string]$bunListRaw)) {
+            Write-OSyncLog -Category 'npm' -Level Info -Message "bun merge skipped (config has no 'paths.bunList' key) - nothing extra to warm." -Config $Config | Out-Null
+        }
+        else {
+            $bunListPath = Resolve-OSyncConfigPath -Config $Config -Path ([string]$bunListRaw)
+            if (-not (Test-Path -LiteralPath $bunListPath -PathType Leaf)) {
+                Write-OSyncLog -Category 'npm' -Level Info -Message "bun merge skipped (bun list file missing: '$bunListPath') - nothing extra to warm." -Config $Config | Out-Null
+            }
+            else {
+                # Same parser as the npm list (name / name@version / @scope/name[@version]).
+                $bunEntries = @(Read-OSyncNpmList -Path $bunListPath)
+                if ($bunEntries.Count -eq 0) {
+                    Write-OSyncLog -Category 'npm' -Level Info -Message "bun list '$bunListPath' is empty (comments only) - nothing extra to warm; bun on B installs from the shared npm registry." -Config $Config | Out-Null
+                }
+                else {
+                    # npm entries first; each bun entry whose NAME (case-insensitive)
+                    # is not already in the set is appended. A name present in BOTH
+                    # lists is warmed exactly once, from the npm side (npm wins).
+                    $warmNames = @{}
+                    foreach ($e in $entries) { $warmNames[[string]$e.Name.ToLowerInvariant()] = $true }
+                    foreach ($be in $bunEntries) {
+                        $key = [string]$be.Name.ToLowerInvariant()
+                        if (-not $warmNames.ContainsKey($key)) {
+                            $warmNames[$key] = $true
+                            $entries += $be
+                            $bunAdded += $be
+                        }
+                    }
+                    $bunMerged = $true
+                    Write-OSyncLog -Category 'npm' -Level Info -Message "bun merge: $($bunEntries.Count) bun entry(ies) parsed, $($bunAdded.Count) bun-only added to the warm list (npm entries first, dedup by name)." -Config $Config | Out-Null
+                }
+            }
+        }
+    }
+    else {
+        Write-OSyncLog -Category 'npm' -Level Info -Message "bun disabled (no 'pins.bun' section in config) - skipping bun merge." -Config $Config | Out-Null
+    }
+
     # --- layout ---
     # <staging>\npm\storage is where the one-shot Verdaccio writes tarballs
     # (plain node fs IO to UNC is fine); everything npm resolves as a prefix
@@ -682,6 +753,18 @@ function Export-OSyncNpm {
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
+    }
+
+    # bun contract file delivery: when bun entries were merged into the warm
+    # list, ship the bun manifest verbatim to <staging>\npm\bun-packages.txt
+    # (the B-side apply reads it to pick the verification package). The merge
+    # gate doubles as the delivery gate - a missing/empty bun list skips both
+    # warming and delivery, and that is NOT an error.
+    $bunDeliveredPath = $null
+    if ($bunMerged) {
+        $bunDeliveredPath = Join-Path $npmDir 'bun-packages.txt'
+        Copy-Item -LiteralPath $bunListPath -Destination $bunDeliveredPath -Force
+        Write-OSyncLog -Category 'npm' -Level Info -Message "bun contract file delivered to '$bunDeliveredPath'." -Config $Config | Out-Null
     }
 
     # --- 2. install the one-shot Verdaccio (A has internet) ---
@@ -831,5 +914,11 @@ function Export-OSyncNpm {
         warmed            = @($ok)
         failed            = @($failed)
         tarballCount      = $tarballCount
+        bun               = [pscustomobject]@{
+            enabled      = $bunEnabled
+            listPath     = $bunListPath
+            entriesAdded = $bunAdded.Count
+            delivered    = $bunDeliveredPath
+        }
     }
 }

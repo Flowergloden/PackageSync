@@ -22,7 +22,8 @@
       directly and nothing is written.
 
   Steps (0/1/2/3 only when categories.winget is enabled, 4 only when
-  categories.npm is enabled, 5/6/7 always - Momus r4-m7 / m2):
+  categories.npm is enabled, 4.5 when npm is enabled AND the runtime\bun
+  payload is present (else 'skipped'), 5/6/7 always - Momus r4-m7 / m2):
       [0] Machine VC++ runtime: if the HKLM VC\Runtimes\x64 key exists it is
           skipped, otherwise <bw>\runtime\appinstaller\VC_redist.x64.exe
           /install /quiet /norestart runs (acceptable exit codes {0,3010,
@@ -75,11 +76,24 @@
           restart, Oracle m-4):
               <nodeExe> <stateDir>\verdaccio-bin\node_modules\verdaccio\bin\verdaccio
                   --config <stateDir>\verdaccio\verdaccio-b.yml
-          and started; the registry is then waited for on
-          127.0.0.1:<config.verdaccioPort> (30 s, Oracle M4 - the service
-          only ever reads the LOCAL copy, never the sync dirs). Task name is
-          injectable (-VerdaccioTaskName) so QA uses a temp-named task.
-      [5] stateDir layout + ACLs (Oracle r3-B1 / M4): bootstrap explicitly
+           and started; the registry is then waited for on
+           127.0.0.1:<config.verdaccioPort> (30 s, Oracle M4 - the service
+           only ever reads the LOCAL copy, never the sync dirs). Task name is
+           injectable (-VerdaccioTaskName) so QA uses a temp-named task.
+       [4.5] bun runtime landing (plan bun-support.md; bun = npm category's
+           parallel frontend): payload-presence gated (npm enabled AND
+           <bw>\runtime\bun\bun.exe present - otherwise 'skipped', never an
+           error). Lands bun.exe at <stateDir>\bun\bun.exe (the dir is created
+           + hardened by step 5, policy SystemAdminsRead - Users RX so every
+           user can execute it; this step does NOT re-grant ACLs), appends
+           <stateDir>\bun to the machine PATH (Set-OSyncMachinePathEntry,
+           idempotent), sets machine env BUN_CONFIG_REGISTRY=
+           http://127.0.0.1:<config.verdaccioPort>/ (trailing slash mandatory
+           - bun bug; machine-env ONLY, zero user-profile writes) and verifies
+           'bun.exe --version' against <bw>\runtime\bun\version.txt (exit 0
+           AND output match, else throw naming the step). WhatIf reports the
+           planned actions with zero changes.
+       [5] stateDir layout + ACLs (Oracle r3-B1 / M4): bootstrap explicitly
           creates state\ (SYSTEM/admins RW, Users read-only), run\ (both
           principals modify - apply.lock, user-state.json, chezmoistate.boltdb,
           logs\), bin\ (SYSTEM/admins write, Users RX - launch-apply.ps1,
@@ -1059,6 +1073,179 @@ function Invoke-OSyncBootstrapStepNpm {
         -Data @{ TaskName = $VerdaccioTaskName; Port = $port; NodeExe = $desired.NodeExe })
 }
 
+# ---- step 4.5: bun runtime landing (payload-presence gated) ------------------
+
+function Set-OSyncMachinePathEntry {
+    <#
+      Idempotent machine-PATH appender (thin mockable wrapper, same style as
+      Set-OSyncMachineEnvVar in NpmApply.ps1 - which this function calls for
+      the actual write). Reads the machine PATH, splits on ';', trims each
+      entry and checks membership case-insensitively:
+        - entry already present -> returns $false (no change, no write);
+        - absent -> appends and returns $true, handling an empty/whitespace
+          machine PATH without leading/trailing ';' artifacts.
+      -MachinePath is a test seam (same pattern as -VcRuntimePresent here and
+      -MachinePath in Resolve-OSyncNodeInstallDir): an EXPLICIT value replaces
+      the real machine PATH read so unit tests are deterministic. The write
+      goes through Set-OSyncMachineEnvVar, which unit tests mock - the helper
+      therefore runs UNelevated and never touches the real machine environment
+      in QA.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$PathEntry,
+        [Parameter(Mandatory = $false)][AllowEmptyString()][string]$MachinePath
+    )
+    $entry = $PathEntry.Trim()
+    if ([string]::IsNullOrWhiteSpace($entry)) {
+        throw 'Bootstrap.ps1: Set-OSyncMachinePathEntry requires a non-empty -PathEntry.'
+    }
+    $current = if ($PSBoundParameters.ContainsKey('MachinePath')) { [string]$MachinePath } else { [string][Environment]::GetEnvironmentVariable('Path', 'Machine') }
+    $dirs = @()
+    if (-not [string]::IsNullOrWhiteSpace($current)) {
+        $dirs = @($current -split ';' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+    foreach ($dir in $dirs) {
+        if ($dir -ieq $entry) { return $false }
+    }
+    $newValue = if ($dirs.Count -eq 0) { $entry } else { ($dirs -join ';') + ';' + $entry }
+    Set-OSyncMachineEnvVar -Name 'Path' -Value $newValue
+    return $true
+}
+
+function Invoke-OSyncBootstrapStepBun {
+    <#
+      Step 4.5: machine-wide bun runtime landing (bun = the npm category's
+      parallel frontend; the runtime\bun payload - bun.exe + version.txt - is
+      produced by the A-side export when pins.bun is present).
+      GATE (payload-presence, per plan bun-support.md): npm category enabled
+      AND <Root>\runtime\bun\bun.exe present in the (verified) work copy. A
+      legacy deployment without a bun payload gets 'skipped' - NEVER an error
+      and never a bootstrap failure. <stateDir>\bun is created + hardened by
+      step 5 (which runs FIRST in the orchestrator; policy SystemAdminsRead -
+      SYSTEM/Administrators full, Users RX so every user can execute bun.exe);
+      this step does NOT re-grant ACLs.
+      Non-WhatIf actions, in order:
+        a. ensure <stateDir>\bun exists; Copy-Item
+           <Root>\runtime\bun\bun.exe -> <stateDir>\bun\bun.exe -Force
+           (bun.zip is NEVER copied - it is the A-side download cache);
+        b. Set-OSyncMachinePathEntry <stateDir>\bun (idempotent machine PATH
+           append);
+        c. Set-OSyncMachineEnvVar BUN_CONFIG_REGISTRY =
+           http://127.0.0.1:<config.verdaccioPort>/ - the trailing slash is
+           MANDATORY (bun bug with slash-less registry URLs); machine-env ONLY,
+           zero user-profile writes (a scheduled task's env block may be stale
+           - the machine env var is WHY a fresh process picks it up);
+        d. verify: '<stateDir>\bun\bun.exe' --version must exit 0 AND its
+           trimmed output must equal the trimmed content of
+           <Root>\runtime\bun\version.txt (version.txt missing/unreadable or
+           any mismatch -> throw naming step '4.5-bun').
+      Test seams (established injectable-parameter style, like $IcaclsInvoker
+      in Invoke-OSyncBootstrapGrantAcl):
+        -BunExe          overrides the landed-exe path (default
+                         <stateDir>\bun\bun.exe) so a QA run can redirect the
+                         copy/verify target.
+        -VersionQuerier  scriptblock receiving the exe path; must return the
+                         trimmed version string. Production default RUNS the
+                         exe as described in (d); unit tests inject a fake so
+                         the step runs UNelevated without a real bun.exe (the
+                         version.txt comparison still runs for real).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $false)][string]$BunExe,
+        [Parameter(Mandatory = $false)][scriptblock]$VersionQuerier,
+        [switch]$WhatIf
+    )
+    $npmEnabled = [bool]$Config.categories.npm
+    $payloadExe = Join-Path $Root 'runtime\bun\bun.exe'
+
+    # Gate: npm enabled AND payload present. Failing the gate returns
+    # 'skipped' with the reason - NEVER an error (legacy exports carry no bun
+    # payload, and bun is not a standalone category).
+    if (-not $npmEnabled) {
+        return (New-OSyncBootstrapStepResult -Step '4.5-bun' -Status 'skipped' `
+            -Message 'npm category disabled - bun runtime landing skipped (bun is the npm category''s parallel frontend).')
+    }
+    if (-not (Test-Path -LiteralPath $payloadExe -PathType Leaf)) {
+        return (New-OSyncBootstrapStepResult -Step '4.5-bun' -Status 'skipped' `
+            -Message ("bun payload absent: 'runtime\bun\bun.exe' not found in the work copy ('{0}') - bun runtime landing skipped (legacy export without pins.bun)." -f $payloadExe))
+    }
+
+    $stateDir = [string]$Config.stateDir
+    $bunDir = Join-Path $stateDir 'bun'
+    $targetExe = $BunExe
+    if ([string]::IsNullOrWhiteSpace($targetExe)) { $targetExe = Join-Path $bunDir 'bun.exe' }
+    $registry = "http://127.0.0.1:{0}/" -f ([int]$Config.verdaccioPort)
+
+    if ($WhatIf) {
+        return (New-OSyncBootstrapStepResult -Step '4.5-bun' -Status 'done' `
+            -Message ("WhatIf: would copy '{0}' -> '{1}', append '{2}' to the machine PATH (idempotent), set machine env BUN_CONFIG_REGISTRY='{3}' and verify 'bun.exe --version' against <Root>\runtime\bun\version.txt." -f $payloadExe, $targetExe, $bunDir, $registry) `
+            -Data @{ BunExe = $targetExe; BunDir = $bunDir; Registry = $registry })
+    }
+
+    # (a) Land bun.exe (bun.zip is NEVER copied - A-side download cache only).
+    if (-not (Test-Path -LiteralPath $bunDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $bunDir -Force | Out-Null
+    }
+    Copy-Item -LiteralPath $payloadExe -Destination $targetExe -Force
+    Write-OSyncLog -Category 'bootstrap' -Level Info -Message ("step 4.5-bun: landed bun.exe at '{0}' (copied from the work copy payload)." -f $targetExe) -Config $Config | Out-Null
+
+    # (b) Machine PATH append (idempotent).
+    $pathChanged = Set-OSyncMachinePathEntry -PathEntry $bunDir
+    if ($pathChanged) {
+        Write-OSyncLog -Category 'bootstrap' -Level Info -Message ("step 4.5-bun: appended '{0}' to the machine PATH." -f $bunDir) -Config $Config | Out-Null
+    }
+    else {
+        Write-OSyncLog -Category 'bootstrap' -Level Info -Message ("step 4.5-bun: machine PATH already contains '{0}' - no change." -f $bunDir) -Config $Config | Out-Null
+    }
+
+    # (c) Machine env BUN_CONFIG_REGISTRY. Trailing slash MANDATORY (bun bug
+    # with slash-less registry URLs). Machine-env ONLY - zero user-profile
+    # writes; scheduled-task env inheritance is never trusted, a fresh process
+    # inherits this variable from the machine environment.
+    Set-OSyncMachineEnvVar -Name 'BUN_CONFIG_REGISTRY' -Value $registry
+    Write-OSyncLog -Category 'bootstrap' -Level Info -Message ("step 4.5-bun: set machine env BUN_CONFIG_REGISTRY='{0}'." -f $registry) -Config $Config | Out-Null
+
+    # (d) Verify: bun.exe --version must exit 0 and its output must match the
+    # payload's declared version (version.txt).
+    $version = $null
+    if ($null -ne $VersionQuerier) {
+        $version = ((@(& $VersionQuerier $targetExe) -join "`n") -replace "`r", '').Trim()
+    }
+    else {
+        $oldEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = @(& $targetExe --version 2>&1)
+            $code = $LASTEXITCODE
+        }
+        finally { $ErrorActionPreference = $oldEap }
+        if ($code -ne 0) {
+            throw ("Bootstrap.ps1 step 4.5-bun: '{0}' --version failed with exit code {1} - the landed bun.exe is not executable." -f $targetExe, $code)
+        }
+        $version = (($out -join "`n") -replace "`r", '').Trim()
+    }
+    $versionTxt = Join-Path $Root 'runtime\bun\version.txt'
+    $expected = $null
+    try {
+        $expected = ([System.IO.File]::ReadAllText($versionTxt)).Trim()
+    }
+    catch {
+        throw ("Bootstrap.ps1 step 4.5-bun: version.txt missing/unreadable at '{0}' - payload/version inconsistency (bun.exe landed but no declared version)." -f $versionTxt)
+    }
+    if ($version -ne $expected) {
+        throw ("Bootstrap.ps1 step 4.5-bun: 'bun.exe --version' reported '{0}' but runtime\bun\version.txt declares '{1}' - payload/version inconsistency." -f $version, $expected)
+    }
+    Write-OSyncLog -Category 'bootstrap' -Level Info -Message ("step 4.5-bun: bun.exe --version verified as '{0}' (matches runtime\bun\version.txt)." -f $version) -Config $Config | Out-Null
+
+    return (New-OSyncBootstrapStepResult -Step '4.5-bun' -Status 'done' `
+        -Message ("bun.exe landed at '{0}', machine PATH + BUN_CONFIG_REGISTRY set, bun --version '{1}' verified against version.txt." -f $targetExe, $version) `
+        -Data @{ BunExe = $targetExe; PathChanged = $pathChanged; Registry = $registry; Version = $version })
+}
+
 # ---- step 5: stateDir layout + ACLs ------------------------------------------
 
 function New-OSyncStateDirSkeleton {
@@ -1067,7 +1254,7 @@ function New-OSyncStateDirSkeleton {
     # for the system store). Full ACL hardening is step 5.
     param([Parameter(Mandatory = $true)]$Config)
     $stateDir = [string]$Config.stateDir
-    foreach ($sub in @('state', 'run', 'bin', 'work', 'verdaccio', 'verdaccio-bin')) {
+    foreach ($sub in @('state', 'run', 'bin', 'work', 'verdaccio', 'verdaccio-bin', 'bun')) {
         $p = Join-Path $stateDir $sub
         if (-not (Test-Path -LiteralPath $p -PathType Container)) {
             New-Item -ItemType Directory -Path $p -Force | Out-Null
@@ -1102,7 +1289,9 @@ function Invoke-OSyncBootstrapStepStateDirLayout {
     #   run\    : both principals modify (apply.lock, user-state.json,
     #             chezmoistate.boltdb, logs\)
     #   bin\    : SYSTEM/admins write, Users RX (launch-apply.ps1)
-    #   work\ verdaccio\ verdaccio-bin\ : SYSTEM/admins exclusive, Users read
+    #   work\ verdaccio\ verdaccio-bin\ bun\ : SYSTEM/admins exclusive, Users
+    #             RX (read + execute - every user must be able to run the
+    #             bun.exe that step 4.5 lands in bun\)
     $layout = @{
         'state'         = 'SystemAdminsRead'
         'run'           = 'UsersModify'
@@ -1110,6 +1299,7 @@ function Invoke-OSyncBootstrapStepStateDirLayout {
         'work'          = 'SystemAdminsRead'
         'verdaccio'     = 'SystemAdminsRead'
         'verdaccio-bin' = 'SystemAdminsRead'
+        'bun'           = 'SystemAdminsRead'
     }
 
     if ($WhatIf) {
@@ -1482,6 +1672,13 @@ function Invoke-OSyncBootstrap {
             $s4 = Invoke-OSyncBootstrapStepNpm -Config $Config -Root $bw -VerdaccioTaskName $VerdaccioTaskName -WhatIf:$WhatIf
             $steps += $s4
         }
+
+        # Step 4.5: bun runtime landing (bun = npm's parallel frontend). Runs
+        # whenever npm is enabled; the step's OWN payload-presence gate returns
+        # 'skipped' when <bw>\runtime\bun\bun.exe is absent (legacy
+        # deployments) - it never fails the bootstrap.
+        $sBun = Invoke-OSyncBootstrapStepBun -Config $Config -Root $bw -WhatIf:$WhatIf
+        $steps += $sBun
 
         # Step 6: tool landing + C:\PakageSync family + micro launcher (always).
         $s6 = Invoke-OSyncBootstrapStepToolLanding -Config $Config -Root $bw -WhatIf:$WhatIf
