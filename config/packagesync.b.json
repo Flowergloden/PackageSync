@@ -49,12 +49,6 @@
       "sha256": "PIN-ME"
     },
     "appInstaller": {
-      "msixbundleUrl": "https://aka.ms/getwinget",
-      "msixbundleSha256": "PIN-ME",
-      "vcLibsUrl": "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx",
-      "vcLibsSha256": "PIN-ME",
-      "uiXamlUrl": "https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.6",
-      "uiXamlSha256": "PIN-ME",
       "vcRedistUrl": "https://aka.ms/vs/17/release/vc_redist.x64.exe",
       "vcRedistSha256": "PIN-ME"
     },
