@@ -17,6 +17,16 @@
   detected and reported as "would ...", and no state / work copy / tasks /
   C:\PakageSync are touched.
 
+  ELEVATION REQUIREMENT: a real (non -WhatIf) run REQUIRES an elevated
+  (Administrator) PowerShell session - the bootstrap creates and ACL-hardens
+  SYSTEM/Administrator-owned state under <stateDir>. A non-elevated run now
+  fails fast with a clear error BEFORE creating directories, acquiring the
+  lock or calling Invoke-OSyncBootstrap (B-side incident 2026-09: a
+  non-elevated run reached work-copy creation because step 5's ACL hardening
+  falsely passed - icacls can return 0 while printing "Access is denied").
+  -WhatIf is exempt: it is a zero-change rehearsal and is allowed from a
+  normal (non-elevated) prompt.
+
   The operator runs this ONCE, elevated, on the B machine after the first
   repository sync. Every step is detect-then-execute, so re-running is
   idempotent (a full second run = all skips).
@@ -40,6 +50,21 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ---- elevation gate (B-side incident 2026-09) ------------------------------
+# A real bootstrap creates and ACL-hardens SYSTEM/Administrator-owned state
+# under <stateDir>, so it REQUIRES an elevated session. The gate runs BEFORE
+# any directory creation, lock acquisition or Invoke-OSyncBootstrap call.
+# -WhatIf is exempt: it is a zero-change rehearsal and must work from a
+# normal (non-elevated) prompt (see the WhatIf notes in Bootstrap.ps1).
+if (-not $WhatIf) {
+    $bootstrapPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $isElevated = $bootstrapPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isElevated) {
+        Write-Host "Install-OfflineBootstrap: requires an elevated (Administrator) PowerShell session. Re-run from an elevated prompt (or use -WhatIf for a zero-change rehearsal)." -ForegroundColor Red
+        exit 1
+    }
+}
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Import-Module (Join-Path $scriptDir 'OfflineSync.psd1') -Force
