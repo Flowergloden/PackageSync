@@ -18,7 +18,8 @@
        (Oracle r7-2).
     4. Runs Export-OSyncWinget/Pip/Npm/Dotfiles/Runtime for the enabled
        categories (runtime always runs - it is the bootstrap payload every
-       category depends on). Each category is try/caught into the export
+       category depends on - unless -SkipRuntime reuses the payloads already
+       published in <repoRoot>). Each category is try/caught into the export
        report (ok/failed per package); one category's failure does NOT
        block the others.
     5. Per category New-OSyncFilesManifest, then Publish-OSyncIndex - the
@@ -161,7 +162,19 @@ function Invoke-OSyncExport {
         # unattended scheduled runs are unaffected either way (Write-Host
         # with no interactive host is harmless).
         [Parameter(Mandatory = $false)]
-        [switch]$Quiet
+        [switch]$Quiet,
+
+        # Skips the runtime re-export (VC_redist/bun downloads, Python/Node
+        # winget downloads, portable Verdaccio build, tool snapshot) and
+        # REUSES the payloads already published in <repoRoot> instead:
+        # runtime\ is mirrored into the staging generation and each runtime
+        # winget entry's <repoRoot>\winget\<Id>\ payload is copied into
+        # <staging>\winget\<Id>\. The reused files are re-manifested into
+        # this generation, so the trust chain (index -> files.json -> per-
+        # file sha256) is unchanged. Requires a previous full export - the
+        # pre-check fails fast when the reuse sources are absent.
+        [Parameter(Mandatory = $false)]
+        [switch]$SkipRuntime
     )
 
     $startedAt = [datetime]::UtcNow.ToString('o')
@@ -223,6 +236,31 @@ function Invoke-OSyncExport {
     }
     Write-OSyncLog -Category 'export' -Level Info -Message 'pre-flight OK (python/node/npm/winget resolvable for the enabled categories).' -Config $config | Out-Null
 
+    # --- -SkipRuntime pre-check (fail-fast BEFORE any staging work): the
+    # reuse sources must already exist in the landing zone - a previous full
+    # export's runtime\ dir plus every runtime winget entry's payload under
+    # winget\<Id>\ (the runtime winget entries live inside the winget
+    # category dir, see RuntimeExport.ps1 step 4). ---
+    $runtimeReuseEntries = @()
+    if ($SkipRuntime) {
+        $repoRuntimeDir = Join-Path $config.repoRoot 'runtime'
+        if (-not (Test-Path -LiteralPath $repoRuntimeDir -PathType Container)) {
+            throw "Export-OfflineRepo: -SkipRuntime requires a previously published runtime payload at '$repoRuntimeDir' - run a full export (without -SkipRuntime) first."
+        }
+        $runtimeWingetListPath = Resolve-OSyncConfigPath -Config $config -Path $config.paths.runtimeWhitelist
+        $runtimeReuseEntries = @(Read-OSyncWingetList -Path $runtimeWingetListPath)
+        $missingPayloads = @()
+        foreach ($entry in $runtimeReuseEntries) {
+            if (-not (Test-Path -LiteralPath (Join-Path $config.repoRoot "winget\$($entry.Id)") -PathType Container)) {
+                $missingPayloads += $entry.Id
+            }
+        }
+        if ($missingPayloads.Count -gt 0) {
+            throw "Export-OfflineRepo: -SkipRuntime: runtime winget payload(s) missing from '$($config.repoRoot)\winget': $($missingPayloads -join ', ') - run a full export (without -SkipRuntime) first."
+        }
+        Write-OSyncLog -Category 'export' -Level Info -Message "-SkipRuntime: reuse sources verified in '$($config.repoRoot)' (runtime\ + $($runtimeReuseEntries.Count) runtime winget payload(s))." -Config $config | Out-Null
+    }
+
     # --- 3. staging dir: <stagingRoot>\<yyyyMMddTHHmmssZ> (same format/source as index exportedAtUtc) ---
     $stamp = [datetime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
     $staging = Join-Path $config.stagingRoot $stamp
@@ -270,11 +308,37 @@ function Invoke-OSyncExport {
         }
     }
 
-    # runtime: the bootstrap payload - always exported when any category is enabled
+    # runtime: the bootstrap payload - always delivered when any category is
+    # enabled. -SkipRuntime skips the re-export (downloads/builds/snapshot)
+    # and REUSES the payloads already published in <repoRoot> (validated in
+    # the pre-check above); the reused files are re-manifested into this
+    # generation, so the trust chain is unchanged. The reuse runs at the same
+    # pipeline position as a real export (after the category exports), so the
+    # runtime winget payloads land in <staging>\winget\<Id>\ exactly as
+    # Export-OSyncRuntime would have placed them.
     try {
-        $runtimeReport = Export-OSyncRuntime -Config $config -StagingDir $staging
+        if ($SkipRuntime) {
+            $repoRuntimeDir = Join-Path $config.repoRoot 'runtime'
+            $null = Invoke-OSyncRobocopy -Source $repoRuntimeDir -Destination (Join-Path $staging 'runtime') -ExtraArgs @('/MIR')
+            $reusedWingetIds = @()
+            foreach ($entry in $runtimeReuseEntries) {
+                $null = Invoke-OSyncRobocopy -Source (Join-Path $config.repoRoot "winget\$($entry.Id)") -Destination (Join-Path $staging "winget\$($entry.Id)") -ExtraArgs @('/MIR')
+                $reusedWingetIds += $entry.Id
+            }
+            $runtimeReport = [pscustomobject]@{
+                category         = 'runtime'
+                status           = 'ok'
+                reused           = $true
+                reusedFrom       = $config.repoRoot
+                runtimeWingetIds = $reusedWingetIds
+            }
+            Write-OSyncLog -Category 'export' -Level Info -Message "category 'runtime' export SKIPPED (-SkipRuntime): reused '$repoRuntimeDir' + $($reusedWingetIds.Count) runtime winget payload(s) from the landing zone." -Config $config | Out-Null
+        }
+        else {
+            $runtimeReport = Export-OSyncRuntime -Config $config -StagingDir $staging
+            Write-OSyncLog -Category 'export' -Level Info -Message "category 'runtime' export OK." -Config $config | Out-Null
+        }
         $categoriesReport['runtime'] = [ordered]@{ status = 'ok'; report = $runtimeReport }
-        Write-OSyncLog -Category 'export' -Level Info -Message "category 'runtime' export OK." -Config $config | Out-Null
     }
     catch {
         $categoriesReport['runtime'] = [ordered]@{ status = 'failed'; error = $_.Exception.Message }

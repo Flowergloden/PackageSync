@@ -3,7 +3,7 @@
   Export-OfflineRepo.ps1 - A-side export orchestrator entry point.
 
   Usage:
-    powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-OfflineRepo.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles] [-Quiet]
+    powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-OfflineRepo.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles] [-Quiet] [-SkipRuntime]
 
   Thin wrapper around Invoke-OSyncExport (src\lib\ExportOrchestrator.ps1):
   imports the module relative to its own location, resolves the default
@@ -14,6 +14,12 @@
   Manual runs echo live progress to the console by default (milestone log
   lines plus throttled winget download output); -Quiet restores the old
   silent behavior (log files only).
+
+  -SkipRuntime skips the runtime re-export (VC_redist/bun downloads,
+  Python/Node winget downloads, portable Verdaccio build, tool snapshot)
+  and reuses the payloads already published in <repoRoot> - the reused
+  files are re-manifested into the new generation, so the trust chain is
+  unchanged. Requires a previous full export; fails fast otherwise.
 
   Registered as the daily 02:00 scheduled task 'PakageSync-Export' by
   src\Register-SyncTasks.ps1 -Role A.
@@ -27,7 +33,12 @@ param(
     [string]$Category = 'winget,pip,npm,dotfiles',
 
     [Parameter(Mandatory = $false)]
-    [switch]$Quiet
+    [switch]$Quiet,
+
+    # Skips the runtime re-export and reuses the payloads already published
+    # in <repoRoot> (see Invoke-OSyncExport -SkipRuntime).
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipRuntime
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,7 +52,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 $ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
 
 try {
-    $result = Invoke-OSyncExport -ConfigPath $ConfigPath -Category $Category -Quiet:$Quiet
+    $result = Invoke-OSyncExport -ConfigPath $ConfigPath -Category $Category -Quiet:$Quiet -SkipRuntime:$SkipRuntime
     if ($result.success) {
         exit 0
     }

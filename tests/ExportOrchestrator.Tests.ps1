@@ -117,6 +117,21 @@ Describe 'ExportOrchestrator' {
             Set-Content -LiteralPath (Join-Path $ToolRoot 'manifests\dotfiles\dot_bashrc') -Value 'export FOO=bar' -Encoding UTF8
         }
 
+        # --- landing-zone helper: seeds <RepoRoot> with the payloads a
+        # previous full export would have published (runtime\ plus the
+        # runtime winget entries under winget\<Id>\; the runtime whitelist
+        # written by New-OTestRepo is Python.Python.3.12 + OpenJS.NodeJS.LTS) ---
+        function New-OTestPublishedRuntime {
+            param([string]$RepoRoot)
+            New-Item -ItemType Directory -Path (Join-Path $RepoRoot 'runtime\tool') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $RepoRoot 'runtime\runtime-winget.txt') -Value 'Python.Python.3.12@3.12.10' -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $RepoRoot 'runtime\tool\README.md') -Value 'tool snapshot' -Encoding UTF8
+            New-Item -ItemType Directory -Path (Join-Path $RepoRoot 'winget\Python.Python.3.12') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $RepoRoot 'winget\Python.Python.3.12\python.yaml') -Value 'PackageVersion: 3.12.10' -Encoding UTF8
+            New-Item -ItemType Directory -Path (Join-Path $RepoRoot 'winget\OpenJS.NodeJS.LTS') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $RepoRoot 'winget\OpenJS.NodeJS.LTS\node.yaml') -Value 'PackageVersion: 24.19.0' -Encoding UTF8
+        }
+
         $script:OkReport = [pscustomobject]@{ category = 'x'; ok = @(); failed = @() }
     }
 
@@ -428,6 +443,77 @@ Describe 'ExportOrchestrator' {
             try { Invoke-OSyncExport -ConfigPath $cfg -Category 'winget,pip,npm,dotfiles' } catch { $err = $_ }
             $err | Should -Not -BeNullOrEmpty
             $err.Exception.Message | Should -BeLike '*python*'
+        }
+    }
+
+    Context '-SkipRuntime (reuse previously published runtime payloads)' {
+        It 'reuses repoRoot payloads, never calls Export-OSyncRuntime, and publishes with an intact trust chain' {
+            $repoRoot = Join-Path $TestDrive 'repo12'
+            $stagingRoot = Join-Path $TestDrive 'staging12'
+            $toolRoot = Join-Path $TestDrive 'tool12'
+            New-OTestRepo -ToolRoot $toolRoot
+            New-OTestPublishedRuntime -RepoRoot $repoRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
+
+            $report = Invoke-OSyncExport -ConfigPath $cfg -Category 'winget,pip,npm,dotfiles' -SkipRuntime
+
+            $report.success | Should -Be $true
+            $report.published | Should -Be $true
+            # runtime export was NOT called; the category exports ran in order
+            $script:CallLog | Should -Be @('winget', 'pip', 'npm', 'dotfiles')
+            $report.categories.runtime.status | Should -Be 'ok'
+            $report.categories.runtime.report.reused | Should -Be $true
+            $report.categories.runtime.report.runtimeWingetIds | Should -Be @('Python.Python.3.12', 'OpenJS.NodeJS.LTS')
+
+            # reused payloads re-manifested into the new staging generation
+            Test-Path -LiteralPath (Join-Path $report.stagingDir 'runtime\files.json') | Should -Be $true
+            Test-Path -LiteralPath (Join-Path $report.stagingDir 'runtime\tool\README.md') | Should -Be $true
+            Test-Path -LiteralPath (Join-Path $report.stagingDir 'winget\Python.Python.3.12\python.yaml') | Should -Be $true
+            Test-Path -LiteralPath (Join-Path $report.stagingDir 'winget\OpenJS.NodeJS.LTS\node.yaml') | Should -Be $true
+
+            # trust chain: index lists runtime and the integrity gate passed
+            $report.integrity.overall | Should -Be 'OK'
+            $index = Get-Content -LiteralPath (Join-Path $repoRoot 'index.json') -Raw | ConvertFrom-Json
+            $index.categories.PSObject.Properties.Name | Should -Contain 'runtime'
+
+            # published landing zone carries the reused payloads
+            Test-Path -LiteralPath (Join-Path $repoRoot 'runtime\tool\README.md') | Should -Be $true
+            Test-Path -LiteralPath (Join-Path $repoRoot 'winget\Python.Python.3.12\python.yaml') | Should -Be $true
+        }
+
+        It 'throws fail-fast when no previous runtime payload exists (no staging work)' {
+            $repoRoot = Join-Path $TestDrive 'repo13'
+            $stagingRoot = Join-Path $TestDrive 'staging13'
+            $toolRoot = Join-Path $TestDrive 'tool13'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
+
+            $err = $null
+            try { Invoke-OSyncExport -ConfigPath $cfg -Category 'pip' -SkipRuntime } catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*-SkipRuntime*previously published runtime payload*'
+            # nothing ran and no staging generation was created
+            $script:CallLog.Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $stagingRoot -Directory -ErrorAction SilentlyContinue).Count | Should -Be 0
+        }
+
+        It 'throws fail-fast naming the missing runtime winget payload(s)' {
+            $repoRoot = Join-Path $TestDrive 'repo14'
+            $stagingRoot = Join-Path $TestDrive 'staging14'
+            $toolRoot = Join-Path $TestDrive 'tool14'
+            New-OTestRepo -ToolRoot $toolRoot
+            # runtime\ exists, but the winget\ payload dirs do not
+            New-Item -ItemType Directory -Path (Join-Path $repoRoot 'runtime') -Force | Out-Null
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
+
+            $err = $null
+            try { Invoke-OSyncExport -ConfigPath $cfg -Category 'pip' -SkipRuntime } catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*runtime winget payload(s) missing*'
+            $err.Exception.Message | Should -BeLike '*Python.Python.3.12*'
+            $err.Exception.Message | Should -BeLike '*OpenJS.NodeJS.LTS*'
+            $script:CallLog.Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $stagingRoot -Directory -ErrorAction SilentlyContinue).Count | Should -Be 0
         }
     }
 }
