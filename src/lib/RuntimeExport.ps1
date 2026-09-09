@@ -20,25 +20,18 @@
        (--python-version 3.12 / --abi cp312, same semantics as PipExport's
        Get-OSyncPipDownloadArgs).
 
-    3. App Installer pieces + VC_redist (config.pins.appInstaller) into
+    3. VC_redist (config.pins.appInstaller.vcRedistUrl/vcRedistSha256) into
        <staging>\runtime\appinstaller\ with the per-piece sha256 PIN-ME flow
        (same semantics as todo 9 / DotfilesExport):
-         - any piece still 'PIN-ME' -> prints ALL real hashes and exits
-           non-zero (the operator pins all four and re-runs),
+         - the piece still 'PIN-ME' -> prints the real hash and exits
+           non-zero (the operator pins it and re-runs),
          - hash mismatch -> aborts naming the file (expected vs actual),
          - match -> proceeds.
-       The UI.Xaml piece is downloaded as the official nuget package
-       (https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.6 - a
-       nupkg IS a zip) and the Tools\AppX\x64\Release\Microsoft.UI.Xaml.2.8.appx
-       entry is extracted; the pinned hash is the hash of the EXTRACTED appx
-       (that is what gets installed on B).
-       Static version-match fallback (Oracle m3): the msixbundle is a zip -
-       its AppxManifest.xml PackageDependency MinVersion values are compared
-       against the actual VCLibs/UI.Xaml appx Identity versions. The real
-       install chain cannot execute on A, so this static check is the only
-       verification available; the result is recorded in the report (a
-       mismatch is a warning, not fatal - the B-side bootstrap has its own
-       version gates).
+       The App Installer chain (msixbundle/VCLibs/UI.Xaml) is NO LONGER
+       exported at all (user decision, 2026-09): modern Windows ships App
+       Installer / winget preinstalled, so the B-side bootstrap only
+       verifies winget.exe presence and never installs the pieces. The
+       appinstaller dir now carries ONLY VC_redist.x64.exe.
 
     4. Runtime winget entries: REUSES todo 6's download+rewrite functions
        (Invoke-OSyncWingetDownload / ConvertTo-OSyncWingetYamlContent /
@@ -223,11 +216,11 @@ function Test-OSyncPipCrossAssertion {
 
 function Get-OSyncAppInstallerPieces {
     <#
-      Returns the four appInstaller piece definitions (name, url, target
-      file, optional zip-entry extraction source). The UI.Xaml piece is
-      downloaded as the official nuget package (a nupkg IS a zip) and the
-      appx entry is extracted from it; the pinned hash is the hash of the
-      EXTRACTED appx.
+      Returns the appInstaller piece definitions (name, url, target file).
+      Only the VC_redist piece remains (user decision, 2026-09): the App
+      Installer chain (msixbundle/VCLibs/UI.Xaml) is no longer exported -
+      modern Windows ships App Installer / winget preinstalled and the
+      B-side bootstrap only verifies winget.exe presence.
     #>
     [CmdletBinding()]
     param(
@@ -238,117 +231,21 @@ function Get-OSyncAppInstallerPieces {
     $pins = $Config.pins.appInstaller
     return @(
         [pscustomobject]@{
-            Name     = 'msixbundle'
-            Url      = [string]$pins.msixbundleUrl
-            File     = 'Microsoft.DesktopAppInstaller.msixbundle'
-            Expected = [string]$pins.msixbundleSha256
-            Extract  = $null
-        },
-        [pscustomobject]@{
-            Name     = 'vclibs'
-            Url      = [string]$pins.vcLibsUrl
-            File     = 'Microsoft.VCLibs.x64.14.00.Desktop.appx'
-            Expected = [string]$pins.vcLibsSha256
-            Extract  = $null
-        },
-        [pscustomobject]@{
-            Name     = 'uixaml'
-            Url      = [string]$pins.uiXamlUrl
-            File     = 'Microsoft.UI.Xaml.2.8.appx'
-            Expected = [string]$pins.uiXamlSha256
-            # Observed entry name in the Microsoft.UI.Xaml/2.8.6 nupkg
-            # (2026-09-04 QA): 'tools/AppX/x64/Release/Microsoft.UI.Xaml.2.8.appx'
-            # - FORWARD slashes, lowercase 'tools' (zip entry names always
-            # use '/'; the -ieq comparison in Expand-OSyncZipEntry handles
-            # case).
-            Extract  = 'tools/AppX/x64/Release/Microsoft.UI.Xaml.2.8.appx'
-        },
-        [pscustomobject]@{
             Name     = 'vcredist'
             Url      = [string]$pins.vcRedistUrl
             File     = 'VC_redist.x64.exe'
             Expected = [string]$pins.vcRedistSha256
-            Extract  = $null
         }
     )
-}
-
-function Expand-OSyncZipEntry {
-    <#
-      Extracts ONE entry from a zip to a target file (overwrite). Throws
-      when the entry is missing. Used for the UI.Xaml appx inside the nuget
-      package.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ZipPath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$EntryName,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Target
-    )
-
-    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
-    try {
-        $entry = $zip.Entries | Where-Object { $_.FullName -ieq $EntryName } | Select-Object -First 1
-        if ($null -eq $entry) {
-            throw "Expand-OSyncZipEntry: entry '$EntryName' not found in '$ZipPath'."
-        }
-        $parent = Split-Path -Parent $Target
-        if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
-            New-Item -ItemType Directory -Path $parent -Force | Out-Null
-        }
-        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $Target, $true)
-        return $Target
-    }
-    finally {
-        $zip.Dispose()
-    }
-}
-
-function Read-OSyncZipEntryText {
-    <#
-      Reads ONE entry of a zip as text (UTF-8). Returns $null when the entry
-      is missing. Used for the AppxManifest.xml static version check.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ZipPath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$EntryName
-    )
-
-    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
-    try {
-        $entry = $zip.Entries | Where-Object { $_.FullName -ieq $EntryName } | Select-Object -First 1
-        if ($null -eq $entry) { return $null }
-        $reader = New-Object System.IO.StreamReader($entry.Open())
-        try {
-            return $reader.ReadToEnd()
-        }
-        finally {
-            $reader.Dispose()
-        }
-    }
-    finally {
-        $zip.Dispose()
-    }
 }
 
 function Assert-OSyncAppInstallerHashes {
     <#
-      Downloads (download-if-missing) all four appInstaller pieces into
-      <Dir>, computes their sha256, and enforces the PIN-ME flow per piece
-      (same semantics as todo 9):
-        - any piece still 'PIN-ME' -> prints ALL real hashes and throws
-          (non-zero exit; the operator pins all four and re-runs),
+      Downloads (download-if-missing) the appInstaller piece(s) into <Dir>,
+      computes their sha256, and enforces the PIN-ME flow per piece (same
+      semantics as todo 9):
+        - a piece still 'PIN-ME' -> prints the real hash and throws
+          (non-zero exit; the operator pins it and re-runs),
         - any hash mismatch -> throws naming the file (expected vs actual),
         - all match -> returns the per-piece results.
       The download-if-missing design means a PIN-ME run followed by a pinned
@@ -372,23 +269,13 @@ function Assert-OSyncAppInstallerHashes {
 
     foreach ($piece in $pieces) {
         $target = Join-Path $Dir $piece.File
-        $downloadTarget = $target
-        if (-not [string]::IsNullOrWhiteSpace($piece.Extract)) {
-            # The UI.Xaml piece: download the nupkg, extract the appx entry.
-            $nupkg = Join-Path $Dir ('{0}.nupkg' -f [System.IO.Path]::GetFileNameWithoutExtension($piece.File))
-            $downloadTarget = $nupkg
-        }
 
-        if (-not (Test-Path -LiteralPath $downloadTarget -PathType Leaf)) {
-            Write-OSyncLog -Category 'runtime' -Level Info -Message ("Downloading appInstaller piece {0} from '{1}' -> '{2}'" -f $piece.Name, $piece.Url, $downloadTarget) -Config $Config | Out-Null
-            $null = Invoke-OSyncDownload -Uri $piece.Url -OutFile $downloadTarget
+        if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+            Write-OSyncLog -Category 'runtime' -Level Info -Message ("Downloading appInstaller piece {0} from '{1}' -> '{2}'" -f $piece.Name, $piece.Url, $target) -Config $Config | Out-Null
+            $null = Invoke-OSyncDownload -Uri $piece.Url -OutFile $target
         }
         else {
-            Write-OSyncLog -Category 'runtime' -Level Info -Message ("Reusing existing download '{0}'" -f $downloadTarget) -Config $Config | Out-Null
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($piece.Extract)) {
-            $null = Expand-OSyncZipEntry -ZipPath $downloadTarget -EntryName $piece.Extract -Target $target
+            Write-OSyncLog -Category 'runtime' -Level Info -Message ("Reusing existing download '{0}'" -f $target) -Config $Config | Out-Null
         }
 
         $actualHash = Get-OSyncFileSha256 -Path $target
@@ -408,7 +295,7 @@ function Assert-OSyncAppInstallerHashes {
         foreach ($r in $results) {
             Write-Host ("  {0}: {1}" -f $r.Name, $r.Sha256)
         }
-        Write-Host 'Pin all four real sha256 values into config\packagesync.json (pins.appInstaller.*Sha256) and re-run.'
+        Write-Host 'Pin the real sha256 value(s) into config\packagesync.json (pins.appInstaller.*Sha256) and re-run.'
         $names = ($pinMe | ForEach-Object { $_.Name }) -join ', '
         $hashList = ($results | ForEach-Object { '{0}={1}' -f $_.Name, $_.Sha256 }) -join '; '
         Write-OSyncLog -Category 'runtime' -Level Error -Message "PIN-ME: appInstaller piece(s) $names still unpinned - actual hashes printed." -Data @{ pieces = $results } -Config $Config | Out-Null
@@ -423,145 +310,6 @@ function Assert-OSyncAppInstallerHashes {
     }
 
     return $results
-}
-
-function Get-OSyncBundleManifestText {
-    <#
-      Reads the AppxManifest.xml of an App Installer msixbundle. Observed
-      layout (2026-09-04 QA, App Installer 1.29.290.0): the bundle has NO
-      AppxManifest.xml at its root - the manifest lives inside the inner
-      architecture msix (AppInstaller_x64.msix, itself a zip). The root
-      entry is tried first (older bundles carry it), then the inner x64 msix
-      is extracted to a temp file and its manifest is read. Returns $null
-      when neither exists.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$BundlePath
-    )
-
-    $root = Read-OSyncZipEntryText -ZipPath $BundlePath -EntryName 'AppxManifest.xml'
-    if ($null -ne $root) { return $root }
-
-    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($BundlePath)
-    $inner = $null
-    $tmp = $null
-    try {
-        $inner = $zip.Entries | Where-Object {
-            $_.FullName -match '\.msix$' -and
-            $_.FullName -match 'x64' -and
-            $_.FullName -notmatch 'language'
-        } | Sort-Object -Property FullName | Select-Object -First 1
-        if ($null -eq $inner) { return $null }
-        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('osync-bundle-' + [guid]::NewGuid().ToString('N') + '.msix')
-        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($inner, $tmp, $true)
-    }
-    finally {
-        $zip.Dispose()
-    }
-    try {
-        return (Read-OSyncZipEntryText -ZipPath $tmp -EntryName 'AppxManifest.xml')
-    }
-    finally {
-        if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force }
-    }
-}
-
-function Test-OSyncAppInstallerVersionMatch {
-    <#
-      Static version-match fallback (Oracle m3): the msixbundle is a zip -
-      its AppxManifest.xml PackageDependency MinVersion values are compared
-      against the actual VCLibs/UI.Xaml appx Identity versions. The real
-      install chain cannot execute on A, so this static check is the only
-      verification available. Returns { Ok, Checks[], Reason } - a mismatch
-      is recorded (the caller logs a warning), not fatal: the B-side
-      bootstrap has its own version gates.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Dir
-    )
-
-    $bundlePath = Join-Path $Dir 'Microsoft.DesktopAppInstaller.msixbundle'
-    $vclibsPath = Join-Path $Dir 'Microsoft.VCLibs.x64.14.00.Desktop.appx'
-    $uixamlPath = Join-Path $Dir 'Microsoft.UI.Xaml.2.8.appx'
-
-    if (-not (Test-Path -LiteralPath $bundlePath -PathType Leaf)) {
-        return [pscustomobject]@{ Ok = $false; Checks = @(); Reason = "msixbundle not found at '$bundlePath'" }
-    }
-
-    $bundleManifest = Get-OSyncBundleManifestText -BundlePath $bundlePath
-    if ($null -eq $bundleManifest) {
-        return [pscustomobject]@{ Ok = $false; Checks = @(); Reason = "no AppxManifest.xml found in the msixbundle '$bundlePath' (neither at the root nor inside an inner x64 msix)" }
-    }
-
-    # <PackageDependency Name="..." MinVersion="..." .../>
-    $deps = @()
-    foreach ($m in [regex]::Matches($bundleManifest, '<PackageDependency\b[^>]*>')) {
-        $tag = $m.Value
-        $nameM = [regex]::Match($tag, 'Name="([^"]+)"')
-        $verM = [regex]::Match($tag, 'MinVersion="([^"]+)"')
-        if ($nameM.Success -and $verM.Success) {
-            $deps += [pscustomobject]@{ Name = $nameM.Groups[1].Value; MinVersion = $verM.Groups[1].Value }
-        }
-    }
-
-    $checks = @()
-    $ok = $true
-
-    foreach ($piece in @(
-            # Identity names observed on the real payloads (2026-09-04 QA):
-            # the aka.ms VCLibs appx is the UWPDesktop variant; the nuget
-            # UI.Xaml appx is Microsoft.UI.Xaml.2.8.
-            [pscustomobject]@{ Name = 'Microsoft.VCLibs.140.00.UWPDesktop'; AppxPath = $vclibsPath; Label = 'vclibs' },
-            [pscustomobject]@{ Name = 'Microsoft.UI.Xaml.2.8'; AppxPath = $uixamlPath; Label = 'uixaml' })) {
-
-        $dep = $deps | Where-Object { $_.Name -ieq $piece.Name } | Select-Object -First 1
-        if ($null -eq $dep) {
-            $checks += [pscustomobject]@{
-                Piece         = $piece.Label
-                Dependency    = $piece.Name
-                MinVersion    = $null
-                ActualVersion = $null
-                Match         = $null
-                Note          = 'not listed as a dependency of the msixbundle'
-            }
-            continue
-        }
-
-        $actualVersion = $null
-        if (Test-Path -LiteralPath $piece.AppxPath -PathType Leaf) {
-            $appxManifest = Read-OSyncZipEntryText -ZipPath $piece.AppxPath -EntryName 'AppxManifest.xml'
-            if ($null -ne $appxManifest) {
-                $idM = [regex]::Match($appxManifest, '<Identity\b[^>]*Version="([^"]+)"')
-                if ($idM.Success) { $actualVersion = $idM.Groups[1].Value }
-            }
-        }
-
-        $match = $null
-        if ($null -ne $actualVersion) {
-            try {
-                $match = ([version]$actualVersion -ge [version]$dep.MinVersion)
-            }
-            catch {
-                $match = $null
-            }
-        }
-        if ($match -eq $false) { $ok = $false }
-        $checks += [pscustomobject]@{
-            Piece         = $piece.Label
-            Dependency    = $piece.Name
-            MinVersion    = $dep.MinVersion
-            ActualVersion = $actualVersion
-            Match         = $match
-            Note          = ''
-        }
-    }
-
-    return [pscustomobject]@{ Ok = $ok; Checks = @($checks); Reason = '' }
 }
 
 function Invoke-OSyncRuntimeWingetExport {
@@ -818,18 +566,11 @@ function Export-OSyncRuntime {
         throw "Export-OSyncRuntime: cross-assertion failed - config.pip.downloadArgs (--python-version '$($cross.PythonVersion)', --abi '$($cross.Abi)') does not match the Python major.minor '$($cross.RuntimePython)' pinned in '$runtimeWingetPath'. $($cross.Reason)"
     }
 
-    # --- 3. App Installer pieces + VC_redist (PIN-ME flow) ---
+    # --- 3. VC_redist (PIN-ME flow; the App Installer chain is no longer
+    # exported - modern Windows ships App Installer / winget preinstalled) ---
     $runtimeDir = Join-Path $StagingDir 'runtime'
     $appInstallerDir = Join-Path $runtimeDir 'appinstaller'
     $pieceResults = Assert-OSyncAppInstallerHashes -Config $Config -Dir $appInstallerDir
-    $versionMatch = Test-OSyncAppInstallerVersionMatch -Dir $appInstallerDir
-    if (-not $versionMatch.Ok) {
-        $detail = ($versionMatch.Checks | ForEach-Object { "{0}: min {1} vs actual {2} (match={3})" -f $_.Piece, $_.MinVersion, $_.ActualVersion, $_.Match }) -join '; '
-        Write-OSyncLog -Category 'runtime' -Level Warning -Message "appInstaller static version-match: $detail" -Config $Config | Out-Null
-    }
-    else {
-        Write-OSyncLog -Category 'runtime' -Level Info -Message 'appInstaller static version-match: all bundle dependencies satisfied by the shipped pieces.' -Config $Config | Out-Null
-    }
 
     # --- 4. runtime winget entries (reuse todo 6 download+rewrite) ---
     $entries = @(Read-OSyncWingetList -Path $runtimeWingetPath)
@@ -903,9 +644,8 @@ function Export-OSyncRuntime {
         }
         pipCrossAssert = $cross
         appInstaller = [pscustomobject]@{
-            dir          = $appInstallerDir
-            pieces       = @($pieceResults)
-            versionMatch = $versionMatch
+            dir    = $appInstallerDir
+            pieces = @($pieceResults)
         }
         verdaccio = [pscustomobject]@{
             version = $verdaccioVersion
@@ -922,7 +662,7 @@ function Export-OSyncRuntime {
         }
     }
 
-    Write-OSyncLog -Category 'runtime' -Level Info -Message ("runtime export complete: {0} winget entry(ies) exported, {1} failed, appInstaller pieces verified, verdaccio@{2} staged." -f $wingetResult.ok.Count, $wingetResult.failed.Count, $verdaccioVersion) -Config $Config | Out-Null
+    Write-OSyncLog -Category 'runtime' -Level Info -Message ("runtime export complete: {0} winget entry(ies) exported, {1} failed, appInstaller piece(s) verified, verdaccio@{2} staged." -f $wingetResult.ok.Count, $wingetResult.failed.Count, $verdaccioVersion) -Config $Config | Out-Null
 
     return $report
 }

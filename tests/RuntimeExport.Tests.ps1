@@ -2,8 +2,8 @@
 <#
 .SYNOPSIS
     Pester 5 unit tests for src\lib\RuntimeExport.ps1 - the A-side runtime
-    bootstrap payload export (App Installer pieces + VC_redist, portable
-    Verdaccio, runtime-winget entries, tool self-bootstrap snapshot).
+    bootstrap payload export (VC_redist, portable Verdaccio, runtime-winget
+    entries, tool self-bootstrap snapshot).
 
 .DESCRIPTION
     All downloads are MOCKED (Mock Invoke-OSyncDownload / Mock
@@ -29,109 +29,19 @@ Describe 'RuntimeExport' {
     BeforeAll {
         . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Config.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\ManifestParse.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\DotfilesExport.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\RuntimeExport.ps1')
 
-        # --- zip helpers (entry-name aware; Compress-Archive cannot do
-        # --- nested entry names like Tools\AppX\x64\Release\...) ---
-        # ZipArchiveMode lives in System.IO.Compression.dll, ZipFile in
-        # System.IO.Compression.FileSystem.dll - both must be loaded on 5.1.
-        Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
-        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-
-        function New-OTestZip {
-            param([string]$ZipPath, [hashtable]$Entries)
-            $fs = [System.IO.File]::Create($ZipPath)
-            $archive = $null
-            try {
-                $archive = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create)
-                foreach ($k in $Entries.Keys) {
-                    $entry = $archive.CreateEntry($k)
-                    $sw = New-Object System.IO.StreamWriter($entry.Open())
-                    $sw.Write([string]$Entries[$k])
-                    $sw.Dispose()
-                }
-            }
-            finally {
-                if ($null -ne $archive) { $archive.Dispose() }
-                $fs.Dispose()
-            }
-        }
-
-        function Add-OTestZipFileEntry {
-            # Copies a BINARY file into an existing zip under EntryName.
-            param([string]$ZipPath, [string]$EntryName, [string]$SourceFile)
-            $fs = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::Open)
-            $archive = $null
-            try {
-                $archive = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Update)
-                $entry = $archive.CreateEntry($EntryName)
-                $in = [System.IO.File]::OpenRead($SourceFile)
-                $out = $entry.Open()
-                $in.CopyTo($out)
-                $out.Dispose()
-                $in.Dispose()
-            }
-            finally {
-                if ($null -ne $archive) { $archive.Dispose() }
-                $fs.Dispose()
-            }
-        }
-
         # --- fake appInstaller artifacts ---
-        # The real aka.ms VCLibs appx Identity is
-        # 'Microsoft.VCLibs.140.00.UWPDesktop' (observed 2026-09-04 QA) - the
-        # fixture mirrors that.
-        $script:FakeVclibs = Join-Path $TestDrive 'fake-vclibs.appx'
-        New-OTestZip -ZipPath $script:FakeVclibs -Entries @{
-            'AppxManifest.xml' = '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="Microsoft.VCLibs.140.00.UWPDesktop" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" Version="14.0.33728.0"/></Package>'
-        }
-
-        $script:FakeUixaml = Join-Path $TestDrive 'fake-uixaml.appx'
-        New-OTestZip -ZipPath $script:FakeUixaml -Entries @{
-            'AppxManifest.xml' = '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="Microsoft.UI.Xaml.2.8" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" Version="2.8.6.0"/></Package>'
-        }
-
-        # The real App Installer msixbundle nests its AppxManifest.xml inside
-        # an inner architecture msix (AppInstaller_x64.msix, itself a zip) -
-        # observed 2026-09-04 QA. The fixtures mirror that shape.
-        $script:FakeInnerMsix = Join-Path $TestDrive 'fake-inner-x64.msix'
-        New-OTestZip -ZipPath $script:FakeInnerMsix -Entries @{
-            'AppxManifest.xml' = '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="Microsoft.DesktopAppInstaller" Version="1.29.290.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" ProcessorArchitecture="x64"/><Dependencies><PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="14.0.33519.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"/><PackageDependency Name="Microsoft.VCLibs.140.00.UWPDesktop" MinVersion="14.0.33728.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"/></Dependencies></Package>'
-        }
-
-        $script:FakeMsixbundle = Join-Path $TestDrive 'fake-msixbundle.msixbundle'
-        New-OTestZip -ZipPath $script:FakeMsixbundle -Entries @{ 'README.txt' = 'fake bundle' }
-        Add-OTestZipFileEntry -ZipPath $script:FakeMsixbundle -EntryName 'AppInstaller_x64.msix' -SourceFile $script:FakeInnerMsix
-
-        # A bundle whose dependencies require NEWER pieces than we ship
-        # (used by the version-match mismatch test).
-        $script:FakeInnerMsixNewer = Join-Path $TestDrive 'fake-inner-x64-newer.msix'
-        New-OTestZip -ZipPath $script:FakeInnerMsixNewer -Entries @{
-            'AppxManifest.xml' = '<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="Microsoft.DesktopAppInstaller" Version="99.0.0.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" ProcessorArchitecture="x64"/><Dependencies><PackageDependency Name="Microsoft.VCLibs.140.00.UWPDesktop" MinVersion="99.0.0.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"/><PackageDependency Name="Microsoft.UI.Xaml.2.8" MinVersion="99.0.0.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"/></Dependencies></Package>'
-        }
-
-        $script:FakeMsixbundleNewer = Join-Path $TestDrive 'fake-msixbundle-newer.msixbundle'
-        New-OTestZip -ZipPath $script:FakeMsixbundleNewer -Entries @{ 'README.txt' = 'fake bundle newer' }
-        Add-OTestZipFileEntry -ZipPath $script:FakeMsixbundleNewer -EntryName 'AppInstaller_x64.msix' -SourceFile $script:FakeInnerMsixNewer
-
-        # The nuget package for UI.Xaml: a zip whose
-        # Tools\AppX\x64\Release\Microsoft.UI.Xaml.2.8.appx entry IS the
-        # fake uixaml appx (binary).
-        $script:FakeNupkg = Join-Path $TestDrive 'fake-uixaml.nupkg'
-        New-OTestZip -ZipPath $script:FakeNupkg -Entries @{ 'README.txt' = 'fake nuget package' }
-        Add-OTestZipFileEntry -ZipPath $script:FakeNupkg -EntryName 'tools/AppX/x64/Release/Microsoft.UI.Xaml.2.8.appx' -SourceFile $script:FakeUixaml
-
+        # Only the VC_redist piece remains (user decision, 2026-09): the App
+        # Installer chain (msixbundle/VCLibs/UI.Xaml) is no longer exported.
         $script:FakeVcredist = Join-Path $TestDrive 'fake-vcredist.exe'
         [System.IO.File]::WriteAllText($script:FakeVcredist, 'fake VC_redist payload', [System.Text.Encoding]::ASCII)
 
-        # The hashes that get pinned into the test config.
-        $script:FakeMsixbundleHash = Get-OSyncFileSha256 -Path $script:FakeMsixbundle
-        $script:FakeMsixbundleNewerHash = Get-OSyncFileSha256 -Path $script:FakeMsixbundleNewer
-        $script:FakeVclibsHash = Get-OSyncFileSha256 -Path $script:FakeVclibs
-        $script:FakeUixamlHash = Get-OSyncFileSha256 -Path $script:FakeUixaml
+        # The hash that gets pinned into the test config.
         $script:FakeVcredistHash = Get-OSyncFileSha256 -Path $script:FakeVcredist
 
         # --- runtime-winget.txt fixtures ---
@@ -208,11 +118,7 @@ exit /b %FAKE_NPM_EXIT%
                 [string]$RepoRoot = $script:RepoRoot,
                 [string]$ToolSourceDir = $script:ToolSourceDir,
                 [string[]]$PipDownloadArgs = @('--only-binary=:all:', '--platform', 'win_amd64', '--python-version', '3.12', '--implementation', 'cp', '--abi', 'cp312'),
-                [string]$MsixbundleSha256 = $script:FakeMsixbundleHash,
-                [string]$VcLibsSha256 = $script:FakeVclibsHash,
-                [string]$UiXamlSha256 = $script:FakeUixamlHash,
                 [string]$VcRedistSha256 = $script:FakeVcredistHash,
-                [string]$MsixbundleUrl = 'https://aka.ms/getwinget',
                 [bool]$PipEnabled = $true,
                 [bool]$NpmEnabled = $true
             )
@@ -227,14 +133,8 @@ exit /b %FAKE_NPM_EXIT%
                 pip        = [pscustomobject]@{ downloadArgs = @($PipDownloadArgs) }
                 pins       = [pscustomobject]@{
                     appInstaller = [pscustomobject]@{
-                        msixbundleUrl    = $MsixbundleUrl
-                        msixbundleSha256 = $MsixbundleSha256
-                        vcLibsUrl        = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx'
-                        vcLibsSha256     = $VcLibsSha256
-                        uiXamlUrl        = 'https://www.nuget.org/api/v2/package/Microsoft.UI.Xaml/2.8.6'
-                        uiXamlSha256     = $UiXamlSha256
-                        vcRedistUrl      = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
-                        vcRedistSha256   = $VcRedistSha256
+                        vcRedistUrl    = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+                        vcRedistSha256 = $VcRedistSha256
                     }
                     npm = [pscustomobject]@{ verdaccioVersion = '6.10.2' }
                 }
@@ -264,19 +164,7 @@ exit /b %FAKE_NPM_EXIT%
             if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
                 New-Item -ItemType Directory -Path $parent -Force | Out-Null
             }
-            if ($Uri -match 'getwinget') {
-                Copy-Item -LiteralPath $script:FakeMsixbundle -Destination $OutFile -Force
-            }
-            elseif ($Uri -match 'newerbundle') {
-                Copy-Item -LiteralPath $script:FakeMsixbundleNewer -Destination $OutFile -Force
-            }
-            elseif ($Uri -match 'VCLibs') {
-                Copy-Item -LiteralPath $script:FakeVclibs -Destination $OutFile -Force
-            }
-            elseif ($Uri -match 'nuget') {
-                Copy-Item -LiteralPath $script:FakeNupkg -Destination $OutFile -Force
-            }
-            elseif ($Uri -match 'vc_redist') {
+            if ($Uri -match 'vc_redist') {
                 Copy-Item -LiteralPath $script:FakeVcredist -Destination $OutFile -Force
             }
             else {
@@ -433,23 +321,20 @@ exit /b %FAKE_NPM_EXIT%
             Test-Path -LiteralPath (Join-Path $staging 'winget\packages.txt') | Should -BeFalse
         }
 
-        It 'stages all four appInstaller pieces with passing hashes' {
+        It 'stages the VC_redist piece with a passing hash (App Installer chain no longer exported)' {
             $staging = Join-Path $TestDrive 'staging-appinstaller'
             $report = Export-OSyncRuntime -Config (New-OTestConfig) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
 
             $dir = Join-Path $staging 'runtime\appinstaller'
-            foreach ($file in @('Microsoft.DesktopAppInstaller.msixbundle', 'Microsoft.VCLibs.x64.14.00.Desktop.appx', 'Microsoft.UI.Xaml.2.8.appx', 'VC_redist.x64.exe')) {
-                Test-Path -LiteralPath (Join-Path $dir $file) -PathType Leaf | Should -BeTrue
-            }
-            # The UI.Xaml appx was extracted from the nupkg (the nupkg itself
-            # is not part of the payload).
-            Test-Path -LiteralPath (Join-Path $dir 'Microsoft.UI.Xaml.2.8.6.nupkg') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $dir 'VC_redist.x64.exe') -PathType Leaf | Should -BeTrue
+            # The App Installer pieces are NOT exported anymore.
+            Test-Path -LiteralPath (Join-Path $dir 'Microsoft.DesktopAppInstaller.msixbundle') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $dir 'Microsoft.VCLibs.x64.14.00.Desktop.appx') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $dir 'Microsoft.UI.Xaml.2.8.appx') | Should -BeFalse
 
-            $report.appInstaller.pieces.Count | Should -Be 4
-            $report.appInstaller.pieces[0].Sha256 | Should -Be $script:FakeMsixbundleHash
-            $report.appInstaller.pieces[1].Sha256 | Should -Be $script:FakeVclibsHash
-            $report.appInstaller.pieces[2].Sha256 | Should -Be $script:FakeUixamlHash
-            $report.appInstaller.pieces[3].Sha256 | Should -Be $script:FakeVcredistHash
+            $report.appInstaller.pieces.Count | Should -Be 1
+            $report.appInstaller.pieces[0].Name | Should -Be 'vcredist'
+            $report.appInstaller.pieces[0].Sha256 | Should -Be $script:FakeVcredistHash
         }
 
         It 'copies runtime-winget.txt into the runtime payload' {
@@ -486,40 +371,6 @@ exit /b %FAKE_NPM_EXIT%
             Test-Path -LiteralPath (Join-Path $staging 'runtime\.verdaccio-build') | Should -BeFalse
         }
 
-        It 'records the static version-match result (bundle deps satisfied)' {
-            $staging = Join-Path $TestDrive 'staging-versionmatch'
-            $report = Export-OSyncRuntime -Config (New-OTestConfig) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
-
-            $report.appInstaller.versionMatch.Ok | Should -BeTrue
-            $report.appInstaller.versionMatch.Checks.Count | Should -Be 2
-            # vclibs (Microsoft.VCLibs.140.00.UWPDesktop) satisfies the
-            # bundle's UWPDesktop dependency (14.0.33728.0 >= 14.0.33728.0).
-            $report.appInstaller.versionMatch.Checks[0].Piece | Should -Be 'vclibs'
-            $report.appInstaller.versionMatch.Checks[0].Match | Should -BeTrue
-            # uixaml is not a dependency of this bundle version -> recorded
-            # as 'not listed' (Match $null), not a failure.
-            $report.appInstaller.versionMatch.Checks[1].Piece | Should -Be 'uixaml'
-            $report.appInstaller.versionMatch.Checks[1].Match | Should -BeNullOrEmpty
-            $report.appInstaller.versionMatch.Checks[1].Note | Should -Match 'not listed'
-        }
-
-        It 'reads the bundle manifest from the inner x64 msix (nested layout)' {
-            $staging = Join-Path $TestDrive 'staging-nested'
-            $null = Export-OSyncRuntime -Config (New-OTestConfig) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
-            $bundlePath = Join-Path $staging 'runtime\appinstaller\Microsoft.DesktopAppInstaller.msixbundle'
-            $manifest = Get-OSyncBundleManifestText -BundlePath $bundlePath
-            $manifest | Should -Match 'Microsoft\.VCLibs\.140\.00\.UWPDesktop'
-        }
-
-        It 'falls back to a root-level AppxManifest.xml for older bundles' {
-            $rootBundle = Join-Path $TestDrive 'root-manifest.msixbundle'
-            New-OTestZip -ZipPath $rootBundle -Entries @{
-                'AppxManifest.xml' = '<Bundle xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"><Identity Name="Microsoft.DesktopAppInstaller" Version="1.0.0.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"/><Dependencies><PackageDependency Name="Microsoft.VCLibs.140.00.UWPDesktop" MinVersion="14.0.33728.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"/></Dependencies></Bundle>'
-            }
-            $manifest = Get-OSyncBundleManifestText -BundlePath $rootBundle
-            $manifest | Should -Match 'Microsoft\.VCLibs\.140\.00\.UWPDesktop'
-        }
-
         It 'reports the pip cross-assertion result in the report' {
             $staging = Join-Path $TestDrive 'staging-cross'
             $report = Export-OSyncRuntime -Config (New-OTestConfig) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
@@ -531,32 +382,29 @@ exit /b %FAKE_NPM_EXIT%
     }
 
     Context 'Export-OSyncRuntime - hash gate paths' {
-        It 'PIN-ME prints the actual hashes and exits non-zero BEFORE any winget download' {
+        It 'PIN-ME prints the actual hash and exits non-zero BEFORE any winget download' {
             $staging = Join-Path $TestDrive 'staging-pinme'
             # Behavior proof: if the export tried to download winget packages
             # before the PIN-ME gate, this mock throws and the test fails.
             Mock Invoke-OSyncWingetDownload { throw 'Invoke-OSyncWingetDownload must not be called before the PIN-ME gate' }
 
             $err = Invoke-OTestThrowing {
-                Export-OSyncRuntime -Config (New-OTestConfig -MsixbundleSha256 'PIN-ME' -VcLibsSha256 'PIN-ME' -UiXamlSha256 'PIN-ME' -VcRedistSha256 'PIN-ME') -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+                Export-OSyncRuntime -Config (New-OTestConfig -VcRedistSha256 'PIN-ME') -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
             }
             $err | Should -Not -BeNullOrEmpty
             $err.Exception.Message | Should -Match 'PIN-ME'
-            $err.Exception.Message | Should -Match ('msixbundle={0}' -f $script:FakeMsixbundleHash)
-            $err.Exception.Message | Should -Match ('vclibs={0}' -f $script:FakeVclibsHash)
-            $err.Exception.Message | Should -Match ('uixaml={0}' -f $script:FakeUixamlHash)
             $err.Exception.Message | Should -Match ('vcredist={0}' -f $script:FakeVcredistHash)
         }
 
-        It 'aborts naming the file when one piece hash is corrupted' {
+        It 'aborts naming the file when the piece hash is corrupted' {
             $staging = Join-Path $TestDrive 'staging-mismatch'
             $wrong = ('a' * 64)
             $err = Invoke-OTestThrowing {
-                Export-OSyncRuntime -Config (New-OTestConfig -VcLibsSha256 $wrong) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
+                Export-OSyncRuntime -Config (New-OTestConfig -VcRedistSha256 $wrong) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
             }
             $err | Should -Not -BeNullOrEmpty
             $err.Exception.Message | Should -Match 'mismatch'
-            $err.Exception.Message | Should -Match 'Microsoft\.VCLibs\.x64\.14\.00\.Desktop\.appx'
+            $err.Exception.Message | Should -Match 'VC_redist\.x64\.exe'
             $err.Exception.Message | Should -Match $wrong
         }
     }
@@ -576,19 +424,6 @@ exit /b %FAKE_NPM_EXIT%
         }
     }
 
-    Context 'Export-OSyncRuntime - version-match mismatch (warning, not fatal)' {
-        It 'records a mismatch when the bundle requires newer pieces but still completes' {
-            $staging = Join-Path $TestDrive 'staging-versionmismatch'
-            $report = Export-OSyncRuntime -Config (New-OTestConfig -MsixbundleUrl 'https://example.com/newerbundle' -MsixbundleSha256 $script:FakeMsixbundleNewerHash) -StagingDir $staging -WingetExePath 'C:\fake\winget.exe' -ToolSourceDir $script:ToolSourceDir
-
-            $report.status | Should -Be 'ok'
-            $report.appInstaller.versionMatch.Ok | Should -BeFalse
-            $report.appInstaller.versionMatch.Checks[0].Match | Should -BeFalse
-            $report.appInstaller.versionMatch.Checks[0].MinVersion | Should -Be '99.0.0.0'
-            $report.appInstaller.versionMatch.Checks[1].Match | Should -BeFalse
-        }
-    }
-
     Context 'Export-OSyncRuntime - per-package winget failure handling' {
         It 'records a failing runtime entry and still exports the others' {
             $staging = Join-Path $TestDrive 'staging-wingetfail'
@@ -604,15 +439,6 @@ exit /b %FAKE_NPM_EXIT%
     }
 
     Context 'Export-OSyncRuntime - portable Verdaccio build dir (local npm prefix)' {
-        # The suite's global BeforeAll does NOT dot-source Config.ps1 (that
-        # is the pre-existing 14-failure baseline). This Context needs
-        # Resolve-OSyncConfigPath to exercise the real export flow, so it is
-        # loaded HERE - scoped to this Context only, the other Contexts stay
-        # untouched.
-        BeforeAll {
-            . (Join-Path $PSScriptRoot '..\src\lib\Config.ps1')
-        }
-
         # npm's arborist 'realpathCached' infinitely recurses on UNC prefixes
         # (RangeError: Maximum call stack size exceeded), so the portable
         # Verdaccio npm install must run with a LOCAL --prefix even when the
