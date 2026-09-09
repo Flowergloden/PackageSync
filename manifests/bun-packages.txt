@@ -1,7 +1,9 @@
-# PakageSync bun package list - same format as the npm list:
+﻿# PakageSync bun package list - same format as the npm list:
 # name, name@version, or @scope/name[@version] (package names are lowercase).
 # bun is the npm-category PARALLEL FRONTEND: entries here are warmed through
 # the same one-shot Verdaccio into the same storage snapshot the npm list
 # uses, so bun on B can also install EVERY package from npm-packages.txt.
 # An empty (comments-only) list is legal: the bun runtime is still delivered
 # and bun on B installs against the shared local registry on demand.
+
+oh-my-openagent@4.19.4

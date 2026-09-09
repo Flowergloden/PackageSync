@@ -105,13 +105,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Register-S
 
 ### 4.0 从本机已安装包交互生成清单（Export-Manifests.ps1）
 
-A 端手动运维工具：从本机包管理器采集已安装包（`winget export` / `pip freeze` / `npm ls -g`），在控制台以编号多选方式勾选需要的条目，按**已安装版本钉版**写回对应清单（首建或增补均可）：
+A 端手动运维工具：从本机包管理器采集已安装包（`winget export` / `pip freeze` / `npm ls -g` / `bun pm ls -g`），在控制台以编号多选方式勾选需要的条目，按**已安装版本钉版**写回对应清单（首建或增补均可）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-Manifests.ps1 [-Category winget,pip,npm]
+powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-Manifests.ps1 [-Category winget,pip,npm,bun]
 ```
 
-- 流程：采集已安装包 → 编号多选（`1,3,5-8` / `all` / `none`，回车保持预选）→ 按已装版本钉版回写（winget `Id@version`、pip `name==version`、npm `name@version`）。
+- 流程：采集已安装包 → 编号多选（`1,3,5-8` / `all` / `none`，回车保持预选）→ 按已装版本钉版回写（winget `Id@version`、pip `name==version`、npm/bun `name@version`）。
+- bun 是**可选类别**（不在默认 `-Category winget,pip,npm` 中，需显式 `-Category bun`），且 presence-gated：config 无 `paths.bunList` 键时该类直接跳过（Info 日志，不报错）——bun 清单格式与 npm 清单完全相同（见 4.5）。
 - 既有清单条目默认预选；已安装但不在清单里的条目默认不选；清单里有但本机未安装的条目显示 `(not installed)` 标记。
 - 回写前自动备份为 `<清单>.bak-<yyyyMMddTHHmmssZ>`（UTC）；选中结果与原清单逐行一致时不写不备份。
 - 某类全部不选则该类清单保持原样不动（绝不写空清单）。
@@ -176,7 +177,7 @@ is-odd@3.0.1
 - **B 端只供给、不自动安装**（同 npm 语义）：用户按需 `bun add -g <pkg>`（无需 lockfile）；全局可执行入口落在 `%USERPROFILE%\.bun\bin`，首次使用前自行加入**用户** PATH（一次性，见 L22）。
 - npm apply 顺带做 bun 视角验证：`bun info <包> version` 命中本地 registry + 不存在包 30s 内快速失败（无 uplink 挂起证明）；失败则整个 npm apply 失败。
 - **关闭 bun**：删除 config 的 `pins.bun` 整节（`paths.bunList` 可一并删）——旧部署/旧 B config 无 bun 键时行为与之前完全一致（bun 全是 presence-gated）。
-- Export-Manifests.ps1 暂不支持从本机 `bun pm ls -g` 采集 bun 清单（后续迭代），bun 清单手工编辑。
+- Export-Manifests.ps1 支持从本机 `bun pm ls -g` 采集 bun 清单：显式 `-Category bun`（opt-in，不在默认类别中；需 config 含 `paths.bunList`），采集/多选/钉版回写流程与其他类别一致（见 4.0）。
 
 ## 五、运维手册
 

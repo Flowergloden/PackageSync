@@ -6,7 +6,7 @@
     of src\Export-Manifests.ps1).
 
 .DESCRIPTION
-    All external tools (winget / python / npm) are FAKE .cmd stubs - no
+    All external tools (winget / python / npm / bun) are FAKE .cmd stubs - no
     real package manager is ever invoked. Read-Host is mocked for the
     picker. All manifest files live under $TestDrive - the real
     manifests\ directory is never touched.
@@ -40,8 +40,20 @@ Describe 'ManifestGenerate' {
         function New-OTestConfigFile {
             param(
                 [string]$ToolRoot,
-                [string]$RepoRoot
+                [string]$RepoRoot,
+                # Opt-in: adds paths.bunList so the bun category is enabled
+                # (bun is presence-gated on this key - the default test
+                # config deliberately omits it so the skip path is testable).
+                [switch]$IncludeBun
             )
+            $paths = [ordered]@{
+                wingetWhitelist  = 'manifests\winget-packages.txt'
+                runtimeWhitelist = 'manifests\runtime-winget.txt'
+                requirements     = 'manifests\requirements.txt'
+                npmList          = 'manifests\npm-packages.txt'
+                dotfilesSource   = 'manifests\dotfiles'
+            }
+            if ($IncludeBun) { $paths['bunList'] = 'manifests\bun-packages.txt' }
             $config = [ordered]@{
                 schemaVersion = 1
                 role          = 'A'
@@ -52,13 +64,7 @@ Describe 'ManifestGenerate' {
                 verdaccioPort = 4873
                 npm           = [ordered]@{ aVerdaccioPort = 4874 }
                 categories    = [ordered]@{ winget = $true; pip = $true; npm = $true; dotfiles = $true }
-                paths = [ordered]@{
-                    wingetWhitelist  = 'manifests\winget-packages.txt'
-                    runtimeWhitelist = 'manifests\runtime-winget.txt'
-                    requirements     = 'manifests\requirements.txt'
-                    npmList          = 'manifests\npm-packages.txt'
-                    dotfilesSource   = 'manifests\dotfiles'
-                }
+                paths         = $paths
                 winget = [ordered]@{ scope = 'machine'; architecture = 'x64' }
                 pip    = [ordered]@{
                     downloadArgs   = @('--only-binary=:all:')
@@ -293,6 +299,69 @@ Describe 'ManifestGenerate' {
         }
     }
 
+    Describe 'Get-OSyncInstalledBun' {
+        BeforeAll {
+            # Real bun 1.4.0 output shape: a header line with the global
+            # node_modules path + count, then tree-prefixed entries.
+            $script:BunFixture = Join-Path $TestDrive 'bun-pm-ls.txt'
+            [System.IO.File]::WriteAllText($script:BunFixture, "C:\Users\X\.bun\install\global node_modules (3)`r`n├── is-odd@3.0.1`r`n├── @babel/core@7.26.0`r`n└── unpinned-pkg`r`n", (New-Object System.Text.UTF8Encoding($false)))
+            $script:FakeBun = New-OFakeTool -FixturePath $script:BunFixture
+        }
+
+        It 'parses the tree output: header line skipped, name/version split at the last @' {
+            $result = @(Get-OSyncInstalledBun -BunExe $script:FakeBun)
+            $result.Count | Should -Be 3
+            $result[0].Name | Should -Be 'is-odd'
+            $result[0].Version | Should -Be '3.0.1'
+            $result[1].Name | Should -Be '@babel/core'
+            $result[1].Version | Should -Be '7.26.0'
+            $result[2].Name | Should -Be 'unpinned-pkg'
+            $result[2].Version | Should -BeNullOrEmpty
+        }
+
+        It 'parses entries even when the tree prefix is OEM-misdecoded (cp936 CJK garbage)' {
+            # bun always writes the tree prefix as UTF-8; under Windows
+            # PowerShell 5.1 with the console OEM codepage (cp936 on zh-CN)
+            # it decodes to CJK garbage, so the parser must not depend on
+            # the literal box-drawing characters. The char codes below are
+            # the ACTUAL misdecoding observed for '└── ' under cp936.
+            $prefix = [string]([char]0x9239) + [char]0x65BA + [char]0x6522 + [char]0x9239 + [char]0x20AC + ' '
+            $mojibake = Join-Path $TestDrive 'bun-pm-ls-mojibake.txt'
+            [System.IO.File]::WriteAllText($mojibake, ($prefix + 'oh-my-openagent@4.19.4' + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+            $fake = New-OFakeTool -FixturePath $mojibake
+            $result = @(Get-OSyncInstalledBun -BunExe $fake)
+            $result.Count | Should -Be 1
+            $result[0].Name | Should -Be 'oh-my-openagent'
+            $result[0].Version | Should -Be '4.19.4'
+        }
+
+        It 'throws when bun pm ls -g exits non-zero' {
+            $bad = New-OFakeTool -FixturePath $script:BunFixture -ExitCode 1
+            { Get-OSyncInstalledBun -BunExe $bad } | Should -Throw -ExpectedMessage '*exit code 1*'
+        }
+
+        It 'throws (never fails silently) when bun pm ls -g produces no output' {
+            $empty = Join-Path $TestDrive 'bun-empty.txt'
+            [System.IO.File]::WriteAllText($empty, '', [System.Text.Encoding]::ASCII)
+            $bad = New-OFakeTool -FixturePath $empty
+            { Get-OSyncInstalledBun -BunExe $bad } | Should -Throw -ExpectedMessage '*no output*'
+        }
+
+        It 'parses entries emitted on stderr (2>&1 merge)' {
+            $errCmd = Join-Path $TestDrive ("fakebun-err-{0}.cmd" -f [guid]::NewGuid().ToString('N'))
+            $content = @(
+                '@echo off',
+                "type `"$script:BunFixture`" 1>&2",
+                'exit /b 0'
+            ) -join "`r`n"
+            [System.IO.File]::WriteAllText($errCmd, $content, [System.Text.Encoding]::ASCII)
+            $result = @(Get-OSyncInstalledBun -BunExe $errCmd)
+            $result.Count | Should -Be 3
+            $result[0].Name | Should -Be 'is-odd'
+            $result[2].Name | Should -Be 'unpinned-pkg'
+        }
+    }
+
     Describe 'Show-OSyncEntryPicker' {
         BeforeAll {
             $script:PickerEntries = @(
@@ -344,9 +413,10 @@ Describe 'ManifestGenerate' {
             function Invoke-OTestMerge {
                 param(
                     [string[]]$Category,
-                    [hashtable]$InstalledByCategory
+                    [hashtable]$InstalledByCategory,
+                    [switch]$IncludeBun
                 )
-                $configPath = New-OTestConfigFile -ToolRoot $script:ToolRoot -RepoRoot $script:RepoRoot
+                $configPath = New-OTestConfigFile -ToolRoot $script:ToolRoot -RepoRoot $script:RepoRoot -IncludeBun:$IncludeBun
                 $config = Get-OSyncConfig -Path $configPath
                 $script:PickerEntries = $null
                 Mock Show-OSyncEntryPicker {
@@ -365,6 +435,7 @@ Describe 'ManifestGenerate' {
                 Mock Get-OSyncInstalledWinget { $l = $InstalledByCategory['winget']; if ($null -eq $l) { return @() }; return @($l) }
                 Mock Get-OSyncInstalledPip { $l = $InstalledByCategory['pip']; if ($null -eq $l) { return @() }; return @($l) }
                 Mock Get-OSyncInstalledNpm { $l = $InstalledByCategory['npm']; if ($null -eq $l) { return @() }; return @($l) }
+                Mock Get-OSyncInstalledBun { $l = $InstalledByCategory['bun']; if ($null -eq $l) { return @() }; return @($l) }
                 $null = Invoke-OSyncManifestGenerate -Config $config -Category $Category
                 return $script:PickerEntries
             }
@@ -430,6 +501,17 @@ Describe 'ManifestGenerate' {
             $entries[0].Preselected | Should -BeTrue
             $entries[0].PinnedText | Should -Be 'is-odd@3.0.2'
         }
+
+        It 'pins bun entries as name@Version (bun list shares the npm list format)' {
+            Set-Content -LiteralPath (Join-Path $script:ManifestsDir 'bun-packages.txt') -Value @('is-odd@3.0.1') -Encoding UTF8
+            $entries = @(Invoke-OTestMerge -Category @('bun') -IncludeBun -InstalledByCategory @{
+                bun = @([pscustomobject]@{ Name = 'is-odd'; Version = '3.0.2' })
+            })
+            $entries.Count | Should -Be 1
+            $entries[0].Key | Should -Be 'is-odd'
+            $entries[0].Preselected | Should -BeTrue
+            $entries[0].PinnedText | Should -Be 'is-odd@3.0.2'
+        }
     }
 
     Describe 'Invoke-OSyncManifestGenerate: writeback' {
@@ -447,9 +529,10 @@ Describe 'ManifestGenerate' {
                 param(
                     [string[]]$Category,
                     [hashtable]$InstalledByCategory,
-                    [string]$InputText
+                    [string]$InputText,
+                    [switch]$IncludeBun
                 )
-                $configPath = New-OTestConfigFile -ToolRoot $script:ToolRoot -RepoRoot $script:RepoRoot
+                $configPath = New-OTestConfigFile -ToolRoot $script:ToolRoot -RepoRoot $script:RepoRoot -IncludeBun:$IncludeBun
                 $config = Get-OSyncConfig -Path $configPath
                 $script:LogMessages = @()
                 # Remove stale backups from earlier tests so .bak assertions
@@ -464,6 +547,7 @@ Describe 'ManifestGenerate' {
                 Mock Get-OSyncInstalledWinget { $l = $InstalledByCategory['winget']; if ($null -eq $l) { return @() }; return @($l) }
                 Mock Get-OSyncInstalledPip { $l = $InstalledByCategory['pip']; if ($null -eq $l) { return @() }; return @($l) }
                 Mock Get-OSyncInstalledNpm { $l = $InstalledByCategory['npm']; if ($null -eq $l) { return @() }; return @($l) }
+                Mock Get-OSyncInstalledBun { $l = $InstalledByCategory['bun']; if ($null -eq $l) { return @() }; return @($l) }
                 return Invoke-OSyncManifestGenerate -Config $config -Category $Category
             }
         }
@@ -573,6 +657,27 @@ Describe 'ManifestGenerate' {
             $result['npm'].Changed | Should -BeTrue
             $text = [System.IO.File]::ReadAllText((Join-Path $script:ManifestsDir 'npm-packages.txt'), [System.Text.Encoding]::UTF8)
             $text.Trim() | Should -Be 'lodash@4.17.21'
+        }
+
+        It 'pins bun entries as name@Version into bun-packages.txt' {
+            Set-Content -LiteralPath (Join-Path $script:ManifestsDir 'bun-packages.txt') -Value @('is-odd') -Encoding UTF8
+            $result = Invoke-OTestWrite -Category @('bun') -InputText '' -IncludeBun -InstalledByCategory @{
+                bun = @([pscustomobject]@{ Name = 'is-odd'; Version = '3.0.1' })
+            }
+            $result['bun'].Changed | Should -BeTrue
+            $text = [System.IO.File]::ReadAllText((Join-Path $script:ManifestsDir 'bun-packages.txt'), [System.Text.Encoding]::UTF8)
+            $text.Trim() | Should -Be 'is-odd@3.0.1'
+        }
+
+        It 'skips the bun category (Info log, no error, no file) when the config has no paths.bunList' {
+            Remove-Item -LiteralPath (Join-Path $script:ManifestsDir 'bun-packages.txt') -Force -ErrorAction SilentlyContinue
+            $result = Invoke-OTestWrite -Category @('bun') -InputText 'all' -InstalledByCategory @{
+                bun = @([pscustomobject]@{ Name = 'is-odd'; Version = '3.0.1' })
+            }
+            $result['bun'].Selected | Should -Be 0
+            $result['bun'].Changed | Should -BeFalse
+            @($script:LogMessages | Where-Object { $_ -match "no 'paths\.bunList'" }).Count | Should -Be 1
+            Test-Path -LiteralPath (Join-Path $script:ManifestsDir 'bun-packages.txt') | Should -BeFalse
         }
 
         It 'isolates a failing category and continues with the others' {

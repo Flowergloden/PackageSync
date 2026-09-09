@@ -3,18 +3,22 @@
   ManifestGenerate.ps1 - A-side interactive manifest generator for PakageSync.
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
 
-  Invoke-OSyncManifestGenerate -Config <config> [-Category winget,pip,npm]
+  Invoke-OSyncManifestGenerate -Config <config> [-Category winget,pip,npm,bun]
     is the core of src\Export-Manifests.ps1 (the entry script is a thin
     wrapper that imports the module and maps success to the process exit
     code). It is a STANDALONE manual operator tool: it reads the installed
-    package set from the A machine (winget export / pip freeze / npm ls -g),
-    lets the operator pick entries at the console (numbered multi-select),
-    pins the picked entries to the installed versions and writes them back
-    into the manifests (winget-packages.txt / requirements.txt /
-    npm-packages.txt). It never touches the export/apply pipelines.
+    package set from the A machine (winget export / pip freeze / npm ls -g
+    / bun pm ls -g), lets the operator pick entries at the console
+    (numbered multi-select), pins the picked entries to the installed
+    versions and writes them back into the manifests (winget-packages.txt
+    / requirements.txt / npm-packages.txt / bun-packages.txt). It never
+    touches the export/apply pipelines.
 
     1. Per category: collect the installed packages (Get-OSyncInstalledWinget
-       / Get-OSyncInstalledPip / Get-OSyncInstalledNpm).
+       / Get-OSyncInstalledPip / Get-OSyncInstalledNpm /
+       Get-OSyncInstalledBun). The bun category is presence-gated: it is
+       skipped with an Info log (not an error) when the config has no
+       paths.bunList key.
     2. Parse the existing manifest entries (Read-OSyncWingetList /
        Read-OSyncNpmList; pip requirements are classified line-wise with
        PEP 503 name normalization - lowercase, runs of [-_.] folded to a
@@ -44,7 +48,9 @@
   (documented gotcha).
 
   User decision: console numbered multi-select only (no Out-GridView);
-  only winget/pip/npm participate (dotfiles has no per-entry interaction);
+  only winget/pip/npm/bun participate (dotfiles has no per-entry
+  interaction; bun is opt-in via -Category, not in the default category
+  list);
   the picker hard-fails when the session is not interactive (scheduled
   task / non-interactive session); this is an A-side manual tool - it is
   never registered as a scheduled task.
@@ -215,6 +221,108 @@ function Get-OSyncInstalledNpm {
             if ($null -ne $prop.Value -and $null -ne $prop.Value.version) { $version = [string]$prop.Value.version }
             $result += [pscustomobject]@{ Name = $name; Version = $version }
         }
+    }
+    return $result
+}
+
+function Get-OSyncInstalledBun {
+    <#
+    .SYNOPSIS
+        Collects the installed global bun packages via `bun pm ls -g`.
+
+    .DESCRIPTION
+        Resolves bun from PATH (override with -BunExe for tests), runs
+        `bun pm ls -g` and parses the tree output into @{ Name; Version }
+        objects. The default (no --all) output lists TOP-LEVEL packages
+        only - the same semantics as `npm ls -g --depth=0` (verified on
+        bun 1.4.0: a global node_modules with 250 packages prints only its
+        1 top-level entry).
+
+        Output shape (bun 1.4.0):
+          <global-dir> node_modules (<count>)     <- header line, skipped
+          ├── name@version                        <- entry lines
+          └── @scope/name@version
+
+        Encoding gotcha: bun always writes the box-drawing prefix as UTF-8;
+        under Windows PowerShell 5.1 the console OEM codepage (e.g. cp936
+        on zh-CN) misdecodes it into CJK garbage. The parser therefore does
+        NOT match the literal tree characters - an entry line is defined
+        structurally as "any run of non-name decoration characters,
+        followed by one npm-shaped spec" (anchored to the whole line, so
+        the header path line with its ':' / '\' / '()' never matches).
+        Name/version are split at the LAST '@' (scoped names start with
+        '@' at index 0 and are handled); an entry without '@version'
+        yields Version = $null. A non-zero exit code throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$BunExe
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BunExe)) {
+        # -CommandType Application: an interactive session may define a
+        # 'bun' alias/function (shell integrations do this) which shadows
+        # the exe in a plain Get-Command; its .Source is EMPTY, and the
+        # subsequent `& '' pm ls -g` then fails SILENTLY - module-scope
+        # $ErrorActionPreference is Continue, a CommandNotFound error is
+        # non-terminating, $LASTEXITCODE keeps its stale (passing) value,
+        # and the run ends with an empty picker instead of an error.
+        # (Observed 2026-09-09: a long-lived interactive session collected
+        # 0 installed while a fresh session collected correctly.)
+        $cmd = Get-Command bun -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $cmd -or [string]::IsNullOrWhiteSpace([string]$cmd.Source)) {
+            throw "Get-OSyncInstalledBun: 'bun' was not found on PATH."
+        }
+        $BunExe = [string]$cmd.Source
+    }
+
+    # 2>&1: merge stderr as well - depending on the host's stream setup a
+    # tool may emit its listing on stderr; non-entry lines are skipped by
+    # the entry regex below, so the merge is harmless when stderr is empty.
+    $output = @(& $BunExe pm ls -g 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Get-OSyncInstalledBun: 'bun pm ls -g' failed with exit code $LASTEXITCODE."
+    }
+    if ($output.Count -eq 0) {
+        # Never fail silently: zero output means the invocation itself
+        # broke (shadowed exe / host capture issue) - an empty GLOBAL
+        # still prints its header line.
+        throw "Get-OSyncInstalledBun: 'bun pm ls -g' produced no output (exit $LASTEXITCODE) - cannot collect the global package set."
+    }
+
+    # Normalize to clean single lines: native stderr items arrive as
+    # ErrorRecord ([string] yields their message text), and an explicit
+    # split survives any host that hands the output over unsplit.
+    $lines = @()
+    foreach ($item in $output) {
+        foreach ($l in (([string]$item) -split "\r?\n")) {
+            if (-not [string]::IsNullOrWhiteSpace($l)) { $lines += $l }
+        }
+    }
+
+    $result = @()
+    foreach ($text in $lines) {
+        # Decoration = any leading run that is not an ASCII name char or
+        # '@' (covers the UTF-8 tree prefix AND its OEM-misdecoded CJK
+        # form). The spec itself is npm-shaped; the whole-line anchor
+        # rejects the header path line and any warning text.
+        if ($text -notmatch '^[^A-Za-z0-9@]*(@?[A-Za-z0-9._~-][A-Za-z0-9._~/-]*(?:@[A-Za-z0-9._~-][^\s@]*)?)\s*$') { continue }
+        $spec = $Matches[1]
+        $at = $spec.LastIndexOf('@')
+        if ($at -gt 0) {
+            $result += [pscustomobject]@{ Name = $spec.Substring(0, $at); Version = $spec.Substring($at + 1) }
+        }
+        else {
+            # No '@version' (or a bare scoped name '@scope/name'): unpinned.
+            $result += [pscustomobject]@{ Name = $spec; Version = $null }
+        }
+    }
+    if ($result.Count -eq 0 -and $lines.Count -gt 1) {
+        # More than just the header line, yet nothing parsed - suspicious;
+        # surface the raw evidence instead of silently showing an empty
+        # picker. (A truly empty global prints ONLY its header line.)
+        Write-Warning "Get-OSyncInstalledBun: 'bun pm ls -g' printed $($lines.Count) line(s) but none parsed as a package entry; first line: '$($lines[0])'"
     }
     return $result
 }
@@ -429,7 +537,8 @@ function New-OSyncManifestCandidates {
             $key = ConvertTo-OSyncPep503Name -Name ([string]$inst.Name)
             $pinned = "$($inst.Name)==$($inst.Version)"
         }
-        elseif ($Category -eq 'npm') {
+        elseif ($Category -in @('npm', 'bun')) {
+            # bun list format is identical to the npm list (README 4.5).
             $key = ([string]$inst.Name).ToLowerInvariant()
             if ([string]::IsNullOrWhiteSpace([string]$inst.Version)) {
                 $pinned = [string]$inst.Name
@@ -534,7 +643,7 @@ function Invoke-OSyncManifestGenerateCategory {
     <#
     .SYNOPSIS
         Runs the collect -> merge -> pick -> write-back flow for ONE
-        category (winget / pip / npm).
+        category (winget / pip / npm / bun).
 
     .DESCRIPTION
         Returns @{ Selected = <int>; Changed = <bool>; BackupPath = <path
@@ -567,6 +676,7 @@ function Invoke-OSyncManifestGenerateCategory {
         'winget' { $installed = @(Get-OSyncInstalledWinget) }
         'pip'    { $installed = @(Get-OSyncInstalledPip) }
         'npm'    { $installed = @(Get-OSyncInstalledNpm) }
+        'bun'    { $installed = @(Get-OSyncInstalledBun) }
     }
 
     # --- 2. parse the existing manifest entries (missing file = empty existing manifest) ---
@@ -606,6 +716,14 @@ function Invoke-OSyncManifestGenerateCategory {
                 }
             }
             'npm' {
+                $parsed = @(Read-OSyncNpmList -Path $listPath)
+                foreach ($p in $parsed) {
+                    $raw = [string]$originalLines[$p.Line - 1]
+                    $existing += [pscustomobject]@{ Key = $p.Name.ToLowerInvariant(); Text = $raw }
+                }
+            }
+            'bun' {
+                # bun list format is identical to the npm list (README 4.5).
                 $parsed = @(Read-OSyncNpmList -Path $listPath)
                 foreach ($p in $parsed) {
                     $raw = [string]$originalLines[$p.Line - 1]
@@ -658,12 +776,14 @@ function Invoke-OSyncManifestGenerate {
         Runs the interactive manifest generator for every requested category.
 
     .DESCRIPTION
-        For each of winget/pip/npm in $Category (other categories are
+        For each of winget/pip/npm/bun in $Category (other categories are
         ignored - dotfiles has no per-entry interaction) it resolves the
         manifest path via Resolve-OSyncConfigPath (paths.wingetWhitelist /
-        paths.requirements / paths.npmList), collects the installed
-        packages, merges them with the existing manifest entries, shows the
-        picker and writes the selection back. One category's failure (e.g.
+        paths.requirements / paths.npmList / paths.bunList), collects the
+        installed packages, merges them with the existing manifest entries,
+        shows the picker and writes the selection back. The bun category is
+        presence-gated: it is skipped (Info log, not an error) when the
+        config has no paths.bunList key. One category's failure (e.g.
         winget unavailable) is logged as Error and does not block the
         others.
 
@@ -684,13 +804,23 @@ function Invoke-OSyncManifestGenerate {
         winget = 'wingetWhitelist'
         pip    = 'requirements'
         npm    = 'npmList'
+        bun    = 'bunList'
     }
 
     Write-OSyncLog -Category 'export' -Level Info -Message "manifest generate: run starting (categories '$($Category -join ',')')." -Config $Config | Out-Null
 
     $result = @{}
     foreach ($cat in $Category) {
-        if ($cat -notin @('winget', 'pip', 'npm')) { continue }
+        if ($cat -notin @('winget', 'pip', 'npm', 'bun')) { continue }
+        # bun is presence-gated: no paths.bunList = bun not enabled - skip
+        # with an Info log instead of letting Resolve-OSyncConfigPath throw
+        # on the $null path (an old config without the bun keys must not
+        # turn an explicit -Category bun into an error).
+        if ($cat -eq 'bun' -and [string]::IsNullOrWhiteSpace([string](Get-ONestedValue -Object $Config -Path 'paths.bunList'))) {
+            Write-OSyncLog -Category 'export' -Level Info -Message "manifest generate: 'bun' skipped - config has no 'paths.bunList' (bun not enabled)." -Config $Config | Out-Null
+            $result[$cat] = @{ Selected = 0; Changed = $false; BackupPath = $null }
+            continue
+        }
         try {
             $result[$cat] = Invoke-OSyncManifestGenerateCategory -Config $Config -Category $cat -PathKey $pathKeys[$cat]
         }
