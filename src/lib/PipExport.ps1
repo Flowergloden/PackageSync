@@ -142,7 +142,15 @@ function Invoke-OSyncPipDownload {
         [string]$Destination,
 
         [Parameter(Mandatory = $false)]
-        [string[]]$DownloadArgs = @()
+        [string[]]$DownloadArgs = @(),
+
+        # Forward each output line to the console live (Write-Host only -
+        # the pipeline still carries the captured objects untouched, so the
+        # returned Output keeps its exact pre-echo shape). pip prints plain
+        # progress lines when stdout is redirected (non-tty), so no
+        # throttling is needed unlike winget's CR-redrawn progress bars.
+        [Parameter(Mandatory = $false)]
+        [bool]$Echo = $false
     )
 
     $pipArgs = @('-m', 'pip', 'download', '-r', $Requirements, '-d', $Destination) + @($DownloadArgs)
@@ -155,8 +163,18 @@ function Invoke-OSyncPipDownload {
     $savedEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $output = & $PythonPath @pipArgs 2>&1 | Out-String
+        $raw = @(& $PythonPath @pipArgs 2>&1 | ForEach-Object {
+            if ($Echo) {
+                # PS 5.1 wraps native stderr lines in ErrorRecords; render the
+                # exception message - "$_" on such a record can collapse to
+                # the type name 'System.Management.Automation.RemoteException'.
+                $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+                Write-Host ('  pip: ' + $line) -ForegroundColor DarkGray
+            }
+            $_
+        })
         $exitCode = $LASTEXITCODE
+        $output = ($raw | Out-String)
     }
     finally {
         $ErrorActionPreference = $savedEap
@@ -296,7 +314,10 @@ function Export-OSyncPip {
     # --- 4. pip download (platform pin mandatory) ---
     $downloadArgs = Get-OSyncPipDownloadArgs -DownloadArgs $Config.pip.downloadArgs
     Write-OSyncLog -Category 'pip' -Level Info -Message "pip download -r '$requirementsPath' -> '$pipDir' args: $($downloadArgs -join ' ')" -Config $Config | Out-Null
-    $result = Invoke-OSyncPipDownload -PythonPath $pythonPath -Requirements $requirementsPath -Destination $pipDir -DownloadArgs $downloadArgs
+    # consoleEcho is an in-memory-only flag pinned by the export orchestrator
+    # (absent/false on B-side configs -> silent, same as WingetExport.ps1).
+    $echoOn = ($null -ne $Config -and $Config.PSObject.Properties['consoleEcho'] -and [bool]$Config.consoleEcho)
+    $result = Invoke-OSyncPipDownload -PythonPath $pythonPath -Requirements $requirementsPath -Destination $pipDir -DownloadArgs $downloadArgs -Echo $echoOn
 
     # Wheels that did make it before a failure (pip usually fails fast, but a
     # mid-download failure can leave partial artifacts) - reported truthfully.

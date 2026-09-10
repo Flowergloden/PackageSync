@@ -420,6 +420,10 @@ function Invoke-OSyncRuntimeWingetExport {
     $wingetDir = Join-Path $StagingDir 'winget'
     New-Item -ItemType Directory -Path $wingetDir -Force | Out-Null
 
+    # consoleEcho is an in-memory-only flag pinned by the export orchestrator
+    # (absent/false on B-side configs -> silent, same as WingetExport.ps1).
+    $echoOn = ($null -ne $Config -and $Config.PSObject.Properties['consoleEcho'] -and [bool]$Config.consoleEcho)
+
     $scope = [string]$Config.winget.scope
     $arch = [string]$Config.winget.architecture
     $httpBind = [string]$Config.httpBind
@@ -457,7 +461,7 @@ function Invoke-OSyncRuntimeWingetExport {
         # export report object is the ONLY thing this function emits.
         Write-OSyncLog -Category 'runtime' -Level Info -Message ("Downloading runtime winget package {0} ({1})" -f $entry.Id, $entry.Version) -Data @{ Id = $entry.Id; Version = $entry.Version } -Config $Config | Out-Null
 
-        $result = Invoke-OSyncWingetDownload -WingetExe $wingetExe -Arguments $downloadArgs
+        $result = Invoke-OSyncWingetDownload -WingetExe $wingetExe -Arguments $downloadArgs -Echo $echoOn
 
         $yamls = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
 
@@ -554,7 +558,13 @@ function Invoke-ORuntimeNpmInstall {
         [string]$Version,
 
         [Parameter(Mandatory = $true)]
-        [string]$Prefix
+        [string]$Prefix,
+
+        # Forward each output line to the console live (Write-Host only -
+        # the pipeline still carries the captured objects untouched, so the
+        # returned Output keeps its exact pre-echo shape).
+        [Parameter(Mandatory = $false)]
+        [bool]$Echo = $false
     )
 
     $oldEap = $ErrorActionPreference
@@ -564,7 +574,15 @@ function Invoke-ORuntimeNpmInstall {
         # spaces itself; pre-embedding quotes makes npm treat them as part of
         # the path (observed: 'CWD\"C:\path"' -> ENOENT). --prefix stays LAST
         # (contract for the fake npm used in unit tests).
-        $output = @(& $NpmExe install "verdaccio@$Version" --no-audit --no-fund --loglevel error --prefix $Prefix 2>&1)
+        $output = @(& $NpmExe install "verdaccio@$Version" --no-audit --no-fund --loglevel error --prefix $Prefix 2>&1 | ForEach-Object {
+            if ($Echo) {
+                # PS 5.1 wraps native stderr lines in ErrorRecords - render
+                # the exception message, not the type name (see PipExport).
+                $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+                Write-Host ('  npm: ' + $line) -ForegroundColor DarkGray
+            }
+            $_
+        })
     }
     finally {
         $ErrorActionPreference = $oldEap
@@ -706,7 +724,10 @@ function Export-OSyncRuntime {
     $buildDir = Get-ORuntimeVerdaccioBuildDir
     $verdaccioDir = Join-Path $runtimeDir 'verdaccio'
     $npmExe = Get-ORuntimeNpmExe
-    $installResult = Invoke-ORuntimeNpmInstall -NpmExe $npmExe -Version $verdaccioVersion -Prefix $buildDir
+    # consoleEcho is an in-memory-only flag pinned by the export orchestrator
+    # (absent/false on B-side configs -> silent, same as WingetExport.ps1).
+    $echoOn = ($null -ne $Config -and $Config.PSObject.Properties['consoleEcho'] -and [bool]$Config.consoleEcho)
+    $installResult = Invoke-ORuntimeNpmInstall -NpmExe $npmExe -Version $verdaccioVersion -Prefix $buildDir -Echo $echoOn
     if ($installResult.ExitCode -ne 0) {
         $tail = ((@($installResult.Output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 5) -join '; ')
         throw "Export-OSyncRuntime: 'npm install verdaccio@$verdaccioVersion' failed (exit $($installResult.ExitCode)): $tail"

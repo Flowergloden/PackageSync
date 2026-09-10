@@ -584,7 +584,12 @@ function Invoke-ONpmInstall {
         [string]$Spec,
         [string]$Registry,
         [string]$Prefix,
-        [string]$CacheDir
+        [string]$CacheDir,
+
+        # Forward each output line to the console live (Write-Host only -
+        # the pipeline still carries the captured objects untouched, so the
+        # returned Output keeps its exact pre-echo shape).
+        [bool]$Echo = $false
     )
 
     # PS 5.1 gotcha: a native command writing to stderr creates an ErrorRecord
@@ -596,7 +601,15 @@ function Invoke-ONpmInstall {
     $ErrorActionPreference = 'Continue'
     try {
         $output = @(& $NpmExe install $Spec --registry $Registry --prefix $Prefix --cache $CacheDir `
-                --no-audit --no-fund --no-save --ignore-scripts --loglevel error 2>&1)
+                --no-audit --no-fund --no-save --ignore-scripts --loglevel error 2>&1 | ForEach-Object {
+            if ($Echo) {
+                # PS 5.1 wraps native stderr lines in ErrorRecords - render
+                # the exception message, not the type name (see PipExport).
+                $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+                Write-Host ('  npm: ' + $line) -ForegroundColor DarkGray
+            }
+            $_
+        })
     }
     finally {
         $ErrorActionPreference = $oldEap
@@ -780,11 +793,22 @@ function Export-OSyncNpm {
     $localToolDir = Join-Path $localWork 'verdaccio-a'
     $npmExe = Get-ONpmExe
     $nodeExe = Get-ONodeExe
+    # consoleEcho is an in-memory-only flag pinned by the export orchestrator
+    # (absent/false on B-side configs -> silent, same as WingetExport.ps1).
+    $echoOn = ($null -ne $Config -and $Config.PSObject.Properties['consoleEcho'] -and [bool]$Config.consoleEcho)
     # PS 5.1: same EAP=Stop native-stderr guard as Resolve-OSyncNpmVerdaccioVersion.
     $oldEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $installOut = @(& $npmExe install --prefix $localToolDir "verdaccio@$pinned" --no-audit --no-fund --loglevel error 2>&1)
+        $installOut = @(& $npmExe install --prefix $localToolDir "verdaccio@$pinned" --no-audit --no-fund --loglevel error 2>&1 | ForEach-Object {
+            if ($echoOn) {
+                # PS 5.1 wraps native stderr lines in ErrorRecords - render
+                # the exception message, not the type name (see PipExport).
+                $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+                Write-Host ('  npm: ' + $line) -ForegroundColor DarkGray
+            }
+            $_
+        })
     }
     finally {
         $ErrorActionPreference = $oldEap
@@ -843,7 +867,7 @@ function Export-OSyncNpm {
 
             Write-OSyncLog -Category 'npm' -Level Info -Message "warming $spec through 127.0.0.1:$aPort ..." -Config $Config | Out-Null
             $result = Invoke-ONpmInstall -NpmExe $npmExe -Spec $spec -Registry $registryUrl `
-                -Prefix $installDir -CacheDir $cacheDir
+                -Prefix $installDir -CacheDir $cacheDir -Echo $echoOn
             if ($result.ExitCode -eq 0) {
                 $ok += [pscustomobject]@{ Name = $entry.Name; Version = $entry.Version; Spec = $spec }
                 Write-OSyncLog -Category 'npm' -Level Info -Message "warmed $spec." -Config $Config | Out-Null
