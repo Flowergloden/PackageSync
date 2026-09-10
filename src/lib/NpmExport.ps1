@@ -30,17 +30,41 @@
         packages '**' has only access: $all, listen 127.0.0.1:<verdaccioPort>, web UI
         disabled. Copies manifests\npm-packages.txt -> <staging>\npm\packages.txt
         (delivery contract, the B-side health check reads it).
-    5b. bun parallel frontend (presence-gated on pins.bun): when enabled, the bun
-        manifest (paths.bunList) is merged into the SAME one-shot warm list - npm
-        entries first, then bun-only entries (dedup by name, case-insensitive, npm
-        wins). The merged list shares the one storage snapshot with npm (zero extra
-        pipeline). When bun entries were merged, the bun manifest is copied verbatim
-        to <staging>\npm\bun-packages.txt (delivery contract, the B-side apply reads
-        it to pick the verification package). A missing/empty bun list skips both
-        warming and delivery with an Info log - NOT an error (an empty bun list is
-        legal: bun installs everything from the npm list via the same registry).
-    6. Export-time assertion: verdaccio-b.yml content must not match uplinks|proxy and
-        must contain a line matching ^\s*storage:\s*\./storage\s*$ (Oracle M5).
+     5b. bun parallel frontend (presence-gated on pins.bun): when enabled, the bun
+         manifest (paths.bunList) is merged into the SAME one-shot warm list - npm
+         entries first, then bun-only entries (dedup by name, case-insensitive, npm
+         wins). The merged list shares the one storage snapshot with npm (zero extra
+         pipeline). When bun entries were merged, the bun manifest is copied verbatim
+         to <staging>\npm\bun-packages.txt (delivery contract, the B-side apply reads
+         it to pick the verification package). A missing/empty bun list skips both
+         warming and delivery with an Info log - NOT an error (an empty bun list is
+         legal: bun installs everything from the npm list via the same registry).
+     5c. npm LOCAL package prewarm (presence-gated on paths.npmLocalDirs): when the
+         key is present and non-empty, the configured directories are scanned for
+         package.json files (the dir itself or its immediate subdirs). Discovered
+         packages are robocopied to a LOCAL scratch dir (npm publish fails on UNC
+         paths), then published into the one-shot Verdaccio in phase 1 (ALL publishes
+         first so local-to-local deps resolve in any order) via a one-shot dummy-auth
+         npmrc (--userconfig; npm refuses credential-less publish client-side while
+         publish: $all accepts any credential - see Invoke-ONpmPublish), then
+         install-verified as name@version with a per-package FRESH cache in phase 2. Failures are
+         recorded in report.local.failed and do not abort the rest of the export.
+         When at least one package was published, <staging>\npm\local-packages.txt
+is delivered with 'name@version  # local: <source dir>' lines for published
+         packages and 'name@spec  # deps: <dir>' lines for deps-manifest entries (same
+         parser as packages.txt for published lines; deps lines carry a different
+         marker). An absent key or an empty array keeps behaviour identical to the
+         pre-local baseline.
+         A package.json that lacks name/version but has a non-empty 'dependencies'
+         object is treated as a "deps-manifest dir" (second-chance fallback in the
+         discovery pass): its dependency specs are warmed into the one-shot storage
+         snapshot (registry-resolved, like manifest entries) AFTER the main warm loop
+         and BEFORE the local publish phase. Specs containing ':' (file:/link:/
+         workspace:/git+/http(s):/npm:) are rejected as non-registry-resolvable.
+         Specs are deduped by lowercased package name against the manifest entries
+         (npm/bun wins) and among deps dirs themselves (first wins).
+      6. Export-time assertion: verdaccio-b.yml content must not match uplinks|proxy and
+         must contain a line matching ^\s*storage:\s*\./storage\s*$ (Oracle M5).
     7. Cross-assertion (fail-fast, before any heavy work): `npm view verdaccio@<pinned>
         engines` node requirement must be compatible with the pinned Node major in
         manifests\runtime-winget.txt. Mismatch -> export fails (Oracle r4-m4).
@@ -56,7 +80,12 @@
     entries with error text), bun (enabled / listPath / entriesAdded / delivered
     - the bun parallel-frontend merge result; entriesAdded is the bun-only count
     merged into the warm list, delivered is <staging>\npm\bun-packages.txt or
-    $null when no bun entries were merged).
+    $null when no bun entries were merged), local (enabled / dirs / published /
+    failed / deps / listPath - the npm local-package prewarm result; published entries
+    carry Name, Version, Spec and SourceDir; failed entries carry Name, Version,
+    SourceDir and Error; deps is an array of {Name, Spec, SourceDir, Status}
+    covering each deps-manifest dependency spec (warmed|failed|skipped-invalid-spec|
+    skipped-duplicate)).
 #>
 
 function Get-ONpmExe {
@@ -209,6 +238,9 @@ function New-OSyncVerdaccioAYaml {
 # Generated by Export-OSyncNpm. This instance exists only for the duration of
 # one export: it caches the full dependency tree into the storage dir below,
 # then it is stopped so the storage snapshot is guaranteed still.
+# The 'publish: $all' rules and 'max_body_size' setting below exist so the
+# export can publish LOCAL private packages into the one-shot registry.
+# They are A-side-only and must NEVER appear in verdaccio-b.yml.
 storage: __STORAGE__
 uplinks:
   npmjs:
@@ -216,10 +248,13 @@ uplinks:
 packages:
   '@*/*':
     access: $all
+    publish: $all
     proxy: npmjs
   '**':
     access: $all
+    publish: $all
     proxy: npmjs
+max_body_size: 100mb
 listen: __LISTEN__
 '@
     return $yaml.Replace('__STORAGE__', $storage).Replace('__UPLINK__', $UplinkUrl).Replace('__LISTEN__', "127.0.0.1:$Port")
@@ -263,8 +298,9 @@ web:
 function Test-OSyncVerdaccioBYaml {
     <#
       The export-time leak assertion (Oracle M5). Returns $true only when:
-        - the content contains NO uplinks:/proxy: key (line-start match,
-          case-insensitive; comments are not false positives), and
+        - the content contains NO uplinks:/proxy:/publish: key (line-start
+          match, case-insensitive; comments are not false positives; publish
+          is forbidden on B because anonymous publish is A-side-only), and
         - it contains a line matching ^\s*storage:\s*\./storage\s*$.
     #>
     [CmdletBinding()]
@@ -275,7 +311,7 @@ function Test-OSyncVerdaccioBYaml {
     )
 
     if ([string]::IsNullOrWhiteSpace($Content)) { return $false }
-    if ($Content -match '(?im)^\s*(uplinks|proxy)\s*:') { return $false }
+    if ($Content -match '(?im)^\s*(uplinks|proxy|publish)\s*:') { return $false }
     if ($Content -notmatch '(?m)^\s*storage:\s*\./storage\s*$') { return $false }
     return $true
 }
@@ -639,6 +675,305 @@ function Get-ONpmExportLocalWorkRoot {
     return $root
 }
 
+function Read-ONpmPackageJson {
+    <#
+      Reads and validates <PackageDir>\package.json for the local-package
+      prewarm. Returns @{ Name; Version }. Throws NAMING THE DIR when the
+      file is missing/unreadable/malformed or when name/version are not
+      non-empty strings - the discovery pass records that as a failed entry
+      and keeps going with the remaining package dirs (a package without a
+      version cannot be published or pinned, so it must never reach npm).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageDir
+    )
+
+    $pkgJsonPath = Join-Path $PackageDir 'package.json'
+    $raw = $null
+    try {
+        # -ErrorAction Stop: a missing/unreadable file must surface HERE as a
+        # terminating error so the catch below can re-throw a clean message
+        # naming the dir - without it the raw non-terminating Get-Content
+        # error still prints to the console before the caught re-throw.
+        $raw = Get-Content -LiteralPath $pkgJsonPath -Raw -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        throw "Read-ONpmPackageJson: cannot read '$pkgJsonPath': $($_.Exception.Message)"
+    }
+    $pkg = $null
+    try {
+        $pkg = $raw | ConvertFrom-Json
+    }
+    catch {
+        throw "Read-ONpmPackageJson: '$pkgJsonPath' is not valid JSON: $($_.Exception.Message)"
+    }
+    $name = [string]$pkg.name
+    $version = [string]$pkg.version
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        throw "Read-ONpmPackageJson: '$pkgJsonPath' has no non-empty 'name' property."
+    }
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        throw "Read-ONpmPackageJson: '$pkgJsonPath' has no non-empty 'version' property."
+    }
+    return [pscustomobject]@{ Name = $name; Version = $version }
+}
+
+function Get-ONpmLocalPackageDirs {
+    <#
+      Discovery pass for the npm local-package prewarm. For each configured
+      directory:
+        - a MISSING dir yields an entry with Error (the caller records it in
+          the local failed list),
+        - a dir that itself contains package.json IS one package dir,
+        - otherwise its IMMEDIATE subdirectories (non-recursive) are scanned
+          for package.json files,
+        - a dir yielding none yields a Warning entry (nothing to publish).
+      Every candidate is read via Read-ONpmPackageJson (a read/validation
+      failure yields an Error entry). Candidates that fail due to missing
+      name/version but have valid JSON get a SECOND CHANCE: if the
+      'dependencies' object is non-empty the entry becomes a "deps-manifest"
+      entry (Name/Version = $null, Deps = array of 'name@spec' strings,
+      Warning = explanation). A valid JSON with no dependencies at all yields
+      an Error mentioning both acceptable shapes. Invalid JSON and I/O errors
+      never get the deps fallback.
+      Candidates are de-duplicated by LOWERCASED package name - the first
+      occurrence wins, a later same-name candidate is skipped with a Warning
+      entry (npm would reject the duplicate publish anyway).
+      Returns entries @{ Dir; Name; Version; Deps; Error; Warning } where at
+      most one of Error/Warning is set; Name/Version are only set for
+      publishable candidates; Deps is set only for deps-manifest entries.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Dirs
+    )
+
+    $results = @()
+    $seenNames = @{}
+    foreach ($dir in @($Dirs)) {
+        if ([string]::IsNullOrWhiteSpace([string]$dir)) { continue }
+
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            $results += [pscustomobject]@{
+                Dir     = $dir
+                Name    = $null
+                Version = $null
+                Deps    = $null
+                Error   = "local package directory not found: '$dir'"
+                Warning = $null
+            }
+            continue
+        }
+
+        $candidates = @()
+        if (Test-Path -LiteralPath (Join-Path $dir 'package.json') -PathType Leaf) {
+            # The configured dir is itself a single package dir.
+            $candidates += $dir
+        }
+        else {
+            # Scan IMMEDIATE subdirs only (non-recursive): a nested package
+            # tree is the operator's layout choice, not ours to flatten.
+            $candidates += @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'package.json') -PathType Leaf } |
+                ForEach-Object { $_.FullName })
+        }
+
+        if ($candidates.Count -eq 0) {
+            $results += [pscustomobject]@{
+                Dir     = $dir
+                Name    = $null
+                Version = $null
+                Deps    = $null
+                Error   = $null
+                Warning = "no package.json found in '$dir' or its immediate subdirectories - nothing to publish"
+            }
+            continue
+        }
+
+        foreach ($pkgDir in $candidates) {
+            $name = $null
+            $version = $null
+            try {
+                $pkg = Read-ONpmPackageJson -PackageDir $pkgDir
+                $name = [string]$pkg.Name
+                $version = [string]$pkg.Version
+            }
+            catch {
+                $errMsg = $_.Exception.Message
+                # Second chance: a package.json with valid JSON but missing
+                # name/version may still be a "deps-manifest dir" - it carries
+                # a non-empty 'dependencies' object whose entries we warm as
+                # registry-resolved specs. Only valid-JSON errors qualify for
+                # the fallback; invalid JSON and I/O errors never do.
+                if ($errMsg -match "no non-empty '(name|version)'") {
+                    $isDepsCandidate = $false
+                    try {
+                        $rawAgain = Get-Content -LiteralPath (Join-Path $pkgDir 'package.json') -Raw -Encoding UTF8 -ErrorAction Stop
+                        $pkgAgain = $rawAgain | ConvertFrom-Json
+                        $depsObj = $null
+                        # PS 5.1: PSCustomObject property access without checking
+                        # existence silently returns $null for a missing member.
+                        if ($null -ne $pkgAgain -and $null -ne $pkgAgain.dependencies) {
+                            $depsObj = $pkgAgain.dependencies
+                        }
+                        if ($null -ne $depsObj -and @($depsObj.PSObject.Properties).Count -gt 0) {
+                            $depsArray = @()
+                            foreach ($prop in $depsObj.PSObject.Properties) {
+                                $depsArray += "$($prop.Name)@$($prop.Value)"
+                            }
+                            $results += [pscustomobject]@{
+                                Dir     = $pkgDir
+                                Name    = $null
+                                Version = $null
+                                Deps    = @($depsArray)
+                                Error   = $null
+                                Warning = "no name/version in '$pkgDir' - treated as a dependency manifest ($(@($depsArray).Count) deps)"
+                            }
+                            $isDepsCandidate = $true
+                        }
+                    }
+                    catch {
+                        # Re-read or re-parse failed - fall through to Error.
+                    }
+                    if ($isDepsCandidate) { continue }
+                    # Has valid JSON but no dependencies: tell the operator both
+                    # acceptable shapes so they know how to fix it.
+                    $results += [pscustomobject]@{
+                        Dir     = $pkgDir
+                        Name    = $null
+                        Version = $null
+                        Deps    = $null
+                        Error   = "$errMsg (publishable package needs name+version, dependency manifest needs a non-empty 'dependencies' object)"
+                        Warning = $null
+                    }
+                    continue
+                }
+                # Invalid JSON, missing file, or I/O error - no fallback.
+                $results += [pscustomobject]@{
+                    Dir     = $pkgDir
+                    Name    = $null
+                    Version = $null
+                    Deps    = $null
+                    Error   = $errMsg
+                    Warning = $null
+                }
+                continue
+            }
+
+            $key = $name.ToLowerInvariant()
+            if ($seenNames.ContainsKey($key)) {
+                $results += [pscustomobject]@{
+                    Dir     = $pkgDir
+                    Name    = $name
+                    Version = $version
+                    Deps    = $null
+                    Error   = $null
+                    Warning = "duplicate local package name '$name' - '$pkgDir' skipped (first occurrence wins)"
+                }
+                continue
+            }
+            $seenNames[$key] = $true
+            $results += [pscustomobject]@{
+                Dir     = $pkgDir
+                Name    = $name
+                Version = $version
+                Deps    = $null
+                Error   = $null
+                Warning = $null
+            }
+        }
+    }
+
+    # Force an array: zero/one entries must still come back as an array.
+    return @($results)
+}
+
+function Invoke-ONpmPublish {
+    <#
+      Publishes one local package into the one-shot Verdaccio via
+      `npm publish <PackageDir> --registry <Registry> --access public ...`.
+      --access public is MANDATORY: npm defaults SCOPED publishes to
+      'restricted', which a Verdaccio publish:$all rule still rejects.
+      --ignore-scripts: a local package's lifecycle scripts must never run
+      during export. --userconfig <UserConfig>: npm CLI REFUSES any publish
+      with NO credential for the registry - a client-side ENEEDAUTH before
+      any request is sent (QA-evidenced against verdaccio 6.10.2) - while
+      verdaccio's publish: $all accepts ANY credential without validating
+      it. The export therefore injects a one-shot npmrc holding only a dummy
+      constant _auth (base64 of 'user:pass', NOT a secret) keyed to the
+      exact 127.0.0.1:<aPort>/ registry URL; it is only ever sent to
+      loopback. --no-update-notifier keeps npm's update check from fetching
+      the 'npm' packument (34 MB of stray metadata) into the storage
+      snapshot. Returns @{ ExitCode; Output } exactly like Invoke-ONpmInstall
+      (same EAP=Continue native-stderr guard).
+    #>
+    param(
+        [string]$NpmExe,
+        [string]$PackageDir,
+        [string]$Registry,
+
+        # MANDATORY-ish: the one-shot dummy-auth npmrc (--userconfig). The
+        # caller generates it; without it npm aborts client-side (ENEEDAUTH).
+        [Parameter(Mandatory = $true)]
+        [string]$UserConfig,
+
+        # Forward each output line to the console live (Write-Host only -
+        # the pipeline still carries the captured objects untouched).
+        [bool]$Echo = $false
+    )
+
+    # PS 5.1 gotcha: same EAP=Continue guard as Invoke-ONpmInstall - npm's
+    # stderr becomes a terminating NativeCommandError under EAP=Stop.
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $NpmExe publish $PackageDir --registry $Registry --access public `
+                --userconfig $UserConfig --ignore-scripts --no-audit --no-fund `
+                --no-update-notifier --loglevel error 2>&1 | ForEach-Object {
+            if ($Echo) {
+                # PS 5.1 wraps native stderr lines in ErrorRecords - render
+                # the exception message, not the type name (see PipExport).
+                $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+                Write-Host ('  npm: ' + $line) -ForegroundColor DarkGray
+            }
+            $_
+        })
+    }
+    finally {
+        $ErrorActionPreference = $oldEap
+    }
+    return [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output   = @($output)
+    }
+}
+
+function Test-ONpmPackageInStorage {
+    <#
+      Belt-and-braces publish verification: the name-level directory must
+      exist under the one-shot storage after `npm publish` reported success
+      (verdaccio lays out storage as <storage>\<name>\...; scoped names map
+      to the two-level '@scope\name' path). A $false here is recorded as a
+      local failure so a silently-rejected publish cannot ship a snapshot
+      that lacks the package.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StorageDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $relative = $Name.Replace('/', '\')
+    return (Test-Path -LiteralPath (Join-Path $StorageDir $relative) -PathType Container)
+}
+
 function Export-OSyncNpm {
     [CmdletBinding()]
     param(
@@ -756,6 +1091,13 @@ function Export-OSyncNpm {
         Write-OSyncLog -Category 'npm' -Level Info -Message "bun disabled (no 'pins.bun' section in config) - skipping bun merge." -Config $Config | Out-Null
     }
 
+    # Ensure $warmNames exists for deps-dedup below (bun may not have
+    # been enabled, or may have skipped the merge).
+    if ($null -eq (Get-Variable -Name warmNames -Scope Local -ErrorAction SilentlyContinue)) {
+        $warmNames = @{}
+        foreach ($e in $entries) { $warmNames[[string]$e.Name.ToLowerInvariant()] = $true }
+    }
+
     # --- layout ---
     # <staging>\npm\storage is where the one-shot Verdaccio writes tarballs
     # (plain node fs IO to UNC is fine); everything npm resolves as a prefix
@@ -778,6 +1120,73 @@ function Export-OSyncNpm {
         $bunDeliveredPath = Join-Path $npmDir 'bun-packages.txt'
         Copy-Item -LiteralPath $bunListPath -Destination $bunDeliveredPath -Force
         Write-OSyncLog -Category 'npm' -Level Info -Message "bun contract file delivered to '$bunDeliveredPath'." -Config $Config | Out-Null
+    }
+
+    # --- 5c. discover npm LOCAL packages (presence-gated on paths.npmLocalDirs) ---
+    # An absent key or an empty JSON array (PS 5.1 parses empty arrays as
+    # $null) keeps the export identical to the pre-local baseline. A configured
+    # dir that is missing, has no package.json, or holds an invalid one is
+    # recorded in localFailed and does NOT abort the remaining export work.
+    $localEnabled = $false
+    $localDirsResolved = @()
+    $localFailed = @()
+    $localCandidates = @()
+    $localDepsCandidates = @()
+    $localRawDirs = Get-ONestedValue -Object $Config -Path 'paths.npmLocalDirs'
+    if ($null -ne $localRawDirs -and @($localRawDirs).Count -gt 0) {
+        # ConvertFrom-Json unrolls a single-element JSON array to a scalar;
+        # Config.ps1 already re-wrapped it during validation, but test configs
+        # may hand-craft the object. Use the array as-is when it already is
+        # one, otherwise wrap the scalar so the foreach iterates over elements.
+        if ($localRawDirs -is [System.Array]) {
+            $localDirInputs = $localRawDirs
+        }
+        else {
+            $localDirInputs = @($localRawDirs)
+        }
+        foreach ($d in $localDirInputs) {
+            if ([string]::IsNullOrWhiteSpace([string]$d)) { continue }
+            $resolved = Resolve-OSyncConfigPath -Config $Config -Path ([string]$d)
+            $localDirsResolved += $resolved
+        }
+        if ($localDirsResolved.Count -gt 0) {
+            $localEnabled = $true
+            $discovered = Get-ONpmLocalPackageDirs -Dirs $localDirsResolved
+            foreach ($e in $discovered) {
+                if (-not [string]::IsNullOrWhiteSpace($e.Error)) {
+                    # Diagnosability fix: Error entries were previously
+                    # recorded silently into $localFailed with no console
+                    # output - add a Warning-level log so the operator sees
+                    # what went wrong during discovery.
+                    Write-OSyncLog -Category 'npm' -Level Warning -Message "local package discovery: $($e.Error)" -Config $Config | Out-Null
+                    $localFailed += [pscustomobject]@{
+                        Name    = $null
+                        Version = $null
+                        SourceDir = $e.Dir
+                        Error   = $e.Error
+                    }
+                }
+                elseif ($null -ne $e.Deps -and @($e.Deps).Count -gt 0) {
+                    # Deps-manifest entry: package.json with valid
+                    # dependencies but no name/version. Log its Warning
+                    # and collect for the deps warm phase.
+                    if (-not [string]::IsNullOrWhiteSpace($e.Warning)) {
+                        Write-OSyncLog -Category 'npm' -Level Warning -Message "local package discovery: $($e.Warning)" -Config $Config | Out-Null
+                    }
+                    $localDepsCandidates += $e
+                }
+                elseif (-not [string]::IsNullOrWhiteSpace($e.Warning)) {
+                    Write-OSyncLog -Category 'npm' -Level Warning -Message "local package discovery: $($e.Warning)" -Config $Config | Out-Null
+                }
+                else {
+                    $localCandidates += $e
+                }
+            }
+            Write-OSyncLog -Category 'npm' -Level Info -Message "local package discovery: $($localCandidates.Count) publishable package(s), $($localDepsCandidates.Count) deps-manifest dir(s) from $($localDirsResolved.Count) configured dir(s)." -Config $Config | Out-Null
+        }
+    }
+    if (-not $localEnabled) {
+        Write-OSyncLog -Category 'npm' -Level Info -Message "local package prewarm skipped (config has no 'paths.npmLocalDirs' key or it is empty)." -Config $Config | Out-Null
     }
 
     # --- 2. install the one-shot Verdaccio (A has internet) ---
@@ -879,6 +1288,229 @@ function Export-OSyncNpm {
             }
         }
 
+        # --- 5c. DEPS-MANIFEST warm phase: warm dependency specs from ---
+        # ---     deps-manifest dirs into the shared storage snapshot.  ---
+        # Each deps-manifest directory (package.json with no name/version
+        # but a non-empty 'dependencies') yields install specs that are
+        # warmed through the one-shot registry exactly like manifest entries.
+        # This runs AFTER the main warm loop so the storage already holds
+        # the manifest packages before we add deps specs on top.
+        $localDepsWarm = @()
+        $localDepsOk = @()
+        $localDepsFailed = @()
+        if ($localEnabled -and $localDepsCandidates.Count -gt 0) {
+            $depsIdx = 0
+            $depsWarmedNames = @{}
+            foreach ($dc in $localDepsCandidates) {
+                foreach ($rawSpec in @($dc.Deps)) {
+                    $depsIdx++
+                    # Split 'name@spec' into name and spec parts.
+                    # For scoped packages (@scope/name@spec), the @ separating the package
+                    # name from the spec is the LAST @ in the string. For un-scoped
+                    # packages (name@spec), the separator is the FIRST @. The spec
+                    # part may also contain @ (e.g. 'npm:@scope/legacy'), so we
+                    # must choose the correct split point.
+                    $atIdx = if ($rawSpec.StartsWith('@')) { $rawSpec.LastIndexOf('@') } else { $rawSpec.IndexOf('@') }
+                    if ($atIdx -le 0) {
+                        # No '@' found or name is empty - skip malformed entry.
+                        $localDepsFailed += [pscustomobject]@{
+                            Name      = $rawSpec
+                            Spec      = $rawSpec
+                            SourceDir = $dc.Dir
+                            Status    = 'skipped-invalid-spec'
+                        }
+                        continue
+                    }
+                    $depName = $rawSpec.Substring(0, $atIdx)
+                    $depSpec = $rawSpec.Substring($atIdx + 1)  # Version spec (range, tag, or empty)
+                    $warmSpec = if ([string]::IsNullOrWhiteSpace($depSpec)) { $depName } else { $rawSpec }
+
+                    # Spec validation: reject non-registry-resolvable specs
+                    # containing ':' (file:/link:/workspace:/git+/http(s):/
+                    # npm: alias - none are registry-available for B).
+                    if ($depSpec.Contains(':')) {
+                        Write-OSyncLog -Category 'npm' -Level Warning -Message "skipping deps spec '$rawSpec' from '$($dc.Dir)' - contains ':' (non-registry-resolvable)." -Config $Config | Out-Null
+                        $localDepsFailed += [pscustomobject]@{
+                            Name      = $depName
+                            Spec      = $rawSpec
+                            SourceDir = $dc.Dir
+                            Status    = 'skipped-invalid-spec'
+                        }
+                        continue
+                    }
+
+                    # Dedup LOWERCASED name against manifest entries
+                    # ($warmNames) and already-seen deps names.
+                    $key = $depName.ToLowerInvariant()
+                    if ($warmNames.ContainsKey($key)) {
+                        Write-OSyncLog -Category 'npm' -Level Warning -Message "skipping deps spec '$rawSpec' from '$($dc.Dir)' - '$depName' is already in the manifest warm list." -Config $Config | Out-Null
+                        $localDepsFailed += [pscustomobject]@{
+                            Name      = $depName
+                            Spec      = $rawSpec
+                            SourceDir = $dc.Dir
+                            Status    = 'skipped-duplicate'
+                        }
+                        continue
+                    }
+                    if ($depsWarmedNames.ContainsKey($key)) {
+                        Write-OSyncLog -Category 'npm' -Level Warning -Message "skipping deps spec '$rawSpec' from '$($dc.Dir)' - '$depName' already seen in another deps dir (first wins)." -Config $Config | Out-Null
+                        $localDepsFailed += [pscustomobject]@{
+                            Name      = $depName
+                            Spec      = $rawSpec
+                            SourceDir = $dc.Dir
+                            Status    = 'skipped-duplicate'
+                        }
+                        continue
+                    }
+                    $depsWarmedNames[$key] = $true
+
+                    # Warm the spec exactly like manifest entries.
+                    $installDir = Join-Path $localWork ("deps-warm-{0}" -f $depsIdx)
+                    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+
+                    Write-OSyncLog -Category 'npm' -Level Info -Message "warming deps spec $warmSpec through 127.0.0.1:$aPort ..." -Config $Config | Out-Null
+                    $result = Invoke-ONpmInstall -NpmExe $npmExe -Spec $warmSpec -Registry $registryUrl `
+                        -Prefix $installDir -CacheDir $cacheDir -Echo $echoOn
+                    if ($result.ExitCode -eq 0) {
+                        Write-OSyncLog -Category 'npm' -Level Info -Message "warmed $warmSpec." -Config $Config | Out-Null
+                        $localDepsOk += [pscustomobject]@{
+                            Name      = $depName
+                            Spec      = $rawSpec
+                            SourceDir = $dc.Dir
+                            Status    = 'warmed'
+                        }
+                    }
+                    else {
+                        $tail = ((@($result.Output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 5) -join '; ')
+                        Write-OSyncLog -Category 'npm' -Level Error -Message "failed to warm deps spec $warmSpec (exit $($result.ExitCode)): $tail" -Config $Config | Out-Null
+                        $localDepsFailed += [pscustomobject]@{
+                            Name      = $depName
+                            Spec      = $rawSpec
+                            SourceDir = $dc.Dir
+                            Status    = 'failed'
+                        }
+                        # Also append to $localFailed for the existing failure
+                        # summary (deps warm failures count toward local failures).
+                        $localFailed += [pscustomobject]@{
+                            Name      = $depName
+                            Version   = $null
+                            SourceDir = $dc.Dir
+                            Error     = "deps warm failed for '$warmSpec' (exit $($result.ExitCode)): $tail"
+                        }
+                    }
+                }
+            }
+            $localDepsWarm = @($localDepsOk)
+            Write-OSyncLog -Category 'npm' -Level Info -Message "deps-manifest warm phase: $($localDepsOk.Count) warmed, $($localDepsFailed.Count) skipped/failed." -Config $Config | Out-Null
+        }
+
+        # --- 5d. LOCAL package prewarm (two phases: publish ALL, then install ALL) ---
+        # Phase separation lets local packages depend on each other regardless
+        # of discovery order; every publish lands in storage before any install.
+        $localPublished = @()
+        if ($localEnabled -and $localCandidates.Count -gt 0) {
+            $registryUrl = "http://127.0.0.1:$aPort"
+            $localIdx = 0
+
+            # One-shot dummy-auth npmrc for ALL publishes this phase: npm CLI
+            # refuses to publish with NO credential for the registry (client-side
+            # ENEEDAUTH - the request never leaves the machine), while verdaccio
+            # publish: $all accepts ANY credential unvalidated. The value is
+            # base64 of the literal constant 'user:pass' - a DUMMY, never a real
+            # credential - and the key matches the one-shot registry host:port
+            # exactly, so it is only ever sent to 127.0.0.1. The file lives in
+            # the local scratch root, which the existing \\?\ delete cleans up.
+            $publishNpmrc = Join-Path $localWork 'publish.npmrc'
+            [System.IO.File]::WriteAllText(
+                $publishNpmrc,
+                "//127.0.0.1:$aPort/:_auth=`"dXNlcjpwYXNz`"",
+                (New-Object System.Text.UTF8Encoding($false)))
+
+            # Phase 1: publish every candidate to the one-shot registry.
+            foreach ($lc in $localCandidates) {
+                $localIdx++
+                $localPkgDir = Join-Path $localWork ("local-pkg-{0}" -f $localIdx)
+                $spec = "$($lc.Name)@$($lc.Version)"
+
+                Write-OSyncLog -Category 'npm' -Level Info -Message "publishing local package $spec from '$($lc.Dir)' ..." -Config $Config | Out-Null
+
+                # Robocopy to a LOCAL scratch copy: npm's arborist fails on UNC
+                # paths, and the source may live on a UNC share.
+                try {
+                    Invoke-OSyncRobocopy -Source $lc.Dir -Destination $localPkgDir -ExtraArgs @('/E') | Out-Null
+                }
+                catch {
+                    $localFailed += [pscustomobject]@{
+                        Name      = $lc.Name
+                        Version   = $lc.Version
+                        SourceDir = $lc.Dir
+                        Error     = "robocopy failed for local package '$spec': $($_.Exception.Message)"
+                    }
+                    Write-OSyncLog -Category 'npm' -Level Error -Message "failed to robocopy local package ${spec}: $($_.Exception.Message)" -Config $Config | Out-Null
+                    continue
+                }
+
+                $pubResult = Invoke-ONpmPublish -NpmExe $npmExe -PackageDir $localPkgDir -Registry $registryUrl -UserConfig $publishNpmrc -Echo $echoOn
+                if ($pubResult.ExitCode -ne 0) {
+                    $tail = ((@($pubResult.Output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 5) -join '; ')
+                    $localFailed += [pscustomobject]@{
+                        Name      = $lc.Name
+                        Version   = $lc.Version
+                        SourceDir = $lc.Dir
+                        Error     = "npm publish failed for '$spec' (exit $($pubResult.ExitCode)): $tail"
+                    }
+                    Write-OSyncLog -Category 'npm' -Level Error -Message "failed to publish local package $spec (exit $($pubResult.ExitCode)): $tail" -Config $Config | Out-Null
+                    continue
+                }
+
+                if (-not (Test-ONpmPackageInStorage -StorageDir $storageDir -Name $lc.Name)) {
+                    $localFailed += [pscustomobject]@{
+                        Name      = $lc.Name
+                        Version   = $lc.Version
+                        SourceDir = $lc.Dir
+                        Error     = "npm publish succeeded but package '$spec' was not found in storage"
+                    }
+                    Write-OSyncLog -Category 'npm' -Level Error -Message "local package $spec publish succeeded but missing from storage." -Config $Config | Out-Null
+                    continue
+                }
+
+                $localPublished += [pscustomobject]@{
+                    Name      = $lc.Name
+                    Version   = $lc.Version
+                    Spec      = $spec
+                    SourceDir = $lc.Dir
+                }
+                Write-OSyncLog -Category 'npm' -Level Info -Message "published local package $spec." -Config $Config | Out-Null
+            }
+
+            # Phase 2: install-verify every successfully-published package with a
+            # FRESH cache per package (so each really pulls through the registry).
+            $localIdx = 0
+            foreach ($lp in $localPublished) {
+                $localIdx++
+                $installDir = Join-Path $localWork ("install-local-{0}" -f $localIdx)
+                $cacheDir = Join-Path $localWork ("npm-cache-local-{0}" -f $localIdx)
+                New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+
+                Write-OSyncLog -Category 'npm' -Level Info -Message "install-verifying local package $($lp.Spec) ..." -Config $Config | Out-Null
+                $instResult = Invoke-ONpmInstall -NpmExe $npmExe -Spec $lp.Spec -Registry $registryUrl `
+                    -Prefix $installDir -CacheDir $cacheDir -Echo $echoOn
+                if ($instResult.ExitCode -ne 0) {
+                    $tail = ((@($instResult.Output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 5) -join '; ')
+                    $localFailed += [pscustomobject]@{
+                        Name      = $lp.Name
+                        Version   = $lp.Version
+                        SourceDir = $lp.SourceDir
+                        Error     = "install-verify failed for '$($lp.Spec)' (exit $($instResult.ExitCode)): $tail"
+                    }
+                    Write-OSyncLog -Category 'npm' -Level Error -Message "failed to install-verify local package $($lp.Spec) (exit $($instResult.ExitCode)): $tail" -Config $Config | Out-Null
+                }
+                else {
+                    Write-OSyncLog -Category 'npm' -Level Info -Message "install-verified local package $($lp.Spec)." -Config $Config | Out-Null
+                }
+            }
+        }
+
         # Give verdaccio a moment to flush any async storage writes before
         # the stop - the snapshot must be still.
         Start-Sleep -Seconds 2
@@ -903,6 +1535,31 @@ function Export-OSyncNpm {
     [System.IO.File]::WriteAllText($bYamlPath, $bYaml, (New-Object System.Text.UTF8Encoding($false)))
     Copy-Item -LiteralPath $listPath -Destination (Join-Path $npmDir 'packages.txt') -Force
 
+    # --- 5c. local-packages.txt delivery contract ---
+    # When at least one local package was published OR at least one deps
+    # manifest spec warmed OK, ship the combined list of published local
+    # packages ('name@version  # local: <dir>') and deps-manifest specs
+    # ('name@spec  # deps: <dir>') so B-side operators know which packages
+    # came from local sources vs. dependency manifests. The published lines
+    # share the same parser as packages.txt; the deps lines use a different
+    # comment marker ('# deps:'). When neither kind produced anything, the
+    # file is not created (unchanged pre-local baseline).
+    $localListPath = $null
+    $localDepsOkCount = @($localDepsOk | Where-Object { $_.Status -eq 'warmed' }).Count
+    if ($localPublished.Count -gt 0 -or $localDepsOkCount -gt 0) {
+        $localListPath = Join-Path $npmDir 'local-packages.txt'
+        $localLines = @('# PakageSync npm local package list (published local package(s) and/or deps-manifest dependency spec(s).')
+        foreach ($lp in $localPublished) {
+            $localLines += ("{0}@{1}  # local: {2}" -f $lp.Name, $lp.Version, $lp.SourceDir)
+        }
+        # Deps lines: 'name@spec  # deps: <originating dir>'
+        foreach ($dw in @($localDepsOk | Where-Object { $_.Status -eq 'warmed' })) {
+            $localLines += ("{0}  # deps: {1}" -f $dw.Spec, $dw.SourceDir)
+        }
+        [System.IO.File]::WriteAllText($localListPath, ($localLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Write-OSyncLog -Category 'npm' -Level Info -Message "local package list delivered to '$localListPath' ($($localPublished.Count) published, $localDepsOkCount deps entries)." -Config $Config | Out-Null
+    }
+
     # --- 6. export-time leak assertion (Oracle M5) ---
     if (-not (Test-OSyncVerdaccioBYaml -Content $bYaml)) {
         throw "Export-OSyncNpm: verdaccio-b.yml failed the leak assertion - it must not contain uplinks/proxy keys and storage must be the relative path './storage'."
@@ -923,8 +1580,10 @@ function Export-OSyncNpm {
     }
 
     $tarballCount = @(Get-ChildItem -LiteralPath $storageDir -Recurse -Filter '*.tgz' -File -ErrorAction SilentlyContinue).Count
-    $summary = "npm export done: $($ok.Count) warmed, $($failed.Count) failed, $tarballCount tarball(s) in storage."
-    Write-OSyncLog -Category 'npm' -Level $(if ($failed.Count -gt 0) { 'Warning' } else { 'Info' }) -Message $summary -Config $Config | Out-Null
+    $localDepsOkCount = @($localDepsOk | Where-Object { $_.Status -eq 'warmed' }).Count
+    $localDepsFailCount = @($localDepsFailed | Where-Object { $_.Status -eq 'failed' }).Count
+    $summary = "npm export done: $($ok.Count) warmed, $($failed.Count) failed, $($localPublished.Count) local published, $($localFailed.Count) local failed, $localDepsOkCount deps-warmed, $localDepsFailCount deps-failed, $tarballCount tarball(s) in storage."
+    Write-OSyncLog -Category 'npm' -Level $(if ($failed.Count -gt 0 -or $localFailed.Count -gt 0) { 'Warning' } else { 'Info' }) -Message $summary -Config $Config | Out-Null
 
     return [pscustomobject]@{
         category          = 'npm'
@@ -943,6 +1602,14 @@ function Export-OSyncNpm {
             listPath     = $bunListPath
             entriesAdded = $bunAdded.Count
             delivered    = $bunDeliveredPath
+        }
+        local             = [pscustomobject]@{
+            enabled   = $localEnabled
+            dirs      = @($localDirsResolved)
+            published = @($localPublished)
+            failed    = @($localFailed)
+            deps      = @($localDepsOk) + @($localDepsFailed)
+            listPath  = $localListPath
         }
     }
 }
