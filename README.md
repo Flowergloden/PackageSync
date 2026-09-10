@@ -180,6 +180,43 @@ is-odd@3.0.1
 - **关闭 bun**：删除 config 的 `pins.bun` 整节（`paths.bunList` 可一并删）——旧部署/旧 B config 无 bun 键时行为与之前完全一致（bun 全是 presence-gated）。
 - Export-Manifests.ps1 支持从本机 `bun pm ls -g` 采集 bun 清单：显式 `-Category bun`（opt-in，不在默认类别中；需 config 含 `paths.bunList`），采集/多选/钉版回写流程与其他类别一致（见 4.0）。
 
+### 4.6 npm 本地私有包目录（paths.npmLocalDirs，可空）
+
+npm 清单（4.3）之外的**私有包预热通道**：把本机/内网自建的私有 npm 包发布进 A 端一次性 Verdaccio 的 storage 快照，使其与公共包一样经 4873 registry 供给到 B——私有包**绝不接触 npmjs**。
+
+```json
+"paths": {
+  "npmLocalDirs": [ "D:\\local-npm-pkgs", "E:\\more-pkgs" ]
+}
+```
+
+- **presence-gated**：config `paths.npmLocalDirs` 键不存在或为空数组 = 关闭，旧 config 不受影响；存在时每个元素须为非空字符串，路径解析同其他 `paths.*`（绝对路径原样使用、相对路径基于工具根）。
+- **发现规则**：某目录本身含 `package.json` → 该目录即一个包；否则扫描其**直接子目录**（不递归）中含 `package.json` 的目录。按包名**小写去重，先到者胜**（同名后者记 Warning 跳过）。目录缺失、无任何 `package.json`、`package.json` 无法解析或缺 name/version，分别记 Error/Warning 进报告，不中断其余包。
+  - **2026-09 新增「依赖清单目录」语义**：若 `package.json` 缺少 name/version 但 JSON 有效且含有非空 `dependencies` 对象，则该目录被识别为**依赖清单目录**（deps-manifest dir），不视为 Error——其 dependencies 条目以 registry 解析方式（`npm install name@spec`）预热进同一 storage 快照，使 B 端可离线 `npm install` 这些依赖。发现优先级：可发布包（有 name+version）> 依赖清单 > Error。依赖清单条目与清单已有包按包名**小写去重，清单优先**（同名者记 `skipped-duplicate` Warning 跳过）。含 `:` 的 spec（如 `file:../x`、`npm:@scope/legacy`、`git+https://...`）均跳过错因非 registry 可解析（记 `skipped-invalid-spec`）。
+- **导出语义（两阶段，一次性 Verdaccio 4874 运行窗口内）**：阶段一先把每个包 robocopy 到本地暂存目录（npm 在 UNC 路径上不可用，源目录可在 UNC 共享上）再 `npm publish --registry http://127.0.0.1:4874 --access public --ignore-scripts --userconfig <一次性 npmrc（仅含 //127.0.0.1:4874/:_auth 哑凭据）>` 进 storage 快照；阶段二对每个发布成功的包 `npm install name@version`（每包独立全新 cache）做安装验证，同时预热其 registry 依赖树。**全部 publish 先于全部 install**，因此局部包之间可以互相依赖、与发现顺序无关。npm CLI 对 registry 完全无凭据时**客户端侧直接 ENEEDAUTH 拒绝发布**（请求根本不发），因此注入一次性哑凭据：npmrc 仅含一行 `//127.0.0.1:4874/:_auth="dXNlcjpwYXNz"`（base64('user:pass')，**常量哑值、非机密**），键与 registry host:port 精确匹配、只发往 127.0.0.1；publish 路径另加 `--no-update-notifier`，防止 npm 的更新检查把 `npm` 包元数据（34MB 无用 packument）拉进 storage 快照。
+- **verdaccio-a.yml 因此新增 `publish: $all` 与 `max_body_size: 100mb`**——仅 A 端一次性实例有效；`publish: $all` 是服务端许可（不校验凭据），客户端凭据靠上面的一次性哑 `_auth` 注入（npm 无凭据时客户端侧直接 ENEEDAUTH）；`verdaccio-b.yml` 绝无 `publish`/`uplinks`/`proxy`（导出期泄漏断言已硬化，三者任一出现即失败）。
+- **单包失败契约**：robocopy/publish/install-verify 任一失败只记入导出报告 `local.failed`，不中断其他包与整体导出。注意两类预期失败：package.json 带 `"private": true` 会被 npm 拒绝（EPRIVATE），发布前需移除；发布与快照中已缓存公共包相同的 name@version 会被 Verdaccio 拒绝（依赖混淆防护，属预期行为）。
+- **交付物 `<staging>\npm\local-packages.txt`**：生成为双行契约——局部发布包行 `name@version  # local: <源目录>`（解析器与 packages.txt 相同），依赖清单行 `<name>@<spec>  # deps: <目录>`（`# deps:` 标记区别于本地发布）。仅当至少一个局部包发布成功 **或** 至少一条依赖清单 spec 预热成功时才生成文件；两者均无产出时不创建（与基线一致）。`packages.txt` 仍是原清单逐字节复制，不受本功能影响。
+- **B 端语义不变**：供给制、不自动全局安装；局部包与公共包经同一 4873 registry 按需 `npm install`。
+- **注意**：npm 主清单（`manifests\npm-packages.txt`）仍需非空（现有契约，空清单导出直接报错）——纯局部包部署也至少保留一条清单条目。
+
+### 4.7 pip 本地 wheel 目录（paths.pipLocalDirs，可空）
+
+pip 清单（4.2）之外的**私有 wheel 通道**：把运维人员预先备好的 `*.whl` 复制进 wheel 仓库并把钉版追加进交付的 requirements——私有包**绝不接触 PyPI**。
+
+```json
+"paths": {
+  "pipLocalDirs": [ "D:\\local-wheels" ]
+}
+```
+
+- **presence-gated**：同 4.6 的 gating 与路径解析语义——`paths.pipLocalDirs` 键不存在或为空数组 = 关闭，交付物与原清单逐字节一致，旧 config 不受影响。
+- **扫描规则**：仅扫描各目录**顶层** `*.whl`（不递归）复制进 `<staging>\pip`；`*.tar.gz` 一律**不复制**并记 Warning（与 `pip.allowSdist` 语义无关，本地目录流程只收 wheel）；无法按 PEP 427 解析文件名的 wheel 跳过并记 Warning；目录缺失记 Warning，不报错。
+- **钉版追加**：从 wheel 文件名解析 `name==version`，追加进**交付的** `<staging>\pip\requirements.txt`，行尾带 `# local: <文件名>` 标记注释（UTF-8 BOM 与 CRLF/LF 均保持原样；无新增钉版时该文件完全不重写）。**原始 `manifests\requirements.txt` 绝不被修改**，A 端 `pip download -r` 也只跑原始清单。
+- **去重**：与清单已有钉版按 PEP 503 归一化（小写、`-_.` 折叠为 `-`）比较——清单已钉同名包时 wheel 仍复制但**不重复追加**（报告 `copied-pin-exists`），避免 B 端 `pip install` 报 "Double requirement given"。
+- **平台责任**：局部 wheel 必须匹配 B 端平台钉版（`pip.downloadArgs` 的 `win_amd64`/`cp312` 等），否则 B 端 apply 时 `pip install` 失败——这属操作员责任，导出不做平台校验。
+- **导出报告**：`<staging>\pip\export-report.json` 新增 `local` 数组，`action` 取值 `copied` / `copied-pin-exists` / `skipped-sdist` / `skipped-unparseable` / `missing-dir`。
+
 ## 五、运维手册
 
 ### 5.1 日志位置
@@ -296,3 +333,7 @@ winget 类别在两端各有一层增量跳过，**信任根链（index.json →
 20. **L20. bun 的 registry 配置仅经机器级环境变量**：bootstrap 设 `BUN_CONFIG_REGISTRY`，npm apply 已设的 `NPM_CONFIG_REGISTRY` 对 bun 同样有效（bun 源码确认三个键都认）；工具不管理任何 bunfig.toml/.npmrc——项目级 bunfig.toml、`.npmrc` 或 CLI `--registry` 可按 bun 优先级（CLI > env > bunfig > npmrc）覆盖它。
 21. **L21. 含 `bundleDependencies` 的包 bun 可能装不上**：bun 会向 registry 索取 bundled 依赖的 manifest（bun 已知行为差异，oven-sh/bun#27418），若该内部依赖不在 Verdaccio 快照中则 `bun add` 404；npm 安装同包不受影响。遇此包改用 npm 安装，或把其内部依赖补进清单重新导出。
 22. **L22. bun 全局安装的 bin 目录需用户自助加 PATH**：`bun add -g` 的可执行入口落在 `%USERPROFILE%\.bun\bin`（per-user，机器 PATH 无法覆盖），用户首次使用前自行加入用户 PATH（一次性）；bun.exe 本体已由 bootstrap 落位机器 PATH（`<stateDir>\bun`），无需任何手动步骤。
+23. **L23. 局部包 publish = 服务端 `publish: $all` 许可 + 客户端一次性哑 `_auth` 注入**：npm 无凭据时**客户端侧直接 ENEEDAUTH 拒绝发布**（请求不发），而 verdaccio 的 `publish: $all` 不校验凭据——因此导出时经 `--userconfig` 注入一次性 npmrc（仅含 `//127.0.0.1:4874/:_auth="dXNlcjpwYXNz"`，base64('user:pass') 常量哑值、非机密，只发往 127.0.0.1）；该组合仅在钉版 verdaccio（6.10.2）上经 QA 实证（含 scoped/unscoped 包）。B 端 `verdaccio-b.yml` 经导出期断言保证无 `publish`/`uplinks`/`proxy`，哑凭据与 publish 规则绝不进入 B 侧。
+24. **L24. 局部 npm 包以 `--ignore-scripts` 发布**：publish 不运行任何生命周期脚本，需自行包含预构建产物；package.json 的 `"private": true` 会被 npm 拒绝（EPRIVATE），发布前需移除（见 4.6）。
+25. **L25. 纯局部包部署仍需 npm 主清单非空**：`manifests\npm-packages.txt` 为空时导出直接报错（现有契约不变）——只用 `paths.npmLocalDirs` 的部署也须至少保留一条主清单条目（见 4.6）。
+26. **L26. 依赖清单目录的 range spec 按导出时解析结果冻结进快照**：依赖清单目录（见 4.6）的 `dependencies` 中的版本范围（如 `^1.2.3`）在 A 端导出时经 `npm install name@^1.2.3` 解析为 registry 当前最新匹配版本并缓存进 storage 快照。B 端始终消费该冻结快照，因此 B 上 `npm install` 可重现（同一份快照）。但若 A 端在一段时间后重跑导出，可能解析到 npmjs 上的更新版本（范围不变、实际内容变）——这与主清单中 `name@version` 的精确版本行为不同：主清单条目钉版锁定具体版本，而 range spec 按导出时间点解析。需精确控制时把依赖从清单目录移入主清单钉版。

@@ -35,6 +35,8 @@ Describe 'README.md mandatory sections (plan todo 19)' {
             '### 4.2 pip requirements.txt（manifests\requirements.txt）',
             '### 4.3 npm 清单（manifests\npm-packages.txt）',
             '### 4.4 chezmoi dotfiles 源态（manifests\dotfiles\）',
+            '### 4.6 npm 本地私有包目录（paths.npmLocalDirs，可空）',
+            '### 4.7 pip 本地 wheel 目录（paths.pipLocalDirs，可空）',
             '### 5.1 日志位置',
             '### 5.2 手动运行：-WhatIf 与 -Category',
             '### 5.3 dotfiles 冲突处理（skipped）',
