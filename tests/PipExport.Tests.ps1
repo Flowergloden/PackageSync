@@ -26,6 +26,9 @@ Describe 'PipExport' {
     BeforeAll {
         . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        # Resolve-OSyncConfigPath lives in Config.ps1 (since 575644a anchored
+        # config.paths to the tool root) and PipExport.ps1 calls it.
+        . (Join-Path $PSScriptRoot '..\src\lib\Config.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\PipExport.ps1')
 
         # The pinned B-side default (plan todo 7): only-binary + win_amd64 /
