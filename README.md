@@ -203,6 +203,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Invoke-Off
 ```
 
 - 引导预演：`powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Install-OfflineBootstrap.ps1 -WhatIf`（零变更：只读仓库与 state，不写任何东西——注：会创建日志目录这个运维产物）。
+- `-SkipRuntime`：检测到 runtime 载荷漂移（`runtimeWingetHash`/`runtimeFilesHash` 与 state 不符）时不触发自愈重装 bootstrap，本轮照常应用类别包；从未 bootstrap 过的机器不受此开关影响（仍会完整引导）。
 - 全程互斥：入口脚本先取 `<stateDir>\run\apply.lock`（拿不到最多等 60s 后本轮跳过；锁龄 >2h 或时间戳为未来视为残留毒锁自动打破）。
 
 ### 5.3 dotfiles 冲突处理（skipped）
