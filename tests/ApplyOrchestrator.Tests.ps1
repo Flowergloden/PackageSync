@@ -508,6 +508,55 @@ Describe 'ApplyOrchestrator: bootstrap self-heal (packages only)' {
         $result.categories['winget'].status | Should -Be 'would-apply'
         (Test-Path -LiteralPath (Join-Path $stateDir 'work')) | Should -Be $false
     }
+
+    Context 'SkipRuntime suppresses drift-triggered self-heal' {
+        It 'does not bootstrap on drift when -SkipRuntime is set (round proceeds)' {
+            $repo = Join-Path $TestDrive 'b5'
+            $null = & $script:NewRepo $repo
+            $stateDir = Join-Path $TestDrive 'sb5'
+            $cfg = & $script:NewConfig $stateDir @{ repoRoot = $repo }
+            # Seed bootstrapped with the CURRENT hashes...
+            $null = Set-OSyncBootstrapComplete -Config $cfg -Bw $repo
+            # ...then change the runtime content and re-publish the trust root
+            # (integrity stays OK, but the runtime hashes now drift vs state).
+            [System.IO.File]::WriteAllText((Join-Path $repo 'runtime\runtime-winget.txt'), "Python.Python.3.12@3.12.10`r`n# new`r`n")
+            $null = New-OSyncFilesManifest -Dir (Join-Path $repo 'runtime')
+            $null = Publish-OSyncIndex -StagingDir $repo
+            # Prove the setup really produces drift - otherwise the test would
+            # pass trivially (no drift = no trigger regardless of the switch).
+            $state = Get-OSyncState -Category 'winget' -Config $cfg
+            (Test-OSyncRuntimeDrift -RepoRoot $repo -State $state) | Should -Be $true
+            # Drift alone must not trigger the self-heal: the throwing mock
+            # fails the test if the suppressed path is taken.
+            Mock Invoke-OSyncBootstrap { throw 'bootstrap must not run with -SkipRuntime (drift path)' }
+
+            $result = Invoke-OSyncApply -Config $cfg -Category @('winget') -SkipRuntime
+
+            $result.bootstrapRan | Should -Be $false
+            $result.bootstrapped | Should -Be $true
+            $result.outcome | Should -Be 'ok'
+            $result.categories['winget'].status | Should -Be 'ok'
+        }
+
+        It 'still bootstraps a never-bootstrapped machine with -SkipRuntime' {
+            $repo = Join-Path $TestDrive 'b6'
+            $null = & $script:NewRepo $repo
+            $stateDir = Join-Path $TestDrive 'sb6'
+            $cfg = & $script:NewConfig $stateDir @{ repoRoot = $repo }
+            Mock Invoke-OSyncBootstrap { param($Config) return [pscustomobject]@{ Success = $true; Error = $null } }
+
+            $result = Invoke-OSyncApply -Config $cfg -Category @('winget') -SkipRuntime
+
+            $result.bootstrapRan | Should -Be $true
+            $result.bootstrapped | Should -Be $true
+            $result.outcome | Should -Be 'ok'
+            $result.categories['winget'].status | Should -Be 'ok'
+        }
+
+        # The drift-WITHOUT--SkipRuntime regression guard already exists as the
+        # It 're-runs the bootstrap on runtime content drift (upgrade path)'
+        # above - intentionally NOT duplicated here.
+    }
 }
 
 Describe 'ApplyOrchestrator: dotfiles (user) round' {

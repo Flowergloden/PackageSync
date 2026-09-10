@@ -3,7 +3,7 @@
   ApplyOrchestrator.ps1 - B-side apply orchestration (Invoke-OfflineApply).
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
 
-  Invoke-OSyncApply -Config [-Category] [-WhatIf]
+  Invoke-OSyncApply -Config [-Category] [-WhatIf] [-SkipRuntime]
       Runs ONE B-side apply round. All the orchestration logic of plan
       todo 17 lives here; the entry script src\Invoke-OfflineApply.ps1 only
       acquires the apply.lock (the lock is taken ONLY by the entry scripts -
@@ -30,11 +30,15 @@
           runtime payload - chezmoi.exe/tools - Momus r4-M2) OR the runtime
           content hashes (runtimeWingetHash / runtimeFilesHash) drifted vs
           system-state (runtime version upgrades, Oracle r5-m1) -> run
-          Invoke-OSyncBootstrap (idempotent upgrade path). A failed
-          bootstrap skips the whole round (retry next cycle). The SYSTEM
-          auto path is a safety net only - QA does not cover the full chain
-          (Momus m4). dotfiles mode: unbootstrapped -> skip + log (Oracle
-          m11).
+          Invoke-OSyncBootstrap (idempotent upgrade path). -SkipRuntime
+          suppresses ONLY the drift half of that trigger: the drifted
+          runtime payload is not reinstalled and the round applies normally
+          (Warning logged). A never-bootstrapped machine always bootstraps
+          regardless of -SkipRuntime (no Python/Node/Verdaccio -> it could
+          not apply anything). A failed bootstrap skips the whole round
+          (retry next cycle). The SYSTEM auto path is a safety net only -
+          QA does not cover the full chain (Momus m4). dotfiles mode:
+          unbootstrapped -> skip + log (Oracle m11).
       [3] Whole-repo snapshot work copy: when ANY enabled category is newer
           than its lastApplied, the packages task robocopies ALL OK enabled
           categories + runtime into <stateDir>\work\<exportedAtUtc>\ (runtime
@@ -504,6 +508,11 @@ function Invoke-OSyncApply {
         [Parameter(Mandatory = $true)]$Config,
         [Parameter(Mandatory = $false)][string[]]$Category = @(),
         [switch]$WhatIf,
+        # Suppresses ONLY the runtime-drift-triggered bootstrap self-heal in
+        # the packages round (see Invoke-OSyncApplyPackagesRound). A machine
+        # that never bootstrapped is unaffected and still bootstraps - it has
+        # no Python/Node/Verdaccio and could not apply anything otherwise.
+        [switch]$SkipRuntime,
         # QA seams (production uses the defaults): a QA run must use clearly
         # temp-named scheduled tasks so the A-side task store is never
         # polluted with B-side service names (same convention as bootstrap).
@@ -592,7 +601,7 @@ function Invoke-OSyncApply {
     if ($mode -eq 'dotfiles') {
         return (Invoke-OSyncApplyDotfilesRound -Config $Config -Result $result -Integrity $integrity -ExportedAtUtc $exportedAtUtc -RepoRoot $repoRoot -WhatIf:$WhatIf)
     }
-    return (Invoke-OSyncApplyPackagesRound -Config $Config -Result $result -Integrity $integrity -ExportedAtUtc $exportedAtUtc -RepoRoot $repoRoot -Category $Category -WhatIf:$WhatIf `
+    return (Invoke-OSyncApplyPackagesRound -Config $Config -Result $result -Integrity $integrity -ExportedAtUtc $exportedAtUtc -RepoRoot $repoRoot -Category $Category -WhatIf:$WhatIf -SkipRuntime:$SkipRuntime `
         -VerdaccioTaskName $VerdaccioTaskName -WingetSettingsTaskName $WingetSettingsTaskName -LandingRoot $LandingRoot)
 }
 
@@ -606,6 +615,9 @@ function Invoke-OSyncApplyPackagesRound {
         [Parameter(Mandatory = $true)][string]$RepoRoot,
         [Parameter(Mandatory = $false)][string[]]$Category = @(),
         [switch]$WhatIf,
+        # Suppresses ONLY the drift-triggered bootstrap self-heal (the
+        # never-bootstrapped trigger below is unconditional).
+        [switch]$SkipRuntime,
         [Parameter(Mandatory = $false)][string]$VerdaccioTaskName = 'PakageSync-Verdaccio',
         [Parameter(Mandatory = $false)][string]$WingetSettingsTaskName = 'PakageSync-WingetSettings-OneShot',
         [Parameter(Mandatory = $false)][string]$LandingRoot = 'C:\PakageSync'
@@ -621,7 +633,12 @@ function Invoke-OSyncApplyPackagesRound {
     if ($bootstrapped) {
         try { $drift = Test-OSyncRuntimeDrift -RepoRoot $RepoRoot -State $state } catch { $drift = $false }
     }
-    if (-not $WhatIf -and (-not $bootstrapped -or $drift)) {
+    # -SkipRuntime suppresses ONLY the drift half of the trigger: a machine
+    # that never bootstrapped has no Python/Node/Verdaccio and must still
+    # bootstrap (the switch is an operator opt-out of reinstalling a drifted
+    # runtime payload, not of the initial bootstrap).
+    $needBootstrap = (-not $bootstrapped) -or ($drift -and -not $SkipRuntime)
+    if (-not $WhatIf -and $needBootstrap) {
         Write-OSyncLog -Category 'apply' -Level Info `
             -Message ("packages round: bootstrap self-heal triggered (bootstrapped={0}, runtimeDrift={1})." -f $bootstrapped, $drift) `
             -Data @{ bootstrapped = $bootstrapped; drift = $drift } -Config $Config | Out-Null
@@ -641,6 +658,13 @@ function Invoke-OSyncApplyPackagesRound {
         # Re-read the state (the bootstrap re-recorded the runtime hashes).
         $state = Get-OSyncState -Category 'winget' -Config $Config
         Write-OSyncLog -Category 'apply' -Level Info -Message 'packages round: bootstrap self-heal SUCCEEDED.' -Config $Config | Out-Null
+    }
+    elseif (-not $WhatIf -and $drift -and $SkipRuntime) {
+        # Drift is real but the operator suppressed the self-heal: the round
+        # continues with the currently installed runtime (no bootstrapRan).
+        Write-OSyncLog -Category 'apply' -Level Warning `
+            -Message 'runtime drift detected but bootstrap self-heal suppressed by -SkipRuntime.' `
+            -Data @{ bootstrapped = $bootstrapped; drift = $true } -Config $Config | Out-Null
     }
 
     # [3] Pending judgment across ALL enabled categories (Momus r5-m2): the

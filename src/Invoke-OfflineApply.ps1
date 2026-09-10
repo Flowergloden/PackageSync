@@ -3,7 +3,7 @@
   Invoke-OfflineApply.ps1 - B-side apply entry point.
 
   Usage:
-    powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Invoke-OfflineApply.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles] [-WhatIf]
+    powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Invoke-OfflineApply.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles] [-WhatIf] [-SkipRuntime]
 
   Thin wrapper around Invoke-OSyncApply (src\lib\ApplyOrchestrator.ps1):
   imports the module relative to its own location, resolves the default
@@ -27,6 +27,13 @@
   work copy / apply / self-refresh / cleanup happens (the log directory is
   created as an operational artifact - same convention as the bootstrap).
 
+  -SkipRuntime suppresses ONLY the runtime-drift-triggered bootstrap
+  self-heal in the packages round: a drifted runtime payload
+  (runtimeWingetHash / runtimeFilesHash vs system-state) is not reinstalled
+  this round, the categories still apply. A machine that never bootstrapped
+  is unaffected and always bootstraps (it has no Python/Node/Verdaccio and
+  could not apply anything otherwise).
+
   QA seams (production uses the defaults): -VerdaccioTaskName /
   -WingetSettingsTaskName let a QA run use clearly temp-named scheduled
   tasks so the A-side task store is never polluted with B-side service
@@ -42,6 +49,11 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$WhatIf,
+
+    # Suppresses ONLY the runtime-drift-triggered bootstrap self-heal (a
+    # never-bootstrapped machine still bootstraps - see Invoke-OSyncApply).
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipRuntime,
 
     [Parameter(Mandatory = $false)]
     [string]$VerdaccioTaskName = 'PakageSync-Verdaccio',
@@ -92,7 +104,7 @@ try {
     }
 
     try {
-        $result = Invoke-OSyncApply -Config $config -Category $categoryList -WhatIf:$WhatIf `
+        $result = Invoke-OSyncApply -Config $config -Category $categoryList -WhatIf:$WhatIf -SkipRuntime:$SkipRuntime `
             -VerdaccioTaskName $VerdaccioTaskName -WingetSettingsTaskName $WingetSettingsTaskName
         Write-Host ("Invoke-OfflineApply: mode={0} outcome={1}" -f $result.mode, $result.outcome)
         if (-not [string]::IsNullOrWhiteSpace($result.skipReason)) {
