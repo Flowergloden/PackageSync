@@ -60,7 +60,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Register-SyncTask
 
    - 注册任务 `PakageSync-Export`：当前用户、LogonType S4U（注销也运行）、RunLevel Highest、StartWhenAvailable。
    - 也可手动触发验证：`powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-OfflineRepo.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles]`。
-   - 手动运行时控制台**默认实时回显**进度（里程碑日志行 + 节流后的 winget 下载输出），无需另开窗口尾随日志；需要静默（只看日志文件）时加 `-Quiet`。无人值守计划任务不受此开关影响。
+   - 手动运行时控制台**默认实时回显**进度（里程碑日志行 + winget/pip/npm 子进程输出，winget 侧 250ms 节流 + CR 折叠），无需另开窗口尾随日志；需要静默（只看日志文件）时加 `-Quiet`。无人值守计划任务不受此开关影响。
    - `-SkipRuntime`：跳过 runtime 重导出（VC_redist/bun 下载、Python/Node winget 下载、Verdaccio 构建、tool 快照），改为**复用落盘区上一代已发布载荷**（`runtime\` + `winget\` 下的 Python/Node 目录复制进新 staging 代并重新入清单）——信任链（index → files.json → 逐文件 SHA256）完全不变，仅省去下载/构建耗时；`runtime\tool` 快照随之保持上一代内容。要求已做过至少一次完整导出，否则 fail-fast 报错（不做任何 staging 工作）。
 
 ### 3.2 B 端（内网机）
