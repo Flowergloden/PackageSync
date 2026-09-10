@@ -15,19 +15,31 @@
        interpreter (PackageSync.md:46-48). Default pin:
          --only-binary=:all: --platform win_amd64 --python-version 3.12
          --implementation cp --abi cp312
-    3. Copies the requirements file to <staging>\pip\requirements.txt.
-    4. Post-export assertion: <staging>\pip must contain NO *.tar.gz sdist
-       unless config.pip.allowSdist is true (default false - an sdist fails
-       the export and the error names the offending file).
-    5. Records pip failures into <staging>\pip\export-report.json and logs
-       via Write-OSyncLog; a pip failure rethrows (non-zero exit).
+3. Copies the requirements file to <staging>\pip\requirements.txt.
+     4. Local wheel dirs (optional, presence-gated on config.paths.pipLocalDirs):
+        operator-staged *.whl files are copied TOP-LEVEL-only into
+        <staging>\pip and their pins appended (with a `# local: <file>`
+        marker) to the STAGING requirements.txt copy - NEVER to the original
+        manifest. Local *.tar.gz sdists are NEVER copied (the local-dir flow
+        is wheels-only, regardless of pip.allowSdist) and are reported as
+        skipped-sdist with a Warning; unparseable wheel names are skipped with
+        a Warning; missing dirs are skipped with a Warning. An absent or empty
+        paths.pipLocalDirs keeps the delivery byte-identical to the source
+        manifest. The A-side `pip download -r` (step 2) always runs against
+        the ORIGINAL manifest only - private packages never hit PyPI.
+     5. Post-export assertion: <staging>\pip must contain NO *.tar.gz sdist
+        unless config.pip.allowSdist is true (default false - an sdist fails
+        the export and the error names the offending file).
+     6. Records pip failures into <staging>\pip\export-report.json and logs
+        via Write-OSyncLog; a pip failure rethrows (non-zero exit).
 
   Returns the export report as a PSCustomObject.
 
   Helpers (all auto-exported by the OfflineSync module's *-OSync* rule):
     Resolve-OSyncPython, Test-OSyncPythonInterpreter, Get-OSyncPipDownloadArgs,
     Invoke-OSyncPipDownload, Get-OSyncPipFailures, Assert-OSyncNoSdist,
-    Write-OSyncPipReport
+    ConvertFrom-OSyncWheelFileName, Get-OSyncPipLocalWheelPlan,
+    Add-OSyncRequirementsPins, Write-OSyncPipReport
 #>
 
 function Test-OSyncPythonInterpreter {
@@ -281,6 +293,225 @@ function Assert-OSyncNoSdist {
     return $true
 }
 
+function ConvertFrom-OSyncWheelFileName {
+    <#
+      PEP 427 wheel filename parse: {distribution}-{version}(-{build})?-
+      {python tag}-{abi tag}-{platform tag}.whl. A naive split on '-' is safe
+      because PEP 427 escapes any '-' inside the distribution/version to '_'
+      (underscore names are kept verbatim - pip normalizes per PEP 503).
+      Valid shapes:
+        - exactly 5 parts (no build tag), or
+        - exactly 6 parts where part[2] (the build tag) starts with a digit.
+      No empty parts allowed. Returns
+      [pscustomobject]@{ Name; Version; Pin = "Name==Version" } or $null when
+      the name is not parseable (the caller buckets it as skipped-unparseable).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$FileName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($FileName)) { return $null }
+    # Basename only: callers may hand a full path; PEP 427 applies to the name.
+    $leaf = Split-Path -Leaf $FileName
+    if ($leaf -notmatch '(?i)\.whl$') { return $null }
+    $stem = $leaf.Substring(0, $leaf.Length - 4)
+    $parts = @($stem -split '-')
+    if ($parts.Count -ne 5 -and $parts.Count -ne 6) { return $null }
+    foreach ($part in $parts) {
+        if ([string]::IsNullOrEmpty($part)) { return $null }
+    }
+    if ($parts.Count -eq 6 -and $parts[2] -notmatch '^\d') { return $null }
+
+    return [pscustomobject]@{
+        Name    = $parts[0]
+        Version = $parts[1]
+        Pin     = ('{0}=={1}' -f $parts[0], $parts[1])
+    }
+}
+
+function Get-OSyncPipLocalWheelPlan {
+    <#
+      Scans the operator-staged local wheel dirs (config.paths.pipLocalDirs)
+      and buckets what it finds. TOP-LEVEL only - a wheel in a subdirectory is
+      NOT part of the delivery (the local dir is a staging area, not a tree).
+      Per dir:
+        - missing (not a container) -> MissingDirs entry,
+        - *.whl files -> Wheels entries @{ Path; File; Name; Version; Pin }
+          (a name ConvertFrom-OSyncWheelFileName rejects goes to the
+          Unparseable bucket instead),
+        - *.tar.gz files -> Sdists bucket @{ Dir; File } (never copied).
+      Returns [pscustomobject]@{ Wheels=@(); Sdists=@(); Unparseable=@();
+      MissingDirs=@() } - every bucket is an array even when empty.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string[]]$Dirs = @()
+    )
+
+    $wheels = @()
+    $sdists = @()
+    $unparseable = @()
+    $missingDirs = @()
+
+    foreach ($dir in @($Dirs)) {
+        if ([string]::IsNullOrWhiteSpace([string]$dir)) { continue }
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+            $missingDirs += [pscustomobject]@{ Dir = [string]$dir }
+            continue
+        }
+
+        # Top-level only: no -Recurse. Get-ChildItem -File -Filter '*.whl'
+        # matches case-insensitively on Windows.
+        foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.whl' -ErrorAction SilentlyContinue)) {
+            $parsed = ConvertFrom-OSyncWheelFileName -FileName $file.Name
+            if ($null -eq $parsed) {
+                $unparseable += [pscustomobject]@{
+                    Dir  = [string]$dir
+                    Path = $file.FullName
+                    File = $file.Name
+                }
+            }
+            else {
+                $wheels += [pscustomobject]@{
+                    Path    = $file.FullName
+                    File    = $file.Name
+                    Name    = $parsed.Name
+                    Version = $parsed.Version
+                    Pin     = $parsed.Pin
+                }
+            }
+        }
+        foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -Filter '*.tar.gz' -ErrorAction SilentlyContinue)) {
+            $sdists += [pscustomobject]@{ Dir = [string]$dir; File = $file.Name }
+        }
+    }
+
+    return [pscustomobject]@{
+        Wheels      = $wheels
+        Sdists      = $sdists
+        Unparseable = $unparseable
+        MissingDirs = $missingDirs
+    }
+}
+
+function Get-OPep503Name {
+    <#
+      PEP 503 name normalization: lowercase, every run of '-', '_' or '.'
+      collapses to a single '-'. pip treats 'my-pkg', 'my_pkg' and 'my.pkg'
+      as the SAME distribution, so the local-pin dedup MUST compare normalized
+      names - otherwise a distribution pinned in the manifest AND delivered as
+      a local wheel would produce "Double requirement given" on the B side.
+      Private helper (no *-OSync* suffix): only used inside this file.
+    #>
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return '' }
+    return ([regex]::Replace($Name.Trim().ToLowerInvariant(), '[-_.]+', '-'))
+}
+
+function Add-OSyncRequirementsPins {
+    <#
+      Appends local-wheel pin lines (e.g. 'name==version  # local: file.whl')
+      to the STAGING requirements.txt copy ONLY - the original manifest is
+      never touched. Dedup: a pin whose distribution name (PEP 503 normalized)
+      is already pinned in the file is skipped, and within one call the first
+      occurrence of a name wins (both prevent "Double requirement given" on B).
+      Byte-level fidelity (the delivery contract must stay exact):
+        - UTF-8 BOM state preserved (read/write via [System.IO.File] bytes),
+        - dominant EOL (CRLF vs LF) preserved; a file without a trailing
+          newline gets the EOL separator inserted before the first appended
+          line; a file with no newline at all defaults to CRLF,
+        - when nothing is appended the file is NOT rewritten at all (stays
+          byte-identical).
+      Returns the actually-appended lines as an array (the comma operator
+      keeps a single-element/empty result an array - PS 5.1 unrolls otherwise).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RequirementsPath,
+
+        [Parameter(Mandatory = $false)]
+        [string[]]$PinLines = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $RequirementsPath -PathType Leaf)) {
+        throw "Add-OSyncRequirementsPins: requirements file not found: '$RequirementsPath'."
+    }
+
+    # --- read bytes; BOM is controlled by us, never by an encoding default ---
+    $bytes = [System.IO.File]::ReadAllBytes($RequirementsPath)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    if ($hasBom) {
+        $content = [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    }
+    else {
+        $content = [System.Text.Encoding]::UTF8.GetString($bytes)
+    }
+
+    # --- dominant EOL (CRLF vs LF); single-line/no-newline files default CRLF ---
+    $crlfCount = ([regex]::Matches($content, "`r`n")).Count
+    $lfCount = ([regex]::Matches($content, "(?<!`r)`n")).Count
+    if ($crlfCount -gt 0 -and $crlfCount -ge $lfCount) { $eol = "`r`n" }
+    elseif ($lfCount -gt 0) { $eol = "`n" }
+    else { $eol = "`r`n" }
+
+    # --- existing pins: normalized names already pinned in the file ---
+    $existing = @{}
+    foreach ($line in ($content -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed.Length -eq 0 -or $trimmed.StartsWith('#')) { continue }
+        $m = [regex]::Match($trimmed, '^([A-Za-z0-9][A-Za-z0-9._-]*)\s*==')
+        if ($m.Success) {
+            $existing[(Get-OPep503Name -Name $m.Groups[1].Value)] = $true
+        }
+    }
+
+    # --- select the lines that are actually new (file pins + intra-call dedup) ---
+    $appended = @()
+    foreach ($line in @($PinLines)) {
+        if ($null -eq $line) { continue }
+        $lineText = ([string]$line).Trim()
+        if ($lineText.Length -eq 0) { continue }
+        $namePart = ($lineText -split '==', 2)[0]
+        $key = Get-OPep503Name -Name $namePart
+        if ($key.Length -eq 0) { continue }
+        if ($existing.ContainsKey($key)) { continue }
+        $existing[$key] = $true
+        $appended += $lineText
+    }
+
+    if ($appended.Count -eq 0) {
+        # Nothing new: leave the file byte-identical (not even rewritten).
+        return ,$appended
+    }
+
+    # --- append (EOL separator first when the file lacks a trailing newline) ---
+    $newContent = $content
+    if ($newContent.Length -gt 0 -and -not $newContent.EndsWith("`n")) {
+        $newContent += $eol
+    }
+    foreach ($line in $appended) {
+        $newContent += $line + $eol
+    }
+
+    $outBytes = [System.Text.Encoding]::UTF8.GetBytes($newContent)
+    if ($hasBom) {
+        $withBom = New-Object byte[] ($outBytes.Length + 3)
+        [Array]::Copy($outBytes, 0, $withBom, 3, $outBytes.Length)
+        $withBom[0] = 0xEF; $withBom[1] = 0xBB; $withBom[2] = 0xBF
+        $outBytes = $withBom
+    }
+    [System.IO.File]::WriteAllBytes($RequirementsPath, $outBytes)
+
+    return ,$appended
+}
+
 function Export-OSyncPip {
     [CmdletBinding()]
     param(
@@ -337,6 +568,7 @@ function Export-OSyncPip {
             failed       = $failures
             wheelCount   = $wheels.Count
             pipExitCode  = $result.ExitCode
+            local        = @()
         }
         Write-OSyncPipReport -Report $report -ReportPath $reportPath
         Write-OSyncLog -Category 'pip' -Level Error -Message "pip download failed (exit $($result.ExitCode)); report written to '$reportPath'." -Data $failures -Config $Config | Out-Null
@@ -348,6 +580,59 @@ function Export-OSyncPip {
     # --- 5. copy the requirements file into the wheel repo ---
     Copy-Item -LiteralPath $requirementsPath -Destination (Join-Path $pipDir 'requirements.txt') -Force
     Write-OSyncLog -Category 'pip' -Level Info -Message "Copied requirements file to '$($pipDir)\requirements.txt'" -Config $Config | Out-Null
+
+    # --- 5b. local wheel dirs (optional, presence-gated) ---
+    # config.paths.pipLocalDirs is NEVER required: an absent key OR an empty
+    # array both mean OFF and the delivery stays byte-identical (the verbatim
+    # copy above is the contract). Operator-staged local wheels are PRIVATE
+    # packages that must never hit PyPI - the pip download in step 4 ran
+    # against the ORIGINAL manifest only, and this flow only ever touches the
+    # STAGING requirements copy.
+    $localEntries = @()
+    $localDirsRaw = Get-ONestedValue -Object $Config -Path 'paths.pipLocalDirs'
+    if ($null -ne $localDirsRaw -and @($localDirsRaw).Count -gt 0) {
+        $resolvedDirs = @()
+        foreach ($rawDir in @($localDirsRaw)) {
+            $resolved = Resolve-OSyncConfigPath -Config $Config -Path ([string]$rawDir)
+            if (-not [string]::IsNullOrWhiteSpace($resolved)) { $resolvedDirs += $resolved }
+        }
+        $plan = Get-OSyncPipLocalWheelPlan -Dirs $resolvedDirs
+
+        foreach ($m in $plan.MissingDirs) {
+            Write-OSyncLog -Category 'pip' -Level Warning -Message "local wheel dir missing: '$($m.Dir)' - skipped (no wheels harvested)." -Config $Config | Out-Null
+            $localEntries += [pscustomobject]@{ file = [string]$m.Dir; name = $null; version = $null; pin = $null; action = 'missing-dir' }
+        }
+        foreach ($s in $plan.Sdists) {
+            Write-OSyncLog -Category 'pip' -Level Warning -Message "local sdist found: '$($s.File)' in '$($s.Dir)' - sdists are NEVER copied (the local-dir flow is wheels-only)." -Config $Config | Out-Null
+            $localEntries += [pscustomobject]@{ file = $s.File; name = $null; version = $null; pin = $null; action = 'skipped-sdist' }
+        }
+        foreach ($u in $plan.Unparseable) {
+            Write-OSyncLog -Category 'pip' -Level Warning -Message "local wheel name not PEP 427-parseable: '$($u.File)' in '$($u.Dir)' - skipped." -Config $Config | Out-Null
+            $localEntries += [pscustomobject]@{ file = $u.File; name = $null; version = $null; pin = $null; action = 'skipped-unparseable' }
+        }
+
+        if ($plan.Wheels.Count -gt 0) {
+            $pinLines = @()
+            foreach ($w in $plan.Wheels) {
+                $pinLines += ('{0}  # local: {1}' -f $w.Pin, $w.File)
+            }
+            $appendedPins = Add-OSyncRequirementsPins -RequirementsPath (Join-Path $pipDir 'requirements.txt') -PinLines $pinLines
+            # Exact-line membership: a wheel whose pin was NOT appended (already
+            # pinned in the manifest, or a same-name duplicate earlier in the
+            # plan) is still copied but reported as copied-pin-exists.
+            $appendedSet = @{}
+            foreach ($line in $appendedPins) { $appendedSet[[string]$line] = $true }
+
+            foreach ($w in $plan.Wheels) {
+                Copy-Item -LiteralPath $w.Path -Destination (Join-Path $pipDir $w.File) -Force
+                $pinLine = ('{0}  # local: {1}' -f $w.Pin, $w.File)
+                $action = if ($appendedSet.ContainsKey($pinLine)) { 'copied' } else { 'copied-pin-exists' }
+                $localEntries += [pscustomobject]@{
+                    file = $w.File; name = $w.Name; version = $w.Version; pin = $w.Pin; action = $action
+                }
+            }
+        }
+    }
 
     # --- 6. no-sdist assertion (defense in depth) ---
     $null = Assert-OSyncNoSdist -PipDir $pipDir -AllowSdist ([bool]$Config.pip.allowSdist)
@@ -362,6 +647,7 @@ function Export-OSyncPip {
         ok           = $wheels
         failed       = @()
         wheelCount   = $wheels.Count
+        local        = @($localEntries)
     }
     Write-OSyncPipReport -Report $report -ReportPath $reportPath
     Write-OSyncLog -Category 'pip' -Level Info -Message "pip export complete: $($wheels.Count) wheel(s) in '$pipDir'." -Data @{ wheelCount = $wheels.Count } -Config $Config | Out-Null
