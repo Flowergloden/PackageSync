@@ -168,6 +168,92 @@ Describe 'OfflineSync config loading (Get-OSyncConfig)' {
         }
     }
 
+    Context 'paths npmLocalDirs/pipLocalDirs (optional, presence-gated)' {
+        It 'validates a legacy config without either key and without pins.bun (double-legacy)' {
+            $legacy = Join-Path $testRoot 'legacy-no-localdirs.json'
+            New-TestConfig -OutFile $legacy -Mutate { param($o)
+                $o.pins.PSObject.Properties.Remove('bun')
+                $o.paths.PSObject.Properties.Remove('bunList')
+            }
+            $config = Get-OSyncConfig -Path $legacy
+            $config | Should -Not -BeNullOrEmpty
+        }
+
+        It 'validates paths.npmLocalDirs as an empty array' {
+            $cfg = Join-Path $testRoot 'npm-empty.json'
+            New-TestConfig -OutFile $cfg -Mutate { param($o)
+                $o.paths | Add-Member -NotePropertyName npmLocalDirs -NotePropertyValue @() -Force
+            }
+            $config = Get-OSyncConfig -Path $cfg
+            $config | Should -Not -BeNullOrEmpty
+        }
+
+        It 'validates paths.npmLocalDirs string array and preserves values' {
+            $cfg = Join-Path $testRoot 'npm-values.json'
+            New-TestConfig -OutFile $cfg -Mutate { param($o)
+                $o.paths | Add-Member -NotePropertyName npmLocalDirs -NotePropertyValue @('D:\pkgs','manifests\local-npm') -Force
+            }
+            $config = Get-OSyncConfig -Path $cfg
+            $config.paths.npmLocalDirs.Count | Should -Be 2
+            $config.paths.npmLocalDirs[0] | Should -Be 'D:\pkgs'
+            $config.paths.npmLocalDirs[1] | Should -Be 'manifests\local-npm'
+        }
+
+        It 'throws when paths.npmLocalDirs is a plain string, naming the key' {
+            $bad = Join-Path $testRoot 'npm-string.json'
+            New-TestConfig -OutFile $bad -Mutate { param($o)
+                $o.paths | Add-Member -NotePropertyName npmLocalDirs -NotePropertyValue 'not-an-array' -Force
+            }
+            $err = $null
+            try { Get-OSyncConfig -Path $bad } catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*paths.npmLocalDirs*'
+        }
+
+        It 'throws when paths.npmLocalDirs contains a whitespace-only element, naming the key' {
+            $bad = Join-Path $testRoot 'npm-ws.json'
+            New-TestConfig -OutFile $bad -Mutate { param($o)
+                $o.paths | Add-Member -NotePropertyName npmLocalDirs -NotePropertyValue @('valid','  ') -Force
+            }
+            $err = $null
+            try { Get-OSyncConfig -Path $bad } catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*paths.npmLocalDirs*'
+        }
+
+        It 'throws when paths.npmLocalDirs contains a non-string element, naming the key' {
+            $bad = Join-Path $testRoot 'npm-int.json'
+            New-TestConfig -OutFile $bad -Mutate { param($o)
+                $o.paths | Add-Member -NotePropertyName npmLocalDirs -NotePropertyValue @('valid',123) -Force
+            }
+            $err = $null
+            try { Get-OSyncConfig -Path $bad } catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*paths.npmLocalDirs*'
+        }
+
+        It 'throws when paths.pipLocalDirs is an object/hashtable, naming the key' {
+            $bad = Join-Path $testRoot 'pip-object.json'
+            New-TestConfig -OutFile $bad -Mutate { param($o)
+                $o.paths | Add-Member -NotePropertyName pipLocalDirs -NotePropertyValue ([pscustomobject]@{foo='bar'}) -Force
+            }
+            $err = $null
+            try { Get-OSyncConfig -Path $bad } catch { $err = $_ }
+            $err | Should -Not -BeNullOrEmpty
+            $err.Exception.Message | Should -BeLike '*paths.pipLocalDirs*'
+        }
+
+        It 'validates paths.pipLocalDirs as a single-element string array' {
+            $cfg = Join-Path $testRoot 'pip-value.json'
+            New-TestConfig -OutFile $cfg -Mutate { param($o)
+                $o.paths | Add-Member -NotePropertyName pipLocalDirs -NotePropertyValue @('C:\wheels') -Force
+            }
+            $config = Get-OSyncConfig -Path $cfg
+            $config.paths.pipLocalDirs.Count | Should -Be 1
+            $config.paths.pipLocalDirs[0] | Should -Be 'C:\wheels'
+        }
+    }
+
     Context 'toolRoot stamping and path resolution' {
         It 'stamps toolRoot as the parent of the config file parent' {
             $config = Get-OSyncConfig -Path $configPath

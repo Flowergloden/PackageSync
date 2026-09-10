@@ -18,6 +18,12 @@
   (the parent of the config file's parent - the repo owning the operator
   manifests) stamped on it; Resolve-OSyncConfigPath resolves config.paths.*
   against that tool root (never config.repoRoot, the output landing dir).
+  Optional local package directory arrays `paths.npmLocalDirs` and
+  `paths.pipLocalDirs` gate whether npm/pip export also harvests pre-staged
+  local packages. Either key may be absent or an empty array (both mean OFF
+  because PowerShell 5.1 turns empty JSON arrays into `$null`). When present
+  and non-null every element must be a non-empty, non-whitespace string.
+
 #>
 
 function Get-ONestedValue {
@@ -150,6 +156,35 @@ function Get-OSyncConfig {
             $value = Get-ONestedValue -Object $config -Path $key
             if ($null -eq $value -or ($value -is [string] -and $value.Trim().Length -eq 0)) {
                 throw "Get-OSyncConfig: config key '$key' is missing or empty (required when 'pins.bun' is present; remove the whole 'pins.bun' section to disable bun)."
+            }
+        }
+    }
+
+    # --- optional local package directory arrays (presence-gated) ---
+    # paths.npmLocalDirs / paths.pipLocalDirs are NEVER required: an absent
+    # key OR an empty JSON array (which PowerShell 5.1 parses as `$null`) both
+    # mean OFF. When present and non-null every element must be a non-empty,
+    # non-whitespace string.
+    foreach ($localDirKey in @('paths.npmLocalDirs', 'paths.pipLocalDirs')) {
+        $localDirs = Get-ONestedValue -Object $config -Path $localDirKey
+        if ($null -eq $localDirs) {
+            continue
+        }
+        # ConvertFrom-Json unrolls a single-element JSON array into its lone
+        # scalar element. Re-wrap it when the raw JSON was actually an array.
+        if ($localDirs -isnot [System.Array]) {
+            $leafName = ($localDirKey -split '\.')[-1]
+            if ($raw -match "`"$([regex]::Escape($leafName))`"\s*:\s*\[") {
+                $localDirs = @($localDirs)
+            }
+        }
+        if ($localDirs -isnot [System.Array]) {
+            throw "Get-OSyncConfig: config key '$localDirKey' must be an array of strings (use an empty array or remove the key to disable); got '$localDirs'."
+        }
+        for ($i = 0; $i -lt $localDirs.Count; $i++) {
+            $element = $localDirs[$i]
+            if ($null -eq $element -or $element -isnot [string] -or $element.Trim().Length -eq 0) {
+                throw "Get-OSyncConfig: config key '$localDirKey' element at index $i must be a non-null, non-whitespace string; got '$element'."
             }
         }
     }
