@@ -21,7 +21,10 @@
     "requirements": "manifests\\requirements.txt",
     "npmList": "manifests\\npm-packages.txt",
     "bunList": "manifests\\bun-packages.txt",
-    "dotfilesSource": "manifests\\dotfiles"
+    "dotfilesSource": "manifests\\dotfiles",
+    "npmLocalDirs": [
+      "C:\\Users\\Administrator\\.config\\opencode"
+    ]
   },
   "winget": {
     "scope": "machine",
