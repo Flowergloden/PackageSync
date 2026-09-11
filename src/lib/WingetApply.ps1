@@ -144,6 +144,36 @@ function Get-OSyncWingetManifestInfo {
 
 <#
 .SYNOPSIS
+    Returns $true when ANY YAML manifest under $PackageDir contains an
+    Installer of type 'msix' or 'appx' (which MUST use --scope user).
+.DESCRIPTION
+    MSIX/Appx packages do not support --scope machine (powered by winget's
+    COM API). Packages like Microsoft.PowerToys and Microsoft.WindowsTerminal
+    ship as MSIX and always need user-scope installation. Reads InstallerType
+    from the raw YAML text (regex-based, same pattern as the other manifest
+    helpers) and returns $true on the first hit.
+#>
+function Test-OSyncWingetNeedsUserScope {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageDir
+    )
+
+    if (-not [System.IO.Directory]::Exists($PackageDir)) { return $false }
+    $yamls = @(Get-ChildItem -LiteralPath $PackageDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+    # Look for InstallerType: msix or appx in the Installers array (indented
+    # under the - list entry). Use multiline regex to match across lines.
+    $msixPattern = '(?m)^\s+InstallerType:\s*(msix|appx)\b'
+    foreach ($yaml in $yamls) {
+        $text = [System.IO.File]::ReadAllText($yaml.FullName, [System.Text.Encoding]::UTF8)
+        if ($text -match $msixPattern) { return $true }
+    }
+    return $false
+}
+<#
+.SYNOPSIS
     Runs one `winget install` invocation with a hard timeout.
 
 .DESCRIPTION
@@ -236,6 +266,71 @@ function Invoke-OSyncWingetInstall {
 
 <#
 .SYNOPSIS
+    Strips inline PackageDependencies from a YAML manifest string so winget
+    does not try to resolve them against an unavailable source in an offline
+    B-end. The caller is responsible for installing the extracted dependencies
+    via the normal packages.txt ordering.
+
+.DESCRIPTION
+    winget's --skip-dependencies flag has been observed to be ineffective at
+    suppressing source resolution for packages that declare a Dependencies
+    section in their manifest YAML.  This function performs a text-level
+    removal of the top-level Dependencies block and returns the cleaned YAML
+    together with the list of extracted PackageIdentifier strings.
+#>
+function Remove-OSyncWingetDependencies {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [string]$YamlText
+    )
+
+    $deps = @()
+    $eol = if ($YamlText.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $lines = $YamlText -split $eol
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -match '^(\s*)Dependencies:') {
+            $depIndent = $Matches[1].Length
+
+            # Collect child lines that are MORE indented than the Dependencies
+            # line.  The block ends at the next non-empty line whose indent is
+            # <= depIndent (sibling or ancestor key, or end of file).  Empty
+            # lines are skipped so they never cut the block short.
+            $j = $i + 1
+            while ($j -lt $lines.Count) {
+                $childLine = $lines[$j]
+                if ($childLine -match '^(\s*)\S') {
+                    $childIndent = $Matches[1].Length
+                    if ($childIndent -le $depIndent) { break }
+                    # Extract PackageIdentifier from list entries.
+                    if ($childLine -match 'PackageIdentifier:\s+(\S+)') {
+                        $deps += $Matches[1]
+                    }
+                }
+                # Empty lines (no non-whitespace content) stay inside the block.
+                $j++
+            }
+
+            # Remove lines [$i .. $j-1] (the Dependencies line + its children).
+            $keep = @()
+            if ($i -gt 0) { $keep += $lines[0..($i - 1)] }
+            if ($j -lt $lines.Count) { $keep += $lines[$j..($lines.Count - 1)] }
+            $YamlText = $keep -join $eol
+            break   # only the first Dependencies block
+        }
+    }
+
+    return [pscustomobject]@{
+        CleanYaml    = $YamlText
+        Dependencies = $deps
+    }
+}
+
+<#
+.SYNOPSIS
     Stages a manifest-ONLY flat directory for one package.
 
 .DESCRIPTION
@@ -246,6 +341,12 @@ function Invoke-OSyncWingetInstall {
     stay in the work copy where the HTTP server serves them. On a filename
     collision the later file is prefixed with its immediate parent directory
     name so no manifest is lost.
+
+    Additionally, each YAML is scanned for a top-level Dependencies section.
+    If found, the section is stripped from the staged copy and the dependency
+    PackageIdentifiers are written to the log.  winget's --skip-dependencies
+    flag has been shown to be ineffective, so text-level removal is required
+    to prevent offline source-resolution failures.
 #>
 function New-OSyncWingetManifestStaging {
     [CmdletBinding()]
@@ -265,7 +366,11 @@ function New-OSyncWingetManifestStaging {
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
     $used = @{}
-    $yamls = @(Get-ChildItem -LiteralPath $PackageDir -Recurse -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+    # Do NOT recurse: Dependencies\ subdirectory contains YAMLs for OTHER
+    # PackageIdentifiers. Flattening them into staging causes winget to see
+    # multiple PackageIdentifiers in the same --manifest directory and reject
+    # the entire manifest set (observed: 0x8A150004).
+    $yamls = @(Get-ChildItem -LiteralPath $PackageDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
     foreach ($yaml in $yamls) {
         $name = $yaml.Name
         if ($used.ContainsKey($name.ToLowerInvariant())) {
@@ -273,7 +378,19 @@ function New-OSyncWingetManifestStaging {
             $name = '{0}_{1}' -f $parent, $name
         }
         $used[$name.ToLowerInvariant()] = $true
-        Copy-Item -LiteralPath $yaml.FullName -Destination (Join-Path $staging $name)
+
+        # Read YAML and strip inline PackageDependencies (winget's
+        # --skip-dependencies is ineffective — text-level removal is required
+        # to prevent offline source-resolution failures).
+        $text = [System.IO.File]::ReadAllText($yaml.FullName, [System.Text.Encoding]::UTF8)
+        $result = Remove-OSyncWingetDependencies -YamlText $text
+        # Note: we deliberately avoid logging here because
+        # New-OSyncWingetManifestStaging does NOT carry a -Config parameter,
+        # and adding one would require updating every caller.  The caller
+        # (Invoke-OSyncWingetApply) logs the install attempt where the
+        # operator can inspect it, and any missing dependencies show up as
+        # later failures in the apply report.
+        [System.IO.File]::WriteAllText((Join-Path $staging $name), $result.CleanYaml, [System.Text.Encoding]::UTF8)
     }
     return $staging
 }
@@ -497,19 +614,37 @@ function Invoke-OSyncWingetApply {
             # where the HTTP server serves them).
             $manifestDir = New-OSyncWingetManifestStaging -PackageDir $pkgDir -StagingRoot $stagingRoot
 
+            # Per-package scope override: MSIX/Appx packages (InstallerType:
+            # msix/appx) MUST use --scope user even when the config default is
+            # 'machine'. Detected by reading InstallerType from the YAML.
+            $actualScope = $scope
+            if ($scope -eq 'machine' -and (Test-OSyncWingetNeedsUserScope -PackageDir $pkgDir)) {
+                $actualScope = 'user'
+                Write-OSyncLog -Category 'winget' -Level 'Info' `
+                    -Message ("winget package {0}: overriding scope to 'user' (InstallerType is msix/appx)" -f $entry.Id) `
+                    -Data @{ Id = $entry.Id; ConfigScope = $scope; OverrideScope = 'user' } -Config $Config | Out-Null
+            }
+
+            # --skip-dependencies: when a YAML declares PackageDependencies,
+            # winget unconditionally resolves them against the configured
+            # source, which fails hard in an offline B-end (no source
+            # available).  We control the install order ourselves via
+            # packages.txt, so telling winget to skip its own dependency
+            # resolution is both safer and reliable.
             $installArgs = @(
                 'install',
                 '--manifest', ('"{0}"' -f $manifestDir),
-                '--scope', $scope,
+                '--scope', $actualScope,
                 '--architecture', $arch,
                 '--accept-package-agreements',
                 '--accept-source-agreements',
-                '--disable-interactivity'
+                '--disable-interactivity',
+                '--skip-dependencies'
             )
 
             Write-OSyncLog -Category 'winget' -Level 'Info' `
-                -Message ("Installing winget package {0} from manifest set {1}" -f $entry.Id, $manifestDir) `
-                -Data @{ Id = $entry.Id; Version = $entry.Version; ManifestDir = $manifestDir } -Config $Config | Out-Null
+                -Message ("Installing winget package {0} from manifest set {1} (scope={2})" -f $entry.Id, $manifestDir, $actualScope) `
+                -Data @{ Id = $entry.Id; Version = $entry.Version; ManifestDir = $manifestDir; Scope = $actualScope } -Config $Config | Out-Null
 
             $result = Invoke-OSyncWingetInstall -WingetExe $wingetExe -Arguments $installArgs
 
@@ -560,6 +695,15 @@ function Invoke-OSyncWingetApply {
                     -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256; ExitCode = $result.ExitCode } -Config $Config | Out-Null
             }
             else {
+                # 0x800700C7 = ERROR_INSTALL_SUSPEND / operation cancelled by
+                # user. Common when running under a non-interactive / S4U User
+                # principal: the MSI installer triggers a UAC prompt that times
+                # out because no user is present to confirm it. Log a clear
+                # hint so the operator knows this is not a networking error.
+                $uacHint = ''
+                if ($result.ExitCode -eq -2147023673) {
+                    $uacHint = ' (0x800700C7 = installation cancelled by user - likely UAC prompt timeout; consider SYSTEM principal or /quiet in installer switches)'
+                }
                 $failure = [pscustomobject]@{
                     Id       = $entry.Id
                     ExitCode = $result.ExitCode
@@ -567,7 +711,7 @@ function Invoke-OSyncWingetApply {
                 }
                 $failed += $failure
                 Write-OSyncLog -Category 'winget' -Level 'Warning' `
-                    -Message ("winget install FAILED for {0} (exit {1}) - recorded, continuing" -f $entry.Id, $result.ExitCode) `
+                    -Message ("winget install FAILED for {0} (exit {1}){2} - recorded, continuing" -f $entry.Id, $result.ExitCode, $uacHint) `
                     -Data $failure -Config $Config | Out-Null
             }
         }

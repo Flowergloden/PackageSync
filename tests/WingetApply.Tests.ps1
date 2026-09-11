@@ -458,7 +458,7 @@ Describe 'WingetApply: winget command line (fake winget .cmd)' {
         $files[0].Name | Should -Be '7-Zip_26.02_Machine_X64_wix_zh-CN.yaml'
     }
 
-    It 'flattens Dependencies\ subdirectory YAMLs into the staging dir (no subdirectories)' {
+    It 'excludes Dependencies\ subdirectory YAMLs from staging (different PackageIdentifier would confuse winget)' {
         $depDir = Join-Path $script:work 'winget\7zip.7zip\Dependencies'
         New-Item -ItemType Directory -Path $depDir -Force | Out-Null
         [System.IO.File]::WriteAllText((Join-Path $depDir 'Dep_1.0.0_Machine_X64_msi_en-US.yaml'),
@@ -470,9 +470,54 @@ Describe 'WingetApply: winget command line (fake winget .cmd)' {
         $report.ok.Count | Should -Be 1
 
         $staging = Join-Path (Join-Path $cfg.stateDir 'run') 'winget-manifests\7zip.7zip'
+        # Only the main YAML, NOT the Dependencies\ YAML (different PackageIdentifier).
         $files = @(Get-ChildItem -LiteralPath $staging -Recurse -File)
-        $files.Count | Should -Be 2
-        @(Get-ChildItem -LiteralPath $staging -Directory).Count | Should -Be 0
+        $files.Count | Should -Be 1
+        $files[0].Extension | Should -Be '.yaml'
+        $files[0].Name | Should -Be '7-Zip_26.02_Machine_X64_wix_zh-CN.yaml'
+    }
+
+    It 'detects msix/appx InstallerType and overrides scope to user' {
+        # Clear the accumulated record from earlier tests (the fake winget
+        # .cmd appends with >>).
+        Clear-Content -LiteralPath $script:recordFile -Force -ErrorAction SilentlyContinue
+
+        # Build a work copy with a MSIX manifest.
+        $work = Join-Path $TestDrive 'work-msix'
+        $pkgDir = Join-Path $work 'winget\Microsoft.PowerToys'
+        New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $pkgDir 'PowerToys_1.0.0_Machine_X64_msix_en-US.yaml'),
+            "PackageIdentifier: Microsoft.PowerToys`nPackageVersion: 1.0.0`nInstallers:`n- Architecture: x64`n  InstallerType: msix`n  InstallerUrl: http://127.0.0.1:8788/winget/Microsoft.PowerToys/installer.msix`n  InstallerSha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`nScope: user`nManifestType: merged`nManifestVersion: 1.12.0",
+            (New-Object System.Text.UTF8Encoding($true)))
+        [System.IO.File]::WriteAllBytes((Join-Path $pkgDir 'installer.msix'), [byte[]]@(1, 2, 3))
+        [System.IO.File]::WriteAllText((Join-Path $work 'winget\packages.txt'), "Microsoft.PowerToys@1.0.0`r`n", (New-Object System.Text.UTF8Encoding($true)))
+
+        # Config scope = 'machine', but MSIX should override to 'user'.
+        $cfg = [pscustomobject]@{
+            role     = 'B'
+            stateDir = (Join-Path $TestDrive 'state-msix')
+            httpPort = 8788
+            winget   = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
+        }
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config $cfg -WingetExePath $script:fakeWinget
+
+        # Verify the fake winget .cmd recorded --scope user instead of machine.
+        $recorded = Get-Content -LiteralPath $script:recordFile -Raw
+        $recorded -match '--scope user' | Should -BeTrue
+        $recorded -notmatch '--scope machine' | Should -BeTrue
+        $report.ok.Count | Should -Be 1
+    }
+
+    It 'does NOT override scope for non-MSIX packages (wix/msi/exe keep config scope)' {
+        Clear-Content -LiteralPath $script:recordFile -Force -ErrorAction SilentlyContinue
+
+        $cfg = & $script:NewCmdConfig (Join-Path $TestDrive 'state-cmd-nomsix')
+        $report = Invoke-OSyncWingetApply -WorkDir $script:work -Config $cfg -WingetExePath $script:fakeWinget
+
+        $recorded = Get-Content -LiteralPath $script:recordFile -Raw
+        $recorded -match '--scope machine' | Should -BeTrue
+        $report.ok.Count | Should -Be 1
     }
 
     It 're-derives winget.exe via Resolve-OSyncWingetExePath when no -WingetExePath is given' {
@@ -610,5 +655,87 @@ Describe 'WingetApply: state-match skip (P2 incremental)' {
         $report.ok[0].Id | Should -Be 'second.Pkg'
         $report.failed.Count | Should -Be 0
         Should -Invoke Invoke-OSyncWingetInstall -Times 1 -Scope It
+    }
+}
+
+Describe 'WingetApply: inline Dependencies stripping' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\ManifestParse.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\HttpServer.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\State.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetApply.ps1')
+    }
+
+    It 'Remove-OSyncWingetDependencies extracts deps and strips the block (indented Dependencies)' {
+        $yaml = @'
+PackageIdentifier: RequiresDep
+PackageVersion: 1.0.0
+Installers:
+  - Architecture: x64
+    InstallerType: wix
+    InstallerUrl: http://127.0.0.1:8788/installer.msi
+    InstallerSha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    Dependencies:
+      PackageDependencies:
+        - PackageIdentifier: Microsoft.DotNet.Runtime.8
+          MinimumVersion: 8.0.0
+        - PackageIdentifier: Microsoft.VCRedist.2015+
+ManifestType: merged
+ManifestVersion: 1.12.0
+'@
+        $result = Remove-OSyncWingetDependencies -YamlText $yaml
+        $result.Dependencies.Count | Should -Be 2
+        $result.Dependencies[0] | Should -Be 'Microsoft.DotNet.Runtime.8'
+        $result.Dependencies[1] | Should -Be 'Microsoft.VCRedist.2015+'
+        # The Dependencies block must be gone at ANY indentation level.
+        $result.CleanYaml -notmatch '(?m)^\s*Dependencies:' | Should -BeTrue
+        $result.CleanYaml -match '(?m)^PackageIdentifier: RequiresDep' | Should -BeTrue
+        $result.CleanYaml -match '(?m)^ManifestType: merged' | Should -BeTrue
+    }
+
+    It 'returns unchanged YAML when there is no Dependencies section' {
+        $yaml = @'
+PackageIdentifier: NoDeps
+PackageVersion: 1.0.0
+Installers:
+  - Architecture: x64
+    InstallerType: wix
+    InstallerUrl: http://127.0.0.1:8788/installer.msi
+    InstallerSha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ManifestType: merged
+ManifestVersion: 1.12.0
+'@
+        $result = Remove-OSyncWingetDependencies -YamlText $yaml
+        $result.Dependencies.Count | Should -Be 0
+        $result.CleanYaml | Should -Be $yaml
+    }
+
+    It 'stages a YAML that had Dependencies stripped from it (staging integration)' {
+        $work = Join-Path $TestDrive 'work-dep-strip'
+        $pkgDir = Join-Path $work 'winget\RequiresDep.Demo'
+        New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+        # Dependencies is indented at 4 spaces, as it appears under an Installers list item.
+        [System.IO.File]::WriteAllText((Join-Path $pkgDir 'RequiresDep_1.0.0.yaml'),
+            "PackageIdentifier: RequiresDep.Demo`nPackageVersion: 1.0.0`nInstallers:`n  - Architecture: x64`n    InstallerType: wix`n    InstallerUrl: http://127.0.0.1:8788/installer.msi`n    InstallerSha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`n    Dependencies:`n      PackageDependencies:`n        - PackageIdentifier: Some.Dep`nManifestType: merged`nManifestVersion: 1.12.0",
+            (New-Object System.Text.UTF8Encoding($true)))
+
+        $stagingRoot = Join-Path $TestDrive 'staging-dep'
+        $dir = New-OSyncWingetManifestStaging -PackageDir $pkgDir -StagingRoot $stagingRoot
+
+        $staged = Get-ChildItem -LiteralPath $dir -Filter '*.yaml' -File
+        $staged.Count | Should -Be 1
+        $text = [System.IO.File]::ReadAllText($staged[0].FullName, [System.Text.Encoding]::UTF8)
+        # Dependencies: must be gone at any indentation level.
+        $text -notmatch '(?m)^\s*Dependencies:' | Should -BeTrue
+        $text -match '(?m)^PackageIdentifier: RequiresDep.Demo' | Should -BeTrue
+        # Also verify the clean YAML is still valid (ManifestType: merged at EoF).
+        $text -match '(?m)^ManifestType: merged' | Should -BeTrue
+        # Verify no stray "Dependencies:" key survives anywhere in the output.
+        $text -match '(?m)^\s*Dependencies:' | Should -BeExactly $false
     }
 }
