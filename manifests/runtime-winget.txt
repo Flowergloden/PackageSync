@@ -1,6 +1,0 @@
-# Runtime bootstrap winget entries - consumed by the B-side bootstrap (todo 10/12).
-# Must contain Python.Python.3.<minor>@<ver> and OpenJS.NodeJS[.LTS]@<ver> when
-# the pip / npm categories are enabled.
-# Pinned on 2026-09-03 via: winget show --id Python.Python.3.12 -e / winget show --id OpenJS.NodeJS.LTS -e
-Python.Python.3.12@3.12.10
-OpenJS.NodeJS.LTS@24.19.0

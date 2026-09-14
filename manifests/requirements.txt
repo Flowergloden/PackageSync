@@ -1,4 +1,0 @@
-﻿# PakageSync pip requirements - every line MUST be pinned (==) for offline reproducibility.
-# Pinned on 2026-09-03 via: C:\Program Files\Python312\python.exe -m pip index versions six
-
-six==1.17.0

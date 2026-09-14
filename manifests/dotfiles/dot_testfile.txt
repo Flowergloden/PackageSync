@@ -1,5 +1,0 @@
-PakageSync dotfiles sample - plain chezmoi source-state file.
-When applied on B, chezmoi creates this file at the mapped target path
-(the dot_ prefix maps to a leading dot: dot_testfile.txt -> .testfile.txt).
-This content is intentionally plain ASCII so the source state stays
-encoding-clean across the SMB hop.
