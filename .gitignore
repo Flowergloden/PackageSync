@@ -12,3 +12,6 @@ staging/
 # Backups (state repair, npmrc backups, etc.)
 *.bak
 logs/
+# Exported manifests and config files
+/manifests/
+/config/
