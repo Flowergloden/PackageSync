@@ -3,22 +3,25 @@
   ManifestGenerate.ps1 - A-side interactive manifest generator for PakageSync.
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
 
-  Invoke-OSyncManifestGenerate -Config <config> [-Category winget,pip,npm,bun]
+  Invoke-OSyncManifestGenerate -Config <config> [-Category winget,pip,npm,bun,dotfiles]
     is the core of src\Export-Manifests.ps1 (the entry script is a thin
     wrapper that imports the module and maps success to the process exit
     code). It is a STANDALONE manual operator tool: it reads the installed
     package set from the A machine (winget export / pip freeze / npm ls -g
     / bun pm ls -g), lets the operator pick entries at the console
     (numbered multi-select), pins the picked entries to the installed
-    versions and writes them back into the manifests (winget-packages.txt
-    / requirements.txt / npm-packages.txt / bun-packages.txt). It never
-    touches the export/apply pipelines.
+    versions and writes them back into the package manifests. For dotfiles,
+    chezmoi unmanaged supplies top-level candidates; selected directories are
+    expanded in a second picker and only selected files/symlinks are added to
+    paths.dotfilesSource. It never touches the export/apply pipelines.
 
-    1. Per category: collect the installed packages (Get-OSyncInstalledWinget
+    1. For package categories, collect the installed packages (Get-OSyncInstalledWinget
        / Get-OSyncInstalledPip / Get-OSyncInstalledNpm /
-       Get-OSyncInstalledBun). The bun category is presence-gated: it is
-       skipped with an Info log (not an error) when the config has no
-       paths.bunList key.
+       Get-OSyncInstalledBun). For dotfiles, chezmoi unmanaged supplies top-level
+       files/directories, the first picker selects files or directories to expand,
+       and a second picker selects individual files/symlinks before chezmoi add.
+       The bun category is presence-gated: it is skipped with an Info log
+       (not an error) when the config has no paths.bunList key.
     2. Parse the existing manifest entries (Read-OSyncWingetList /
        Read-OSyncNpmList; pip requirements are classified line-wise with
        PEP 503 name normalization - lowercase, runs of [-_.] folded to a
@@ -48,10 +51,12 @@
   (documented gotcha).
 
   User decision: console numbered multi-select only (no Out-GridView);
-  only winget/pip/npm/bun participate (dotfiles has no per-entry
-  interaction; bun is opt-in via -Category, not in the default category
-  list);
-  the picker hard-fails when the session is not interactive (scheduled
+  winget/pip/npm/bun participate in the picker; dotfiles is also interactive:
+  chezmoi unmanaged supplies top-level candidates; selected directories are
+  recursively expanded in a second picker, and chezmoi add receives only the
+  selected files/symlinks. Bun is opt-in via -Category, not in the default
+  category list.
+  The picker hard-fails when the session is not interactive (scheduled
   task / non-interactive session); this is an A-side manual tool - it is
   never registered as a scheduled task.
 #>
@@ -432,7 +437,10 @@ function Show-OSyncEntryPicker {
         # the operator can answer 'none' and leave the manifest untouched.
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
-        [array]$Entries
+        [array]$Entries,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Expanded
     )
 
     if (-not [Environment]::UserInteractive) {
@@ -440,12 +448,30 @@ function Show-OSyncEntryPicker {
     }
 
     Write-Host ''
-    Write-Host "=== $Category - select entries to write into the manifest ===" -ForegroundColor Cyan
+    if ($Category -eq 'dotfiles') {
+        if ($Expanded) {
+            Write-Host '=== dotfiles - select files/symlinks from expanded directories ===' -ForegroundColor Cyan
+            $prompt = "Enter numbers / ranges / comma lists (e.g. 1,3,5-8), 'all', 'none', or just Enter to skip adding:"
+        }
+        else {
+            Write-Host '=== dotfiles - select files/directories (directories will be expanded) ===' -ForegroundColor Cyan
+            $prompt = "Enter numbers / ranges / comma lists (e.g. 1,3,5-8), 'all', 'none', or just Enter to add files or expand directories:"
+        }
+    }
+    else {
+        Write-Host "=== $Category - select entries to write into the manifest ===" -ForegroundColor Cyan
+        $prompt = "Enter numbers / ranges / comma lists (e.g. 1,3,5-8), 'all', 'none', or just Enter to keep the current selection:"
+    }
     for ($i = 0; $i -lt $Entries.Count; $i++) {
         $state = if ($Entries[$i].Preselected) { '[x]' } else { '[ ]' }
-        Write-Host ('{0} {1,3}  {2}' -f $state, ($i + 1), $Entries[$i].Display)
+        $display = [string]$Entries[$i].Display
+        if ($Entries[$i].PSObject.Properties['IsDirectory'] -and [bool]$Entries[$i].IsDirectory) {
+            $display += '\'
+        }
+        Write-Host ('{0} {1,3}  {2}' -f $state, ($i + 1), $display)
     }
-    Write-Host "Enter numbers / ranges / comma lists (e.g. 1,3,5-8), 'all', 'none', or just Enter to keep the current selection:" -ForegroundColor Cyan
+
+    Write-Host $prompt -ForegroundColor Cyan
 
     $selected = $null
     while ($true) {
@@ -470,11 +496,16 @@ function Show-OSyncEntryPicker {
             # Enter pressed - keep the current selection.
             $isSelected = [bool]$Entries[$i].Preselected
         }
+        $isDirectory = $false
+        if ($Entries[$i].PSObject.Properties['IsDirectory']) {
+            $isDirectory = [bool]$Entries[$i].IsDirectory
+        }
         $result += [pscustomobject]@{
             Key         = $Entries[$i].Key
             Display     = $Entries[$i].Display
             Preselected = [bool]$Entries[$i].Preselected
             PinnedText  = $Entries[$i].PinnedText
+            IsDirectory = $isDirectory
             Selected    = $isSelected
         }
     }
@@ -639,6 +670,502 @@ function Write-OSyncManifestGenerate {
     return [pscustomobject]@{ Changed = $true; BackupPath = $backupPath }
 }
 
+function Resolve-OSyncChezmoiExe {
+    <#
+    .SYNOPSIS
+        Resolves the locally installed chezmoi executable used by the
+        interactive dotfiles picker.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$ChezmoiExe
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ChezmoiExe)) {
+        return $ChezmoiExe
+    }
+
+    $cmd = Get-Command chezmoi.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $cmd) {
+        $cmd = Get-Command chezmoi -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    }
+    if ($null -eq $cmd) {
+        throw "Resolve-OSyncChezmoiExe: 'chezmoi' was not found on PATH. Install chezmoi before selecting dotfiles."
+    }
+
+    $resolved = [string]$cmd.Source
+    if ([string]::IsNullOrWhiteSpace($resolved)) { $resolved = [string]$cmd.Path }
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        throw "Resolve-OSyncChezmoiExe: found 'chezmoi' but could not resolve its executable path."
+    }
+    return $resolved
+}
+
+function Get-OSyncChezmoiDotfilesArgs {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDir,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ConfigFile,
+
+        [Parameter(Mandatory = $false)]
+        [string]$DestinationDir
+    )
+
+    $arguments = @()
+    if (-not [string]::IsNullOrWhiteSpace($ConfigFile)) {
+        $arguments += @('--config', $ConfigFile)
+    }
+    $arguments += @('--source', $SourceDir)
+    if (-not [string]::IsNullOrWhiteSpace($DestinationDir)) { $arguments += @('--destination', $DestinationDir) }
+    return $arguments
+}
+
+function ConvertTo-OSyncDotfilePathKey {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return ([string]$Path).Trim().Replace('/', '\').TrimStart([char[]]'\/').ToLowerInvariant()
+}
+
+function ConvertTo-OSyncDotfileRelativePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $destinationFull = [System.IO.Path]::GetFullPath($DestinationDir).TrimEnd([char[]]'\/')
+    $pathFull = [System.IO.Path]::GetFullPath($Path)
+    $prefix = $destinationFull + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $pathFull.Equals($destinationFull, [System.StringComparison]::OrdinalIgnoreCase) -and
+        -not $pathFull.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "ConvertTo-OSyncDotfileRelativePath: path '$Path' is outside destination '$DestinationDir'."
+    }
+    if ($pathFull.Equals($destinationFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return ''
+    }
+    return $pathFull.Substring($destinationFull.Length).TrimStart([char[]]'\/').Replace('/', '\')
+}
+
+function New-OSyncDotfileCandidate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RelativePath,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$IsDirectory
+    )
+
+    $display = ([string]$RelativePath).Trim().Replace('/', '\')
+    return [pscustomobject]@{
+        Key         = (ConvertTo-OSyncDotfilePathKey -Path $display)
+        Display     = $display
+        Preselected = $false
+        PinnedText  = $display
+        IsDirectory = [bool]$IsDirectory
+    }
+}
+
+function Get-OSyncManagedDotfilePaths {
+    <#
+    .SYNOPSIS
+        Gets relative target paths already managed by chezmoi.
+
+    .DESCRIPTION
+        Recursive directory expansion is performed against the destination
+        filesystem. The managed set prevents files already present in the
+        source state from being offered again when their parent directory is
+        expanded.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ChezmoiExe,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDir,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ConfigFile,
+
+        [Parameter(Mandatory = $false)]
+        [string]$DestinationDir
+    )
+
+    $arguments = @(Get-OSyncChezmoiDotfilesArgs -SourceDir $SourceDir -ConfigFile $ConfigFile -DestinationDir $DestinationDir)
+    $arguments += @('--no-pager', 'managed', '--include', 'files,dirs,symlinks', '--path-style', 'relative')
+    $command = Invoke-OSyncChezmoiTextCommand -ChezmoiExe $ChezmoiExe -Arguments $arguments -TimeoutMs 120000
+    if ($command.TimedOut -or $command.ExitCode -ne 0) {
+        $detail = ([string]$command.Stderr).Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = 'no stderr output' }
+        throw "Get-OSyncManagedDotfilePaths: 'chezmoi managed' failed with exit code $($command.ExitCode): $detail"
+    }
+
+    $result = @{}
+    $stdout = [string]$command.Stdout
+    if ([string]::IsNullOrWhiteSpace($stdout)) { return $result }
+    foreach ($line in ($stdout -split "`r?`n")) {
+        $target = ([string]$line).Trim()
+        if ([string]::IsNullOrWhiteSpace($target)) { continue }
+        $result[(ConvertTo-OSyncDotfilePathKey -Path $target)] = $true
+    }
+    return $result
+}
+
+function Expand-OSyncUnmanagedDotfileDirectories {
+    <#
+    .SYNOPSIS
+        Recursively expands unmanaged directory candidates to files.
+
+    .DESCRIPTION
+        The unmanaged command reports an unmanaged directory as one path. Do
+        not pass that directory to `chezmoi add`, because it may contain large
+        caches, databases, binaries, or unsupported reparse points. Instead,
+        enumerate its descendants and offer only individual files and
+        symlinks. Reparse-point directories are skipped to avoid crossing
+        Windows compatibility links such as AppData\Local\Application Data.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [array]$Entries,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDir,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$ManagedPaths = @{}
+    )
+
+    $result = @()
+    $seen = @{}
+    $managed = if ($null -eq $ManagedPaths) { @{} } else { $ManagedPaths }
+    $destinationFull = [System.IO.Path]::GetFullPath($DestinationDir)
+
+    foreach ($entry in $Entries) {
+        $relative = ([string]$entry.Display).Trim().Replace('/', '\')
+        if ([string]::IsNullOrWhiteSpace($relative)) { continue }
+        $absolute = if ([System.IO.Path]::IsPathRooted($relative)) {
+            [System.IO.Path]::GetFullPath($relative)
+        }
+        else {
+            [System.IO.Path]::GetFullPath((Join-Path -Path $destinationFull -ChildPath $relative))
+        }
+
+        $item = Get-Item -LiteralPath $absolute -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item) {
+            Write-Warning "Expand-OSyncUnmanagedDotfileDirectories: target '$relative' disappeared before expansion; skipped."
+            continue
+        }
+
+        $isReparsePoint = (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+        if (-not $item.PSIsContainer -or $isReparsePoint) {
+            if ($isReparsePoint -and $item.PSIsContainer) {
+                continue
+            }
+            $candidateKey = ConvertTo-OSyncDotfilePathKey -Path $relative
+            if (-not $managed.ContainsKey($candidateKey) -and -not $seen.ContainsKey($candidateKey)) {
+                $seen[$candidateKey] = $true
+                $result += @(New-OSyncDotfileCandidate -RelativePath $relative)
+            }
+            continue
+        }
+
+        $pending = New-Object 'System.Collections.Generic.Queue[string]'
+        $pending.Enqueue($item.FullName)
+        while ($pending.Count -gt 0) {
+            $current = $pending.Dequeue()
+            try {
+                $children = @(Get-ChildItem -LiteralPath $current -Force -ErrorAction Stop | Sort-Object -Property FullName)
+            }
+            catch {
+                Write-Warning "Expand-OSyncUnmanagedDotfileDirectories: cannot enumerate '$current'; skipped: $($_.Exception.Message)"
+                continue
+            }
+
+            foreach ($child in $children) {
+                $childRelative = ConvertTo-OSyncDotfileRelativePath -DestinationDir $destinationFull -Path $child.FullName
+                if ([string]::IsNullOrWhiteSpace($childRelative)) { continue }
+                $childKey = ConvertTo-OSyncDotfilePathKey -Path $childRelative
+                $childIsReparsePoint = (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+                if ($child.PSIsContainer -and -not $childIsReparsePoint) {
+                    $pending.Enqueue($child.FullName)
+                    continue
+                }
+                if ($childIsReparsePoint -and $child.PSIsContainer) {
+                    continue
+                }
+                if ($managed.ContainsKey($childKey) -or $seen.ContainsKey($childKey)) { continue }
+                $seen[$childKey] = $true
+                $result += @(New-OSyncDotfileCandidate -RelativePath $childRelative)
+            }
+        }
+    }
+
+    return @($result)
+}
+
+function Get-OSyncUnmanagedDotfiles {
+    <#
+    .SYNOPSIS
+        Gets top-level unmanaged target files, directories, and symlinks from
+        chezmoi. Directory candidates are expanded only after the operator
+        selects them in the first picker.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ChezmoiExe,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDir,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ConfigFile,
+
+        [Parameter(Mandatory = $false)]
+        [string]$DestinationDir
+    )
+
+    $arguments = @(Get-OSyncChezmoiDotfilesArgs -SourceDir $SourceDir -ConfigFile $ConfigFile -DestinationDir $DestinationDir)
+    $arguments += @('--no-pager', 'unmanaged', '--include', 'files,dirs,symlinks', '--path-style', 'relative')
+    $command = Invoke-OSyncChezmoiTextCommand -ChezmoiExe $ChezmoiExe -Arguments $arguments -TimeoutMs 120000
+    if ($command.TimedOut -or $command.ExitCode -ne 0) {
+        $detail = ([string]$command.Stderr).Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = 'no stderr output' }
+        throw "Get-OSyncUnmanagedDotfiles: 'chezmoi unmanaged' failed with exit code $($command.ExitCode): $detail"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DestinationDir)) {
+        throw 'Get-OSyncUnmanagedDotfiles: DestinationDir is required to identify directory candidates.'
+    }
+
+    $result = @()
+    $seen = @{}
+    $stdout = [string]$command.Stdout
+    if ([string]::IsNullOrWhiteSpace($stdout)) { return $result }
+    foreach ($line in ($stdout -split "`r?`n")) {
+        $target = ([string]$line).Trim().Replace('/', '\')
+        if ([string]::IsNullOrWhiteSpace($target)) { continue }
+        $key = ConvertTo-OSyncDotfilePathKey -Path $target
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $absolute = [System.IO.Path]::GetFullPath((Join-Path -Path $DestinationDir -ChildPath $target))
+        $item = Get-Item -LiteralPath $absolute -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item) {
+            Write-Warning "Get-OSyncUnmanagedDotfiles: target '$target' disappeared before picker display; skipped."
+            continue
+        }
+        $isDirectory = $item.PSIsContainer -and (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0)
+        $result += @(New-OSyncDotfileCandidate -RelativePath $target -IsDirectory:$isDirectory)
+    }
+    return @($result)
+}
+function Add-OSyncDotfilesWithChezmoi {
+    <#
+    .SYNOPSIS
+        Adds selected target paths to the configured chezmoi source state.
+        Large selections are split into safe command-line batches.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ChezmoiExe,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDir,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ConfigFile,
+
+        [Parameter(Mandatory = $false)]
+        [string]$DestinationDir,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$TargetPaths
+    )
+
+    if ($TargetPaths.Count -eq 0) {
+        return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Stdout = ''; Stderr = '' }
+    }
+
+    $baseArguments = @(Get-OSyncChezmoiDotfilesArgs -SourceDir $SourceDir -ConfigFile $ConfigFile -DestinationDir $DestinationDir)
+    $baseArguments += 'add'
+    # chezmoi resolves add targets relative to the caller's working directory,
+    # not --destination. Convert the relative paths emitted by unmanaged to
+    # absolute destination paths so files and directories are added correctly.
+    $absoluteTargetPaths = @()
+    foreach ($targetPath in $TargetPaths) {
+        $targetText = [string]$targetPath
+        if ([System.IO.Path]::IsPathRooted($targetText)) {
+            $absoluteTargetPaths += [System.IO.Path]::GetFullPath($targetText)
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($DestinationDir)) {
+            throw "Add-OSyncDotfilesWithChezmoi: DestinationDir is required for relative target paths."
+        }
+        $absoluteTargetPaths += [System.IO.Path]::GetFullPath((Join-Path -Path $DestinationDir -ChildPath $targetText))
+    }
+
+    # Windows CreateProcess rejects an overlong command line. Keep a generous
+    # margin below the documented ~32K limit because ProcessStartInfo also
+    # includes the executable and native argument parsing overhead.
+    $maxCommandLineLength = 24000
+    $batches = @()
+    $currentBatch = @()
+    foreach ($targetPath in $absoluteTargetPaths) {
+        $trialArguments = @($baseArguments) + @($currentBatch) + @($targetPath)
+        $trialLength = (ConvertTo-OSyncQuotedArgs -ArgList $trialArguments).Length
+        if ($currentBatch.Count -gt 0 -and $trialLength -gt $maxCommandLineLength) {
+            $batches += ,@($currentBatch)
+            $currentBatch = @($targetPath)
+            $trialArguments = @($baseArguments) + @($currentBatch)
+            $trialLength = (ConvertTo-OSyncQuotedArgs -ArgList $trialArguments).Length
+        }
+        if ($trialLength -gt $maxCommandLineLength) {
+            throw "Add-OSyncDotfilesWithChezmoi: a single target path makes the chezmoi command line exceed $maxCommandLineLength characters: '$targetPath'."
+        }
+        if ($currentBatch.Count -eq 0) {
+            $currentBatch = @($targetPath)
+        }
+        elseif ($currentBatch[-1] -ne $targetPath) {
+            $currentBatch += $targetPath
+        }
+    }
+    if ($currentBatch.Count -gt 0) { $batches += ,@($currentBatch) }
+
+    $stdoutParts = @()
+    $stderrParts = @()
+    for ($batchIndex = 0; $batchIndex -lt $batches.Count; $batchIndex++) {
+        $batch = @($batches[$batchIndex])
+        $arguments = @($baseArguments) + @($batch)
+        if ($batches.Count -gt 1) {
+            Write-Host "Adding chezmoi dotfiles batch $($batchIndex + 1)/$($batches.Count) ($($batch.Count) path(s))..." -ForegroundColor Cyan
+        }
+        $command = Invoke-OSyncChezmoiTextCommand -ChezmoiExe $ChezmoiExe -Arguments $arguments -TimeoutMs 600000
+        if ($command.TimedOut -or $command.ExitCode -ne 0) {
+            $detail = ([string]$command.Stderr).Trim()
+            if ([string]::IsNullOrWhiteSpace($detail)) { $detail = 'no stderr output' }
+            throw "Add-OSyncDotfilesWithChezmoi: 'chezmoi add' batch $($batchIndex + 1)/$($batches.Count) failed with exit code $($command.ExitCode): $detail"
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$command.Stdout)) { $stdoutParts += [string]$command.Stdout }
+        if (-not [string]::IsNullOrWhiteSpace([string]$command.Stderr)) { $stderrParts += [string]$command.Stderr }
+    }
+
+    return [pscustomobject]@{
+        ExitCode   = 0
+        TimedOut   = $false
+        Stdout     = ($stdoutParts -join "`r`n")
+        Stderr     = ($stderrParts -join "`r`n")
+        BatchCount = $batches.Count
+    }
+}
+
+function Invoke-OSyncManifestGenerateDotfiles {
+    <#
+    .SYNOPSIS
+        Interactively selects unmanaged user files and adds them with chezmoi.
+
+    .DESCRIPTION
+        The dotfiles source directory is the manifest. `chezmoi unmanaged`
+        supplies top-level candidate files/directories; the first picker selects
+        files or directories to expand, and a second picker selects individual
+        files/symlinks. `chezmoi add` receives only those final selected paths.
+        Existing source-state files are already managed and do not appear as
+        candidates.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+
+    $sourceValue = [string](Get-ONestedValue -Object $Config -Path 'paths.dotfilesSource')
+    if ([string]::IsNullOrWhiteSpace($sourceValue)) {
+        throw "Invoke-OSyncManifestGenerateDotfiles: config key 'paths.dotfilesSource' is empty."
+    }
+    $sourceDir = Resolve-OSyncConfigPath -Config $Config -Path $sourceValue
+    $destinationDir = [Environment]::GetFolderPath('UserProfile')
+    if ([string]::IsNullOrWhiteSpace($destinationDir)) { $destinationDir = [string]$env:USERPROFILE }
+    $sourceFull = [System.IO.Path]::GetFullPath($sourceDir).TrimEnd([char[]]'\/')
+    $destinationFull = [System.IO.Path]::GetFullPath($destinationDir).TrimEnd([char[]]'\/')
+    if ($sourceFull.Equals($destinationFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Invoke-OSyncManifestGenerateDotfiles: paths.dotfilesSource '$sourceDir' equals the chezmoi destination '$destinationDir'. Set paths.dotfilesSource to a separate source-state directory such as 'manifests\dotfiles'; the user profile is the destination, not the source state."
+    }
+    if (-not (Test-Path -LiteralPath $sourceDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $sourceDir -Force | Out-Null
+    }
+
+    $chezmoiExe = Resolve-OSyncChezmoiExe
+    $configFile = Resolve-OSyncConfigPath -Config $Config -Path 'manifests\dotfiles.toml'
+    if (-not (Test-Path -LiteralPath $configFile -PathType Leaf)) { $configFile = $null }
+
+    Write-Host "Source state: $sourceDir"
+    $candidates = @(Get-OSyncUnmanagedDotfiles -ChezmoiExe $chezmoiExe -SourceDir $sourceDir -ConfigFile $configFile -DestinationDir $destinationDir)
+    if ($candidates.Count -eq 0) {
+        Write-Host 'No unmanaged dotfiles were reported by chezmoi.' -ForegroundColor Yellow
+        Write-OSyncLog -Category 'export' -Level Info -Message "manifest generate: dotfiles has no unmanaged target paths; source '$sourceDir' unchanged." -Config $Config | Out-Null
+        return @{ Selected = 0; Changed = $false; BackupPath = $null }
+    }
+
+    $picked = @(Show-OSyncEntryPicker -Category 'dotfiles' -Entries $candidates)
+    $selectedTopLevel = @($picked | Where-Object { $_.Selected })
+    $selectedFiles = @($selectedTopLevel | Where-Object { -not [bool]$_.IsDirectory })
+    $selectedDirectories = @($selectedTopLevel | Where-Object { [bool]$_.IsDirectory })
+    Write-OSyncLog -Category 'export' -Level Info -Message "manifest generate: dotfiles operator selected $($selectedTopLevel.Count) of $($candidates.Count) top-level paths ($($selectedFiles.Count) files, $($selectedDirectories.Count) directories)." -Config $Config | Out-Null
+
+    if ($selectedTopLevel.Count -eq 0) {
+        Write-OSyncLog -Category 'export' -Level Warning -Message "manifest generate: dotfiles 未选中任何条目，源态保持原样不动" -Config $Config | Out-Null
+        return @{ Selected = 0; Changed = $false; BackupPath = $null }
+    }
+
+    if ($selectedDirectories.Count -gt 0) {
+        Write-Host "Expanding $($selectedDirectories.Count) selected dotfile director$(if($selectedDirectories.Count -eq 1){'y'}else{'ies'})..." -ForegroundColor Cyan
+        $managedPaths = Get-OSyncManagedDotfilePaths -ChezmoiExe $chezmoiExe -SourceDir $sourceDir -ConfigFile $configFile -DestinationDir $destinationDir
+        $expandedCandidates = @(Expand-OSyncUnmanagedDotfileDirectories -Entries $selectedDirectories -DestinationDir $destinationDir -ManagedPaths $managedPaths)
+        if ($expandedCandidates.Count -eq 0) {
+            Write-Host 'No unmanaged files or symlinks were found under the selected directories.' -ForegroundColor Yellow
+        }
+        else {
+            $expandedPicked = @(Show-OSyncEntryPicker -Category 'dotfiles' -Entries $expandedCandidates -Expanded)
+            $selectedFiles += @($expandedPicked | Where-Object { $_.Selected })
+        }
+    }
+
+    $selected = @($selectedFiles)
+    if ($selected.Count -eq 0) {
+        Write-OSyncLog -Category 'export' -Level Warning -Message "manifest generate: dotfiles 未选中任何文件或符号链接，源态保持原样不动" -Config $Config | Out-Null
+        return @{ Selected = 0; Changed = $false; BackupPath = $null }
+    }
+
+    $targetPaths = @($selected | ForEach-Object { [string]$_.PinnedText })
+    Write-Host "Adding $($targetPaths.Count) dotfiles file(s)/symlink(s) with chezmoi..." -ForegroundColor Cyan
+    $command = Add-OSyncDotfilesWithChezmoi -ChezmoiExe $chezmoiExe -SourceDir $sourceDir -ConfigFile $configFile -DestinationDir $destinationDir -TargetPaths $targetPaths
+    $commandOutput = ([string]$command.Stdout).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($commandOutput)) {
+        foreach ($line in ($commandOutput -split "`r?`n")) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) { Write-Host "chezmoi: $line" }
+        }
+    }
+    Write-OSyncLog -Category 'export' -Level Info -Message "manifest generate: dotfiles added $($targetPaths.Count) file(s)/symlink(s) to '$sourceDir'." -Config $Config | Out-Null
+    return @{ Selected = $targetPaths.Count; Changed = $true; BackupPath = $null }
+}
+
 function Invoke-OSyncManifestGenerateCategory {
     <#
     .SYNOPSIS
@@ -776,17 +1303,17 @@ function Invoke-OSyncManifestGenerate {
         Runs the interactive manifest generator for every requested category.
 
     .DESCRIPTION
-        For each of winget/pip/npm/bun in $Category (other categories are
-        ignored - dotfiles has no per-entry interaction) it resolves the
-        manifest path via Resolve-OSyncConfigPath (paths.wingetWhitelist /
+        For each of winget/pip/npm/bun in $Category it resolves the manifest
+        path via Resolve-OSyncConfigPath (paths.wingetWhitelist /
         paths.requirements / paths.npmList / paths.bunList), collects the
         installed packages, merges them with the existing manifest entries,
-        shows the picker and writes the selection back. The bun category is
-        presence-gated: it is skipped (Info log, not an error) when the
-        config has no paths.bunList key. One category's failure (e.g.
-        winget unavailable) is logged as Error and does not block the
-        others.
-
+        shows the picker and writes the selection back. The dotfiles category
+        uses chezmoi unmanaged for top-level candidates, recursively expands
+        selected directories in a second picker, and passes only selected files
+        or symlinks to chezmoi add. The bun category is presence-gated: it is skipped
+        (Info log, not an error) when the config has no paths.bunList key. One category's failure
+        (e.g. winget unavailable) is logged as Error and does not block the other
+        categories.
         Returns a hashtable of category -> @{ Selected = <int>; Changed =
         <bool>; BackupPath = <path or $null> }. All Write-OSyncLog calls
         are piped to Out-Null (documented gotcha).
@@ -797,7 +1324,7 @@ function Invoke-OSyncManifestGenerate {
         $Config,
 
         [Parameter(Mandatory = $false)]
-        [string[]]$Category = @('winget', 'pip', 'npm')
+        [string[]]$Category = @('winget', 'pip', 'npm', 'dotfiles')
     )
 
     $pathKeys = @{
@@ -811,7 +1338,18 @@ function Invoke-OSyncManifestGenerate {
 
     $result = @{}
     foreach ($cat in $Category) {
-        if ($cat -notin @('winget', 'pip', 'npm', 'bun')) { continue }
+        if ($cat -notin @('winget', 'pip', 'npm', 'bun', 'dotfiles')) { continue }
+        if ($cat -eq 'dotfiles') {
+            try {
+                $result[$cat] = Invoke-OSyncManifestGenerateDotfiles -Config $Config
+            }
+            catch {
+                Write-Host "Export-Manifests: dotfiles FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                Write-OSyncLog -Category 'export' -Level Error -Message "manifest generate: category 'dotfiles' FAILED: $($_.Exception.Message)" -Config $Config | Out-Null
+                $result[$cat] = @{ Selected = 0; Changed = $false; BackupPath = $null }
+            }
+            continue
+        }
         # bun is presence-gated: no paths.bunList = bun not enabled - skip
         # with an Info log instead of letting Resolve-OSyncConfigPath throw
         # on the $null path (an old config without the bun keys must not

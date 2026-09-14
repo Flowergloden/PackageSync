@@ -30,6 +30,7 @@ Describe 'ManifestGenerate' {
         . (Join-Path $PSScriptRoot '..\src\lib\ManifestParse.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\PipExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\DotfilesApply.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\ManifestGenerate.ps1')
 
         # --- config helper: writes a full valid packagesync config JSON ---
@@ -680,6 +681,158 @@ Describe 'ManifestGenerate' {
             Test-Path -LiteralPath (Join-Path $script:ManifestsDir 'bun-packages.txt') | Should -BeFalse
         }
 
+        It 'expands selected directories and adds only selected files' {
+            $configPath = New-OTestConfigFile -ToolRoot $script:ToolRoot -RepoRoot $script:RepoRoot
+            $config = Get-OSyncConfig -Path $configPath
+            $script:ChezmoiCalls = @()
+            $script:PickerCalls = @()
+            $script:LogMessages = @()
+
+            Mock Write-OSyncLog {
+                param($Category, $Level, $Message, $Data, $Config, $LogDir)
+                $script:LogMessages += $Message
+            }
+            Mock Resolve-OSyncChezmoiExe { return 'fake-chezmoi.exe' }
+            Mock Get-OSyncUnmanagedDotfiles {
+                return @(
+                    [pscustomobject]@{ Key = '.config'; Display = '.config'; Preselected = $false; PinnedText = '.config'; IsDirectory = $true }
+                    [pscustomobject]@{ Key = '.gitconfig'; Display = '.gitconfig'; Preselected = $false; PinnedText = '.gitconfig'; IsDirectory = $false }
+                )
+            }
+            Mock Get-OSyncManagedDotfilePaths { return @{} }
+            Mock Expand-OSyncUnmanagedDotfileDirectories {
+                return @(
+                    [pscustomobject]@{ Key = '.config\one.txt'; Display = '.config\one.txt'; Preselected = $false; PinnedText = '.config\one.txt'; IsDirectory = $false }
+                    [pscustomobject]@{ Key = '.config\two.txt'; Display = '.config\two.txt'; Preselected = $false; PinnedText = '.config\two.txt'; IsDirectory = $false }
+                )
+            }
+            Mock Invoke-OSyncChezmoiTextCommand {
+                param($ChezmoiExe, $Arguments, $TimeoutMs)
+                $script:ChezmoiCalls += ,@($Arguments)
+                return [pscustomobject]@{
+                    ExitCode = 0
+                    TimedOut = $false
+                    Stdout   = 'added selected files'
+                    Stderr   = ''
+                }
+            }
+            Mock Show-OSyncEntryPicker {
+                param($Category, $Entries, $Expanded)
+                $isExpanded = [bool]$Expanded
+                $script:PickerCalls += [pscustomobject]@{ Expanded = $isExpanded; Entries = @($Entries) }
+                return @($Entries | ForEach-Object {
+                    [pscustomobject]@{
+                        Key         = $_.Key
+                        Display     = $_.Display
+                        Preselected = $_.Preselected
+                        PinnedText  = $_.PinnedText
+                        IsDirectory = $_.IsDirectory
+                        Selected    = if ($isExpanded) { $_.Display -eq '.config\one.txt' } else { $_.Display -in @('.config', '.gitconfig') }
+                    }
+                })
+            }
+
+            $result = Invoke-OSyncManifestGenerate -Config $config -Category @('dotfiles')
+
+            $result['dotfiles'].Selected | Should -Be 2
+            $result['dotfiles'].Changed | Should -BeTrue
+            $script:PickerCalls.Count | Should -Be 2
+            $script:PickerCalls[0].Expanded | Should -BeFalse
+            $script:PickerCalls[0].Entries[0].IsDirectory | Should -BeTrue
+            $script:PickerCalls[1].Expanded | Should -BeTrue
+            $script:PickerCalls[1].Entries.Count | Should -Be 2
+            $addCall = @($script:ChezmoiCalls | Where-Object { $_ -contains 'add' })[0]
+            $addCall | Should -Not -BeNullOrEmpty
+            $addCall | Should -Contain (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config\one.txt')
+            $addCall | Should -Contain (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.gitconfig')
+            $addCall | Should -Not -Contain (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config')
+            @($script:LogMessages | Where-Object { $_ -match 'dotfiles added 2 file' }).Count | Should -Be 1
+        }
+
+        It 'batches long chezmoi add command lines' {
+            $script:ChezmoiCalls = @()
+            Mock Invoke-OSyncChezmoiTextCommand {
+                param($ChezmoiExe, $Arguments, $TimeoutMs)
+                $script:ChezmoiCalls += ,@($Arguments)
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Stdout = ''; Stderr = '' }
+            }
+
+            $targetPaths = @(1..500 | ForEach-Object {
+                ".config\long-folder\file-$($_)-$([string]('x' * 40)).json"
+            })
+            $result = Add-OSyncDotfilesWithChezmoi -ChezmoiExe 'fake-chezmoi.exe' -SourceDir (Join-Path $TestDrive 'source') -DestinationDir (Join-Path $TestDrive 'destination') -TargetPaths $targetPaths
+
+            $result.BatchCount | Should -BeGreaterThan 1
+            $script:ChezmoiCalls.Count | Should -Be $result.BatchCount
+            @($script:ChezmoiCalls | ForEach-Object { (ConvertTo-OSyncQuotedArgs -ArgList $_).Length } | Where-Object { $_ -gt 24000 }).Count | Should -Be 0
+        }
+        It 'recursively expands files and skips managed paths' {
+            $destination = Join-Path $TestDrive 'dotfiles-destination'
+            New-Item -ItemType Directory -Path (Join-Path $destination '.config\nested') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $destination '.config\one.txt') -Value 'one' -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $destination '.config\nested\two.txt') -Value 'two' -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path $destination '.config\nested\managed.txt') -Value 'managed' -Encoding UTF8
+            $entries = @([pscustomobject]@{ Display = '.config'; IsDirectory = $true })
+            $managed = @{ '.config\nested\managed.txt' = $true }
+
+            $expanded = @(Expand-OSyncUnmanagedDotfileDirectories -Entries $entries -DestinationDir $destination -ManagedPaths $managed)
+
+            @($expanded | ForEach-Object Display) | Should -Contain '.config\one.txt'
+            @($expanded | ForEach-Object Display) | Should -Contain '.config\nested\two.txt'
+            @($expanded | Where-Object { $_.IsDirectory }).Count | Should -Be 0
+            @($expanded | Where-Object { $_.Display -eq '.config\nested\managed.txt' }).Count | Should -Be 0
+        }
+
+        It 'requests files, directories and symlinks from chezmoi for top-level candidates' {
+            $configPath = New-OTestConfigFile -ToolRoot $script:ToolRoot -RepoRoot $script:RepoRoot
+            $config = Get-OSyncConfig -Path $configPath
+            $destination = Join-Path $TestDrive 'unmanaged-destination'
+            New-Item -ItemType Directory -Path (Join-Path $destination '.config') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $destination '.config\one.txt') -Value 'one' -Encoding UTF8
+            $script:ChezmoiCalls = @()
+
+            Mock Invoke-OSyncChezmoiTextCommand {
+                param($ChezmoiExe, $Arguments, $TimeoutMs)
+                $script:ChezmoiCalls += ,@($Arguments)
+                if ($Arguments -contains 'unmanaged') {
+                    return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Stdout = '.config'; Stderr = '' }
+                }
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Stdout = ''; Stderr = '' }
+            }
+
+            $result = Get-OSyncUnmanagedDotfiles -ChezmoiExe 'fake-chezmoi.exe' -SourceDir $script:ManifestsDir -DestinationDir $destination
+
+            $result.Count | Should -Be 1
+            $result[0].IsDirectory | Should -BeTrue
+            $unmanagedCall = @($script:ChezmoiCalls | Where-Object { $_ -contains 'unmanaged' })[0]
+            $unmanagedCall | Should -Contain '--include'
+            $unmanagedCall | Should -Contain 'files,dirs,symlinks'
+        }
+        It 'rejects a dotfiles source state that equals the chezmoi destination' {
+            $configPath = New-OTestConfigFile -ToolRoot $script:ToolRoot -RepoRoot $script:RepoRoot
+            $config = Get-OSyncConfig -Path $configPath
+            $config.paths.dotfilesSource = $env:USERPROFILE
+
+            { Invoke-OSyncManifestGenerateDotfiles -Config $config } | Should -Throw '*equals the chezmoi destination*'
+        }
+        It 'includes dotfiles in the default category filter' {
+            $configPath = New-OTestConfigFile -ToolRoot $script:ToolRoot -RepoRoot $script:RepoRoot
+            $config = Get-OSyncConfig -Path $configPath
+            Mock Write-OSyncLog { }
+            Mock Invoke-OSyncManifestGenerateCategory {
+                return @{ Selected = 0; Changed = $false; BackupPath = $null }
+            }
+            Mock Invoke-OSyncManifestGenerateDotfiles {
+                return @{ Selected = 0; Changed = $false; BackupPath = $null }
+            }
+
+            $result = Invoke-OSyncManifestGenerate -Config $config
+
+            $result.ContainsKey('winget') | Should -BeTrue
+            $result.ContainsKey('pip') | Should -BeTrue
+            $result.ContainsKey('npm') | Should -BeTrue
+            $result.ContainsKey('dotfiles') | Should -BeTrue
+        }
         It 'isolates a failing category and continues with the others' {
             Set-Content -LiteralPath (Join-Path $script:ManifestsDir 'requirements.txt') -Value @('six==1.16.0') -Encoding UTF8
             Set-Content -LiteralPath (Join-Path $script:ManifestsDir 'npm-packages.txt') -Value @('is-odd@3.0.1') -Encoding UTF8

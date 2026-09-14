@@ -109,11 +109,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Register-S
 A 端手动运维工具：从本机包管理器采集已安装包（`winget export` / `pip freeze` / `npm ls -g` / `bun pm ls -g`），在控制台以编号多选方式勾选需要的条目，按**已安装版本钉版**写回对应清单（首建或增补均可）：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-Manifests.ps1 [-Category winget,pip,npm,bun]
+powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-Manifests.ps1 [-Category winget,pip,npm,bun,dotfiles]
 ```
 
 - 流程：采集已安装包 → 编号多选（`1,3,5-8` / `all` / `none`，回车保持预选）→ 按已装版本钉版回写（winget `Id@version`、pip `name==version`、npm/bun `name@version`）。
 - bun 是**可选类别**（不在默认 `-Category winget,pip,npm` 中，需显式 `-Category bun`），且 presence-gated：config 无 `paths.bunList` 键时该类直接跳过（Info 日志，不报错）——bun 清单格式与 npm 清单完全相同（见 4.5）。
+- `dotfiles` 默认包含在类别筛选中；也可显式传入 `-Category dotfiles`。进入该类别后，Export-Manifests 先调用 `chezmoi unmanaged` 列出顶层未纳入源态的文件、目录和符号链接；第一轮编号筛选选择文件或需要展开的目录，选中的目录随后递归展开，在第二轮筛选中逐项选择其中的文件/符号链接，最后调用 `chezmoi add` 写入 `manifests\dotfiles\`。目录不会再作为整体添加，长路径列表会自动分批调用 chezmoi，避免命令行超长；实际仓库导出仍由 `Export-OfflineRepo.ps1` 完成。
+- `paths.dotfilesSource` 必须指向独立的 chezmoi source state（默认 `manifests\dotfiles`），不能填写当前用户目录；用户目录由 chezmoi 作为 destination 自动处理。
 - 既有清单条目默认预选；已安装但不在清单里的条目默认不选；清单里有但本机未安装的条目显示 `(not installed)` 标记。
 - 回写前自动备份为 `<清单>.bak-<yyyyMMddTHHmmssZ>`（UTC）；选中结果与原清单逐行一致时不写不备份。
 - 某类全部不选则该类清单保持原样不动（绝不写空清单）。

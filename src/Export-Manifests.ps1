@@ -3,7 +3,7 @@
   Export-Manifests.ps1 - A-side interactive manifest generator entry point.
 
   Usage:
-    powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-Manifests.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,bun]
+    powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-Manifests.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,bun,dotfiles]
 
   Thin wrapper around Invoke-OSyncManifestGenerate (src\lib\ManifestGenerate.ps1):
   imports the module relative to its own location, resolves the default
@@ -15,10 +15,12 @@
   the A machine (winget export / pip freeze / npm ls -g / bun pm ls -g),
   lets the operator pick entries at the console (numbered multi-select)
   and writes them back into the manifests pinned to the installed
-  versions. The bun category is opt-in (not in the default -Category
-  list) and presence-gated: it is skipped when the config has no
-  paths.bunList key. The tool requires an interactive console session
-  (never registered as a scheduled task) and an A-role config.
+  versions. The bun category is opt-in (not in the default -Category list)
+  and presence-gated: it is skipped when the config has no paths.bunList key.
+  The dotfiles category uses chezmoi unmanaged plus a two-stage numbered picker:
+  top-level directories are expanded recursively, selected files/symlinks are added in batches,
+  and oversized command lines are split automatically.
+  The tool requires an interactive console session (never registered as a scheduled task) and an A-role config.
 #>
 [CmdletBinding()]
 param(
@@ -26,7 +28,7 @@ param(
     [string]$ConfigPath,
 
     [Parameter(Mandatory = $false)]
-    [string]$Category = 'winget,pip,npm'
+    [string]$Category = 'winget,pip,npm,dotfiles'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,9 +53,9 @@ try {
     }
 
     $requested = @($Category -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
-    $invalid = @($requested | Where-Object { $_ -notin @('winget', 'pip', 'npm', 'bun') })
+    $invalid = @($requested | Where-Object { $_ -notin @('winget', 'pip', 'npm', 'bun', 'dotfiles') })
     if ($invalid.Count -gt 0) {
-        throw "Export-Manifests: unknown -Category value(s): '$($invalid -join ', ')' - valid values: winget,pip,npm,bun."
+        throw "Export-Manifests: unknown -Category value(s): '$($invalid -join ', ')' - valid values: winget,pip,npm,bun,dotfiles."
     }
 
     $null = Invoke-OSyncManifestGenerate -Config $config -Category $requested
