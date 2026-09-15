@@ -544,6 +544,89 @@ public sealed class OSyncStreamPump
     }
 }
 
+function Invoke-OSyncWingetDownloadWithRetry {
+    <#
+    .SYNOPSIS
+    Runs a winget download with bounded retries for transient failures.
+
+    .DESCRIPTION
+    Mirrors Invoke-OSyncDownload's policy: 3 attempts total with 5s and 15s
+    backoff. Only transient winget download/service exit codes are retried;
+    deterministic selection errors such as version-not-found and
+    no-applicable-installer return immediately so the caller can handle them.
+    The per-package directory is cleared before every retry to prevent a
+    partial first attempt from contaminating the next one.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WingetExe,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DownloadDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Id,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Version = '',
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Scope = '',
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Echo = $false,
+
+        [Parameter(Mandatory = $false)]
+        $Config,
+
+        [Parameter(Mandatory = $false)]
+        [int[]]$RetryDelays = @(5, 15)
+    )
+
+    $attempt = 1
+    $totalAttempts = $RetryDelays.Count + 1
+    $outputs = @()
+
+    while ($true) {
+        $result = Invoke-OSyncWingetDownload -WingetExe $WingetExe -Arguments $Arguments -Echo $Echo
+        if (-not [string]::IsNullOrWhiteSpace([string]$result.Output)) {
+            $outputs += ("[attempt {0}/{1}]`n{2}" -f $attempt, $totalAttempts, ([string]$result.Output).Trim())
+        }
+
+        $retryable = Test-OSyncWingetDownloadRetryable `
+            -ExitCode $result.ExitCode -TimedOut:$result.TimedOut
+        if ($result.ExitCode -eq 0 -or -not $retryable -or $attempt -ge $totalAttempts) {
+            return [pscustomobject]@{
+                ExitCode = $result.ExitCode
+                TimedOut = $result.TimedOut
+                Output   = ($outputs -join "`n")
+                Attempts = $attempt
+            }
+        }
+
+        $delay = $RetryDelays[$attempt - 1]
+        $reason = Get-OSyncWingetDownloadFailureReason `
+            -ExitCode $result.ExitCode -TimedOut:$result.TimedOut -Output $result.Output
+        Write-OSyncLog -Category 'winget' -Level 'Warning' `
+            -Message ("winget download attempt {0} of {1} failed for {2}@{3} (scope={4}, exit {5}, {6}) - retrying in {7}s" -f $attempt, $totalAttempts, $Id, $Version, $Scope, $result.ExitCode, $reason, $delay) `
+            -Data @{ Id = $Id; Version = $Version; Scope = $Scope; Attempt = $attempt; TotalAttempts = $totalAttempts; ExitCode = $result.ExitCode; Reason = $reason; RetryDelaySeconds = $delay } `
+            -Config $Config | Out-Null
+
+        Start-Sleep -Seconds $delay
+        if (Test-Path -LiteralPath $DownloadDir) {
+            Remove-Item -Recurse -Force -LiteralPath $DownloadDir
+        }
+        New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null
+        $attempt++
+    }
+}
 function Copy-OSyncWingetReusedPackage {
     <#
     .SYNOPSIS
@@ -687,7 +770,11 @@ function Export-OSyncWinget {
     Per-package download failures (non-zero exit, timeout, no manifest
     downloaded - including UA-403 blocks and nonexistent versions) are
     recorded in the report's failed array and processing CONTINUES with the
-    next package. A rewrite/leak-assertion failure is a tool bug, not a
+    next package. Transient download/service failures get 3 attempts total
+    with 5s and 15s backoff. When the configured machine scope has no
+    applicable installer, the same package is retried once with user scope
+    before it is recorded as failed. A rewrite/leak-assertion failure is a
+    tool bug, not a
     per-package condition, and therefore throws (the whole export fails).
 
     Returns the export report object and also writes it to
@@ -785,12 +872,15 @@ function Export-OSyncWinget {
 
         # --download-directory is quoted and placed LAST (also the contract
         # for the fake winget used in unit tests).
+        $scopeUsed = $scope
+        $scopeAttempts = @($scopeUsed)
         $downloadArgs = @('download', '--id', $entry.Id, '-e')
         if ($null -ne $entry.Version -and $entry.Version.Trim().Length -gt 0) {
             $downloadArgs += @('-v', $entry.Version)
         }
         $downloadArgs += @(
-            '--scope', $scope,
+            '--scope', $scopeUsed,
+            '--source', 'winget',
             '--architecture', $arch,
             '--accept-package-agreements',
             '--accept-source-agreements',
@@ -802,32 +892,77 @@ function Export-OSyncWinget {
         # export report object is the ONLY thing this function emits.
         Write-OSyncLog -Category 'winget' -Level 'Info' `
             -Message ("Downloading winget package {0} ({1})" -f $entry.Id, $entry.Version) `
-            -Data @{ Id = $entry.Id; Version = $entry.Version } -Config $Config | Out-Null
+            -Data @{ Id = $entry.Id; Version = $entry.Version; Scope = $scopeUsed } -Config $Config | Out-Null
 
         $echoOn = ($null -ne $Config -and $Config.PSObject.Properties['consoleEcho'] -and [bool]$Config.consoleEcho)
-        $result = Invoke-OSyncWingetDownload -WingetExe $wingetExe -Arguments $downloadArgs -Echo $echoOn
-
+        $result = Invoke-OSyncWingetDownloadWithRetry `
+            -WingetExe $wingetExe -Arguments $downloadArgs -DownloadDir $pkgDir `
+            -Id $entry.Id -Version ([string]$entry.Version) -Scope $scopeUsed `
+            -Echo $echoOn -Config $Config
+        $totalDownloadAttempts = [int]$result.Attempts
+        $attemptOutputs = @($result.Output)
         $yamls = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+
+        # A machine default is still the right choice for most packages.  If
+        # winget explicitly reports that no installer matches that scope,
+        # retry once as user scope so user-only/MSIX/AppX packages can be
+        # exported without weakening the global config for every package.
+        if ($scope -eq 'machine' -and
+            (Test-OSyncWingetNoApplicableInstaller -ExitCode $result.ExitCode -Output $result.Output)) {
+            if (Test-Path -LiteralPath $pkgDir) {
+                Remove-Item -Recurse -Force -LiteralPath $pkgDir
+            }
+            New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+            $scopeUsed = 'user'
+            $scopeAttempts += $scopeUsed
+            Write-OSyncLog -Category 'winget' -Level 'Info' `
+                -Message ("winget package {0} has no applicable installer at scope 'machine'; retrying with scope 'user'" -f $entry.Id) `
+                -Data @{ Id = $entry.Id; Version = $entry.Version; Scope = 'user'; PreviousExitCode = $result.ExitCode } -Config $Config | Out-Null
+
+            $downloadArgs = @('download', '--id', $entry.Id, '-e')
+            if ($null -ne $entry.Version -and $entry.Version.Trim().Length -gt 0) {
+                $downloadArgs += @('-v', $entry.Version)
+            }
+            $downloadArgs += @(
+                '--scope', $scopeUsed,
+            '--source', 'winget',
+                '--architecture', $arch,
+                '--accept-package-agreements',
+                '--accept-source-agreements',
+                '--disable-interactivity',
+                '--download-directory', ('"{0}"' -f $pkgDir)
+            )
+            $result = Invoke-OSyncWingetDownloadWithRetry `
+                -WingetExe $wingetExe -Arguments $downloadArgs -DownloadDir $pkgDir `
+                -Id $entry.Id -Version ([string]$entry.Version) -Scope $scopeUsed `
+                -Echo $echoOn -Config $Config
+            $totalDownloadAttempts += [int]$result.Attempts
+            $attemptOutputs += $result.Output
+            $yamls = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+        }
 
         if ($result.TimedOut -or $result.ExitCode -ne 0 -or $yamls.Count -eq 0) {
             $tail = ''
-            if (-not [string]::IsNullOrWhiteSpace($result.Output)) {
-                $tailLines = @($result.Output -split "`n")
+            $combinedOutput = (($attemptOutputs | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace([string]$_)
+                }) -join "`n")
+            if (-not [string]::IsNullOrWhiteSpace($combinedOutput)) {
+                $tailLines = @($combinedOutput -split "`n")
                 $tail = (($tailLines | Select-Object -Last 15) -join "`n").Trim()
             }
-            $reason = 'download failed'
-            if ($result.TimedOut) {
-                $reason = 'timeout'
-            }
-            elseif ($result.ExitCode -eq 0) {
+            $reason = Get-OSyncWingetDownloadFailureReason `
+                -ExitCode $result.ExitCode -TimedOut:$result.TimedOut -Output $combinedOutput
+            if ($result.ExitCode -eq 0 -and -not $result.TimedOut) {
                 $reason = 'no manifest downloaded'
             }
             $failure = [pscustomobject]@{
-                Id       = $entry.Id
-                Version  = $entry.Version
-                ExitCode = $result.ExitCode
-                Reason   = $reason
-                Output   = $tail
+                Id            = $entry.Id
+                Version       = $entry.Version
+                ExitCode      = $result.ExitCode
+                Reason        = $reason
+                ScopeAttempts    = $scopeAttempts
+                DownloadAttempts = $totalDownloadAttempts
+                Output           = $tail
             }
             $failed += $failure
             Write-OSyncLog -Category 'winget' -Level 'Warning' `
@@ -856,7 +991,7 @@ function Export-OSyncWinget {
         $okIds[$entry.Id.ToLowerInvariant()] = $entry
         Write-OSyncLog -Category 'winget' -Level 'Info' `
             -Message ("winget package {0} exported ({1} manifest(s) rewritten)" -f $entry.Id, $yamls.Count) `
-            -Data @{ Id = $entry.Id; Version = $entry.Version; Manifests = $yamls.Count } -Config $Config | Out-Null
+            -Data @{ Id = $entry.Id; Version = $entry.Version; Scope = $scopeUsed; DownloadAttempts = $totalDownloadAttempts; Manifests = $yamls.Count } -Config $Config | Out-Null
     }
 
     # packages.txt: ONLY the IDs that downloaded successfully this round.

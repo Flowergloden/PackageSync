@@ -215,10 +215,97 @@ Describe 'WingetExport: packages.txt content (only successful IDs)' {
     }
 }
 
+Describe 'WingetExport: bounded retry for transient download failures' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+
+        $script:retryDir = Join-Path $TestDrive 'retry-download'
+        $script:retryConfig = [pscustomobject]@{ stateDir = (Join-Path $TestDrive 'retry-state') }
+    }
+
+    BeforeEach {
+        $script:retryAttempt = 0
+        $script:retryFailuresBeforeSuccess = 0
+        $script:retryExitCode = -1978335123
+        New-Item -ItemType Directory -Path $script:retryDir -Force | Out-Null
+
+        Mock Invoke-OSyncWingetDownload {
+            $script:retryAttempt++
+            if ($script:retryAttempt -le $script:retryFailuresBeforeSuccess) {
+                return [pscustomobject]@{
+                    ExitCode = $script:retryExitCode
+                    TimedOut = $false
+                    Output   = 'transient failure'
+                }
+            }
+            return [pscustomobject]@{
+                ExitCode = 0
+                TimedOut = $false
+                Output   = 'downloaded'
+            }
+        }
+        Mock Start-Sleep { }
+        Mock Write-OSyncLog { }
+    }
+
+    It 'retries service-unavailable once and succeeds on the second attempt' {
+        $script:retryFailuresBeforeSuccess = 1
+
+        $result = Invoke-OSyncWingetDownloadWithRetry `
+            -WingetExe 'C:\fake\winget.exe' -Arguments @('download') `
+            -DownloadDir $script:retryDir -Id 'synthetic.Retry' -Version '1.0.0' `
+            -Scope 'user' -Config $script:retryConfig
+
+        $result.ExitCode | Should -Be 0
+        $result.Attempts | Should -Be 2
+        $result.Output | Should -Match 'transient failure'
+        $result.Output | Should -Match 'downloaded'
+        Should -Invoke Invoke-OSyncWingetDownload -Times 2
+        Should -Invoke Start-Sleep -Times 1 -ParameterFilter { $Seconds -eq 5 }
+        Should -Invoke Write-OSyncLog -Times 1
+    }
+
+    It 'returns immediately for deterministic version-not-found failures' {
+        $script:retryFailuresBeforeSuccess = 99
+        $script:retryExitCode = -1978335209
+
+        $result = Invoke-OSyncWingetDownloadWithRetry `
+            -WingetExe 'C:\fake\winget.exe' -Arguments @('download') `
+            -DownloadDir $script:retryDir -Id 'synthetic.BadVersion' -Version '9.9.9' `
+            -Scope 'machine' -Config $script:retryConfig
+
+        $result.ExitCode | Should -Be -1978335209
+        $result.Attempts | Should -Be 1
+        Should -Invoke Invoke-OSyncWingetDownload -Times 1
+        Should -Invoke Start-Sleep -Times 0
+        Should -Invoke Write-OSyncLog -Times 0
+    }
+
+    It 'stops after 3 transient failures with 5s then 15s backoff' {
+        $script:retryFailuresBeforeSuccess = 99
+
+        $result = Invoke-OSyncWingetDownloadWithRetry `
+            -WingetExe 'C:\fake\winget.exe' -Arguments @('download') `
+            -DownloadDir $script:retryDir -Id 'synthetic.AlwaysFail' -Version '1.0.0' `
+            -Scope 'user' -Config $script:retryConfig
+
+        $result.ExitCode | Should -Be -1978335123
+        $result.Attempts | Should -Be 3
+        Should -Invoke Invoke-OSyncWingetDownload -Times 3
+        Should -Invoke Start-Sleep -Times 2
+        Should -Invoke Start-Sleep -Times 1 -ParameterFilter { $Seconds -eq 5 }
+        Should -Invoke Start-Sleep -Times 1 -ParameterFilter { $Seconds -eq 15 }
+        Should -Invoke Write-OSyncLog -Times 2
+    }
+}
 Describe 'WingetExport: export loop with a fake winget (no network)' {
 
     BeforeAll {
         . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
 
@@ -230,14 +317,24 @@ Describe 'WingetExport: export loop with a fake winget (no network)' {
         # seeds the fixture files into that directory, fails with exit 1 for
         # Foo.Bar999, and exits 0 for anything that is not a download call.
         $script:fakeWinget = Join-Path $TestDrive 'fakewinget.cmd'
+        $script:fakeLog = Join-Path $TestDrive 'fakewinget.args.log'
         $fakeContent = @(
             '@echo off',
             'set DIR=',
+            "set LOG=$($script:fakeLog)",
+            'echo %*>>"%LOG%"',
             'echo %*| findstr /C:"download" >nul',
             'if errorlevel 1 exit /b 0',
             'for %%A in (%*) do set DIR=%%~A',
             'echo %*| findstr /C:"Foo.Bar999" >nul',
             'if not errorlevel 1 exit /b 1',
+            'echo %*| findstr /C:"synthetic.UserScope" >nul',
+            'if errorlevel 1 goto normal_download',
+            'echo %*| findstr /C:"--scope machine" >nul',
+            'if errorlevel 1 goto normal_download',
+            'echo No applicable installer found',
+            'exit /b 1',
+            ':normal_download',
             'echo %*| findstr /C:"synthetic.BrokenManifest" >nul',
             'if not errorlevel 1 goto broken',
             'if not exist "%DIR%" mkdir "%DIR%"',
@@ -294,6 +391,31 @@ Describe 'WingetExport: export loop with a fake winget (no network)' {
         $parsed.failed.Count | Should -Be 1
     }
 
+    It 'retries a machine-scope no-applicable-installer failure as user scope' {
+        $staging = Join-Path $TestDrive 'staging-user-scope'
+        $list = @(
+            [pscustomobject]@{ Id = 'synthetic.UserScope'; Version = '1.0.0'; Line = 1 }
+        )
+
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir $staging `
+            -Config $script:testConfig -WingetExePath $script:fakeWinget
+
+        $report.failed.Count | Should -Be 0
+        $report.ok.Count | Should -Be 1
+        $report.ok[0].Id | Should -Be 'synthetic.UserScope'
+        Test-Path -LiteralPath (Join-Path $staging 'winget\synthetic.UserScope\Sample App_1.0.0_Machine_X64_exe_en-US.yaml') | Should -BeTrue
+
+        $invocations = @(Get-Content -LiteralPath $script:fakeLog)
+        @($invocations | Where-Object { $_ -match 'synthetic\.UserScope' -and $_ -match '--scope machine' }).Count | Should -BeGreaterOrEqual 1
+        @($invocations | Where-Object { $_ -match 'synthetic\.UserScope' -and $_ -match '--scope user' }).Count | Should -BeGreaterOrEqual 1
+        @($invocations | Where-Object { $_ -match 'synthetic\.UserScope' -and $_ -match '--source winget' }).Count | Should -BeGreaterOrEqual 2
+    }
+    It 'classifies the winget service-unavailable exit code in failure reports' {
+        Get-OSyncWingetDownloadFailureReason -ExitCode -1978335123 |
+            Should -Be 'winget service unavailable'
+        Get-OSyncWingetDownloadFailureReason -ExitCode -1978335209 |
+            Should -Be 'version not found'
+    }
     It 'fails the WHOLE export (throws) when a manifest cannot be rewritten/leak-asserted' {
         $staging = Join-Path $TestDrive 'staging-broken'
         $list = @(
@@ -310,6 +432,7 @@ Describe 'WingetExport: incremental reuse of unchanged pinned packages (P1)' {
 
     BeforeAll {
         . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\RepoContract.ps1')

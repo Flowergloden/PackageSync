@@ -31,7 +31,7 @@
     --manifest. The work copy itself stays pristine.
 
   EXIT-CODE POLICY (this todo owns the constant, see Winget.Common.ps1):
-      0                                        -> success
+      $script:WingetSuccessfulInstallExitCodes -> success (including reboot required)
       $script:WingetSatisfiedExitCodes         -> already satisfied
           (already installed / no applicable upgrade) -> idempotent success
       anything else                             -> recorded in failed,
@@ -142,36 +142,7 @@ function Get-OSyncWingetManifestInfo {
     }
 }
 
-<#
-.SYNOPSIS
-    Returns $true when ANY YAML manifest under $PackageDir contains an
-    Installer of type 'msix' or 'appx' (which MUST use --scope user).
-.DESCRIPTION
-    MSIX/Appx packages do not support --scope machine (powered by winget's
-    COM API). Packages like Microsoft.PowerToys and Microsoft.WindowsTerminal
-    ship as MSIX and always need user-scope installation. Reads InstallerType
-    from the raw YAML text (regex-based, same pattern as the other manifest
-    helpers) and returns $true on the first hit.
-#>
-function Test-OSyncWingetNeedsUserScope {
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PackageDir
-    )
 
-    if (-not [System.IO.Directory]::Exists($PackageDir)) { return $false }
-    $yamls = @(Get-ChildItem -LiteralPath $PackageDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
-    # Look for InstallerType: msix or appx in the Installers array (indented
-    # under the - list entry). Use multiline regex to match across lines.
-    $msixPattern = '(?m)^\s+InstallerType:\s*(msix|appx)\b'
-    foreach ($yaml in $yamls) {
-        $text = [System.IO.File]::ReadAllText($yaml.FullName, [System.Text.Encoding]::UTF8)
-        if ($text -match $msixPattern) { return $true }
-    }
-    return $false
-}
 <#
 .SYNOPSIS
     Runs one `winget install` invocation with a hard timeout.
@@ -614,14 +585,13 @@ function Invoke-OSyncWingetApply {
             # where the HTTP server serves them).
             $manifestDir = New-OSyncWingetManifestStaging -PackageDir $pkgDir -StagingRoot $stagingRoot
 
-            # Per-package scope override: MSIX/Appx packages (InstallerType:
-            # msix/appx) MUST use --scope user even when the config default is
-            # 'machine'. Detected by reading InstallerType from the YAML.
+            # Per-package scope override: user-scoped installers (including MSIX/AppX)
+            # MUST use --scope user even when the config default is 'machine'.
             $actualScope = $scope
             if ($scope -eq 'machine' -and (Test-OSyncWingetNeedsUserScope -PackageDir $pkgDir)) {
                 $actualScope = 'user'
                 Write-OSyncLog -Category 'winget' -Level 'Info' `
-                    -Message ("winget package {0}: overriding scope to 'user' (InstallerType is msix/appx)" -f $entry.Id) `
+                    -Message ("winget package {0}: overriding scope to 'user' (manifest is user-scoped or MSIX/AppX)" -f $entry.Id) `
                     -Data @{ Id = $entry.Id; ConfigScope = $scope; OverrideScope = 'user' } -Config $Config | Out-Null
             }
 
@@ -666,19 +636,20 @@ function Invoke-OSyncWingetApply {
                 continue
             }
 
-            if ($result.ExitCode -eq 0) {
+            if ($script:WingetSuccessfulInstallExitCodes -contains $result.ExitCode) {
                 $info = Get-OSyncWingetManifestInfo -YamlPath $yamls[0].FullName
                 $ok += [pscustomobject]@{
                     Id       = $entry.Id
                     Version  = $info.PackageVersion
                     Sha256   = $info.InstallerSha256
-                    ExitCode = 0
+                    ExitCode = $result.ExitCode
                 }
                 Add-OSyncStateRecord -Category 'winget' -Name $entry.Id `
                     -Version $info.PackageVersion -Sha256 $info.InstallerSha256 -Config $Config | Out-Null
+                $rebootRequired = ($result.ExitCode -eq -1978334967)
                 Write-OSyncLog -Category 'winget' -Level 'Info' `
-                    -Message ("winget package {0} installed (exit 0)" -f $entry.Id) `
-                    -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256 } -Config $Config | Out-Null
+                    -Message ("winget package {0} installed (exit {1}{2})" -f $entry.Id, $result.ExitCode, $(if ($rebootRequired) { ', reboot required' } else { '' })) `
+                    -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256; ExitCode = $result.ExitCode; RebootRequired = $rebootRequired } -Config $Config | Out-Null
             }
             elseif ($script:WingetSatisfiedExitCodes -contains $result.ExitCode) {
                 $info = Get-OSyncWingetManifestInfo -YamlPath $yamls[0].FullName

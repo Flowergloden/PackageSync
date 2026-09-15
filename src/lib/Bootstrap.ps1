@@ -59,7 +59,7 @@
           REJECTS non-YAML files and subdirectories, so each package is
           staged manifest-only exactly like WingetApply.ps1 (reusing
           New-OSyncWingetManifestStaging). Source auto-update failures are
-          logged only. Exit-code policy reuses $script:WingetSatisfiedExitCodes
+          logged only. Exit-code policy reuses $script:WingetSuccessfulInstallExitCodes and $script:WingetSatisfiedExitCodes
           (READ-ONLY consumer, Winget.Common.ps1): 0/satisfied = ok, any
           other non-zero = the bootstrap FAILS and step 7 is never reached
           (Momus M3). After the installs the machine PATH is re-read and the
@@ -911,7 +911,7 @@ function Invoke-OSyncBootstrapStepRuntimeWinget {
             }
             # Exit-code policy (Momus M3): 0 / satisfied = ok; any other
             # non-zero FAILS the bootstrap (runtime deps are mandatory).
-            if ($result.ExitCode -eq 0 -or $script:WingetSatisfiedExitCodes -contains $result.ExitCode) {
+            if ($script:WingetSuccessfulInstallExitCodes -contains $result.ExitCode -or $script:WingetSatisfiedExitCodes -contains $result.ExitCode) {
                 $installed += [pscustomobject]@{ Id = $entry.Id; Version = $entry.Version; ExitCode = $result.ExitCode }
                 Write-OSyncLog -Category 'bootstrap' -Level Info `
                     -Message ("step 3: runtime winget package {0} installed/satisfied (exit {1})" -f $entry.Id, $result.ExitCode) `

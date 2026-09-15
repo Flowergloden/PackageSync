@@ -133,6 +133,8 @@ Microsoft.PowerToys
 
 - 强烈建议钉版 `Id@version`，保证 A/B 版本一致；查版本用 `winget show --id <Id> -e`（本机 winget 输出为中文，勿 grep 英文 `Version:` 标签，直接正则版本号）。
 - 只有**本轮导出成功**的 Id 才会写进交付清单 `winget\packages.txt`；失败的包仅记入导出报告 `failed` 数组，不中断其他包，也不进 B 端安装清单。
+- 当 `winget.scope=machine` 返回“找不到适用的安装程序”时，A 端仅对该包自动重试一次 `--scope user`，不会改变全局 scope；下载命令固定指定 `--source winget`，避免误走 Microsoft Store 源；B 端根据 YAML 的 `Scope: user` 或 MSIX/AppX 类型同步使用 user scope。
+- winget 下载遇到瞬时下载/依赖下载/服务不可用/零字节载荷错误时，按与通用 HTTP 下载一致的策略最多尝试 3 次（首次 + 5 秒、15 秒退避重试）；版本不存在、无适用安装器等确定性错误不重试。
 - **钉版条目启用增量导出（P1）**：钉版版本与上一版已发布载荷一致时直接复用落盘区现有文件、跳过 `winget download`（判定条件见 5.8）；未钉版条目每轮仍全量下载。
 - 换版本 = 改这一行，下次导出自动生效。
 

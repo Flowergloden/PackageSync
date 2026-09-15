@@ -92,6 +92,20 @@ Describe 'WingetApply: exit-code mapping table (mocked winget invocation)' {
         $state.winget['7zip.7zip'].sha256 | Should -Be 'db407a4f6d4999e5c7bc00ce8a882be94717b56e7fa68140fe3f12605d91643e'
     }
 
+    It 'treats winget 0x8A150109 (installer exit 3010) as success requiring reboot' {
+        $stateDir = Join-Path $TestDrive 'state-reboot-required'
+        $cfg = & $script:NewConfig $stateDir
+        $script:mockExitCode = -1978334967
+
+        $report = Invoke-OSyncWingetApply -WorkDir $script:work -Config $cfg
+
+        $report.ok.Count | Should -Be 1
+        $report.ok[0].Id | Should -Be '7zip.7zip'
+        $report.ok[0].ExitCode | Should -Be -1978334967
+        $report.failed.Count | Should -Be 0
+        $state = Get-OSyncState -Category winget -StateDir $stateDir
+        $state.winget['7zip.7zip'].version | Should -Be '26.02'
+    }
     It 'each satisfied exit code maps to satisfied and writes the state record' {
         # The constant currently holds @(0); 0 is handled by the ok branch, so
         # extend it with a representative NON-ZERO satisfied code to exercise
@@ -520,6 +534,26 @@ Describe 'WingetApply: winget command line (fake winget .cmd)' {
         $report.ok.Count | Should -Be 1
     }
 
+    It 'overrides scope for an explicitly user-scoped non-MSIX installer' {
+        Clear-Content -LiteralPath $script:recordFile -Force -ErrorAction SilentlyContinue
+
+        $work = Join-Path $TestDrive 'work-user-scope'
+        $pkgDir = Join-Path $work 'winget\synthetic.UserScope'
+        New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $pkgDir 'User Scope_1.0.0_User_X64_nsis_en-US.yaml'),
+            "PackageIdentifier: synthetic.UserScope`nPackageVersion: 1.0.0`nInstallers:`n- Architecture: x64`n  InstallerType: nsis`n  InstallerUrl: http://127.0.0.1:8788/winget/synthetic.UserScope/User%20Scope_1.0.0_User_X64_nsis_en-US.exe`n  InstallerSha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`n  Scope: user`nManifestType: merged`nManifestVersion: 1.12.0",
+            (New-Object System.Text.UTF8Encoding($true)))
+        [System.IO.File]::WriteAllBytes((Join-Path $pkgDir 'User Scope_1.0.0_User_X64_nsis_en-US.exe'), [byte[]]@(1, 2, 3))
+        [System.IO.File]::WriteAllText((Join-Path $work 'winget\packages.txt'), "synthetic.UserScope@1.0.0`r`n", (New-Object System.Text.UTF8Encoding($true)))
+
+        $cfg = & $script:NewCmdConfig (Join-Path $TestDrive 'state-cmd-user-scope')
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config $cfg -WingetExePath $script:fakeWinget
+
+        $recorded = Get-Content -LiteralPath $script:recordFile -Raw
+        $recorded -match '--scope user' | Should -BeTrue
+        $recorded -notmatch '--scope machine' | Should -BeTrue
+        $report.ok.Count | Should -Be 1
+    }
     It 're-derives winget.exe via Resolve-OSyncWingetExePath when no -WingetExePath is given' {
         Mock Resolve-OSyncWingetExePath { return $script:fakeWinget }
 
