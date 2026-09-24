@@ -390,8 +390,10 @@ function Invoke-OSyncRuntimeWingetExport {
         $Config,
 
         # Test seam: unit tests inject a fake winget; production resolves
-        # the real winget.exe via Resolve-OSyncWingetExePath (per-user alias
-        # fallback for non-elevated shells - observed, todo 6).
+        # the real winget.exe via Resolve-OSyncWingetExePath.  The resolver
+        # prefers the per-user App Execution Alias for interactive shells and
+        # falls back to the versioned package binary for identities such as
+        # SYSTEM that do not have an alias.
         [Parameter(Mandatory = $false)]
         [string]$WingetExePath
     )
@@ -406,12 +408,6 @@ function Invoke-OSyncRuntimeWingetExport {
     }
     else {
         $wingetExe = Resolve-OSyncWingetExePath
-        if ($null -eq $wingetExe) {
-            # Non-elevated shells cannot glob C:\Program Files\WindowsApps
-            # (ACL); the per-user alias works there (observed, todo 6).
-            $cmd = Get-Command winget -ErrorAction SilentlyContinue
-            if ($null -ne $cmd) { $wingetExe = $cmd.Source }
-        }
         if ($null -eq $wingetExe) {
             throw 'Invoke-OSyncRuntimeWingetExport: winget.exe not found (App Installer not installed?).'
         }

@@ -205,6 +205,62 @@ Describe 'ManifestGenerate' {
         }
     }
 
+    Describe 'Resolve-OSyncWingetExePath' {
+        It 'prefers the per-user App Execution Alias over the versioned WindowsApps binary' {
+            $alias = 'C:\Users\TestUser\AppData\Local\Microsoft\WindowsApps\winget.exe'
+            $package = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe\winget.exe'
+            $command = [pscustomobject]@{
+                Source     = $alias
+                Path       = $alias
+                Definition = $alias
+            }
+            $packageItem = [pscustomobject]@{
+                FullName  = $package
+                Directory = [pscustomobject]@{ Name = 'Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe' }
+            }
+
+            Mock Get-Command { $command } -ParameterFilter {
+                $Name -eq 'winget' -and $CommandType -eq 'Application'
+            }
+            Mock Test-Path { $true } -ParameterFilter {
+                $LiteralPath -eq $alias -and $PathType -eq 'Leaf'
+            }
+            Mock Get-Item { @($packageItem) } -ParameterFilter {
+                $Path -like '*Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe*winget.exe'
+            }
+
+            Resolve-OSyncWingetExePath | Should -Be $alias
+        }
+
+        It 'falls back to the newest versioned WindowsApps binary without an alias' {
+            $package = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe\winget.exe'
+            $packageItem = [pscustomobject]@{
+                FullName  = $package
+                Directory = [pscustomobject]@{ Name = 'Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe' }
+            }
+
+            Mock Get-Command { $null } -ParameterFilter {
+                $Name -eq 'winget' -and $CommandType -eq 'Application'
+            }
+            Mock Get-Item { @($packageItem) } -ParameterFilter {
+                $Path -like '*Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe*winget.exe'
+            }
+
+            Resolve-OSyncWingetExePath | Should -Be $package
+        }
+
+        It 'returns null when neither the alias nor a package binary exists' {
+            Mock Get-Command { $null } -ParameterFilter {
+                $Name -eq 'winget' -and $CommandType -eq 'Application'
+            }
+            Mock Get-Item { @() } -ParameterFilter {
+                $Path -like '*Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe*winget.exe'
+            }
+
+            Resolve-OSyncWingetExePath | Should -BeNullOrEmpty
+        }
+    }
+
     Describe 'Get-OSyncInstalledWinget' {
         BeforeAll {
             $script:WingetFixture = Join-Path $TestDrive 'winget-export.json'

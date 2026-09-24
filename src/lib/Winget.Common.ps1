@@ -28,9 +28,14 @@
       future winget versions that may return dedicated satisfied codes.
 
   Resolve-OSyncWingetExePath:
-    Globs C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe
-    and returns the full path of the newest version. Returns $null and writes
-    a warning when no winget.exe is found.
+    Prefers the current user's App Execution Alias resolved by
+    `Get-Command winget`.  Launching the versioned binary directly from
+    C:\Program Files\WindowsApps can fail with Access Denied in a normal
+    (non-elevated) A-side shell even though winget is installed.  When the
+    alias is unavailable (for example under SYSTEM), the resolver falls back
+    to the newest versioned package binary under
+    C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe.
+    Returns $null and writes a warning when neither form is found.
 #>
 
 $script:WingetSuccessfulInstallExitCodes = @(
@@ -40,13 +45,70 @@ $script:WingetSuccessfulInstallExitCodes = @(
 
 $script:WingetSatisfiedExitCodes = @(0)
 
+function Get-OSyncWingetExecutionAliasPath {
+    <#
+      Returns the App Execution Alias path exposed by the current Windows
+      identity, when one is available.  Restrict the accepted path to the
+      WindowsApps alias directory so an unrelated winget.exe earlier on PATH
+      cannot silently replace the App Installer binary used by PakageSync.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $commands = @(Get-Command winget -CommandType Application -All -ErrorAction SilentlyContinue)
+    foreach ($command in $commands) {
+        if ($null -eq $command) { continue }
+
+        $candidate = $null
+        foreach ($propertyName in @('Source', 'Path', 'Definition')) {
+            $property = $command.PSObject.Properties[$propertyName]
+            if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                $candidate = [string]$property.Value
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+
+        try {
+            $candidate = [System.IO.Path]::GetFullPath($candidate)
+        }
+        catch {
+            continue
+        }
+
+        # Do not accept the versioned package path here: that is exactly the
+        # path which can be denied to a non-elevated A-side shell.  The
+        # resolver below still uses it as the fallback for identities without
+        # an alias (notably SYSTEM tasks).
+        if ($candidate -notmatch '(?i)\\Microsoft\\WindowsApps\\winget\.exe$') { continue }
+        if ($candidate -match '(?i)\\Program Files\\WindowsApps\\') { continue }
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+
+        return $candidate
+    }
+
+    return $null
+}
+
 function Resolve-OSyncWingetExePath {
     [CmdletBinding()]
     [OutputType([string])]
     param()
 
+    # Prefer the per-user App Execution Alias.  The alias is the supported
+    # launch surface for an interactive A-side user and avoids the WindowsApps
+    # ACL failure that occurs when ProcessStartInfo targets the package binary
+    # directly.
+    $alias = Get-OSyncWingetExecutionAliasPath
+    if (-not [string]::IsNullOrWhiteSpace($alias)) {
+        return $alias
+    }
+
     # App Installer ships winget.exe inside the versioned package folder and
     # the package can be updated in place, so pick the newest version folder.
+    # This is primarily the SYSTEM/non-interactive fallback where the current
+    # identity has no per-user App Execution Alias.
     $pattern = Join-Path $env:ProgramFiles 'WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe\winget.exe'
     $items = @(Get-Item -Path $pattern -ErrorAction SilentlyContinue)
     if ($items.Count -eq 0) {

@@ -33,9 +33,10 @@
           NO LONGER installs the App Installer chain; modern Windows ships
           App Installer / winget preinstalled, so the msixbundle/VCLibs/
           UI.Xaml payload is no longer carried at all). winget.exe is resolved
-          (Resolve-OSyncWingetExePath, newest WindowsApps glob) and recorded
-          into state.wingetExePath (diagnostic only); an empty glob is an
-          explicit, fast error telling the operator App Installer must be
+          (Resolve-OSyncWingetExePath, App Execution Alias or newest WindowsApps
+          fallback) and recorded
+          into state.wingetExePath (diagnostic only); an empty resolution is
+          an explicit, fast error telling the operator App Installer must be
           present on this machine (Metis B1). No Add-AppxPackage is ever run
           here.
       [2] LocalManifestFiles, PER-USER semantics in BOTH contexts (Momus
@@ -598,9 +599,10 @@ function Invoke-OSyncBootstrapStepAppInstaller {
       installs the App Installer chain (msixbundle/VCLibs/UI.Xaml) - modern
       Windows ships App Installer / winget preinstalled, so there is nothing
       to install and no payload to verify. This step only resolves winget.exe
-      (Resolve-OSyncWingetExePath, newest WindowsApps glob) and records it
+      (Resolve-OSyncWingetExePath, App Execution Alias or newest WindowsApps
+      fallback) and records it
       into state.wingetExePath (RECORD ONLY / diagnostic - apply re-derives
-      every run). An empty glob is an explicit, fast error telling the
+      every run). An empty resolution is an explicit, fast error telling the
       operator this machine must have App Installer (Metis B1).
     #>
     [CmdletBinding()]
