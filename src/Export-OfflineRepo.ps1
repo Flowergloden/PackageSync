@@ -11,6 +11,10 @@
   Success flag to the process exit code (0 = full export -> integrity ->
   publish chain OK, 1 = anything else).
 
+  Before exporting, existing package manifests are refreshed non-interactively
+  from locally installed versions. This also applies to scheduled runs.
+  Runtime manifests are left unchanged when -SkipRuntime is used.
+
   Manual runs echo live progress to the console by default (milestone log
   lines plus throttled winget download output); -Quiet restores the old
   silent behavior (log files only).

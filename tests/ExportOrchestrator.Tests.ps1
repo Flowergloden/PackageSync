@@ -43,6 +43,9 @@ Describe 'ExportOrchestrator' {
         . (Join-Path $PSScriptRoot '..\src\lib\RuntimeExport.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\RepoContract.ps1')
         . (Join-Path $PSScriptRoot '..\src\lib\ExportOrchestrator.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\ManifestRefresh.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\ManifestGenerate.ps1')
+        $script:RefreshImplementation = ${function:Invoke-OSyncManifestRefresh}
 
         # --- config helper: writes a full valid packagesync config JSON ---
         # The config lives at <ToolRoot>\config\packagesync.json so
@@ -136,6 +139,7 @@ Describe 'ExportOrchestrator' {
     }
 
     BeforeEach {
+        Mock Invoke-OSyncManifestRefresh { }
         $script:CallLog = @()
         $script:FailCategory = $null
 
@@ -193,6 +197,61 @@ Describe 'ExportOrchestrator' {
         Mock Resolve-OSyncWingetExePath { return 'C:\fake\winget.exe' }
     }
 
+    Context 'automatic manifest refresh before export' {
+        It 'refreshes all inputs before any exporter and consumes new pins (Quiet=<Silent>)' -ForEach @(@{ Silent = $false }, @{ Silent = $true }) {
+            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-OTestRepo -ToolRoot $root
+            $cfg = New-OTestConfigFile -ToolRoot $root -RepoRoot (Join-Path $root 'out') -StagingRoot (Join-Path $root 'staging')
+            Mock Get-OSyncInstalledWinget {
+                @([pscustomobject]@{ Id = '7zip.7zip'; Version = '26.03' }, [pscustomobject]@{ Id = 'Python.Python.3.12'; Version = '3.12.11' })
+            }
+            Mock Get-OSyncInstalledPip { @([pscustomobject]@{ Name = 'six'; Version = '1.18.0' }) }
+            Mock Get-OSyncInstalledNpm { @([pscustomobject]@{ Name = 'is-odd'; Version = '3.0.2' }) }
+            Mock Invoke-OSyncManifestRefresh {
+                param($Config, $Category)
+                $script:CallLog += "refresh-$Category"
+                & $script:RefreshImplementation -Config $Config -Category $Category
+            }
+            $report = Invoke-OSyncExport -ConfigPath $cfg -Quiet:$Silent
+            $report.success | Should -BeTrue
+            $script:CallLog | Should -Be @('refresh-winget', 'refresh-pip', 'refresh-npm', 'refresh-runtime', 'winget', 'pip', 'npm', 'dotfiles', 'runtime')
+            Should -Invoke Export-OSyncWinget -Times 1 -Exactly -ParameterFilter { $ParsedList[0].Version -eq '26.03' }
+            (Get-Content (Join-Path $root 'manifests\requirements.txt') -Raw) | Should -Match 'six==1.18.0'
+            (Get-Content (Join-Path $root 'manifests\npm-packages.txt') -Raw) | Should -Match 'is-odd@3.0.2'
+            (Get-Content (Join-Path $root 'manifests\runtime-winget.txt') -Raw) | Should -Match 'Python.Python.3.12@3.12.11'
+        }
+
+        It 'isolates a <FailedKind> refresh failure and prevents publishing stale inputs' -ForEach @(@{ FailedKind = 'pip' }, @{ FailedKind = 'runtime' }) {
+            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-OTestRepo -ToolRoot $root
+            $cfg = New-OTestConfigFile -ToolRoot $root -RepoRoot (Join-Path $root 'out') -StagingRoot (Join-Path $root 'staging')
+            $script:RefreshFailure = $FailedKind
+            Mock Invoke-OSyncManifestRefresh {
+                param($Config, $Category)
+                if ($Category -eq $script:RefreshFailure) { throw 'cannot collect installed versions' }
+            }
+            $report = Invoke-OSyncExport -ConfigPath $cfg -Quiet
+            $report.success | Should -BeFalse
+            $report.published | Should -BeFalse
+            $report.categories[$FailedKind].error | Should -Match 'manifest refresh failed'
+            $report.failedCategories | Should -Contain $FailedKind
+            $script:CallLog | Should -Not -Contain $FailedKind
+            $script:CallLog | Should -Contain 'npm'
+            Test-Path (Join-Path $root 'out\index.json') | Should -BeFalse
+        }
+
+        It 'refreshes only the selected categories and leaves reused runtime unchanged' {
+            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-OTestRepo -ToolRoot $root
+            $out = Join-Path $root 'out'
+            New-OTestPublishedRuntime -RepoRoot $out
+            $cfg = New-OTestConfigFile -ToolRoot $root -RepoRoot $out -StagingRoot (Join-Path $root 'staging')
+            $report = Invoke-OSyncExport -ConfigPath $cfg -Category pip -SkipRuntime -Quiet
+            $report.success | Should -BeTrue
+            Should -Invoke Invoke-OSyncManifestRefresh -Times 1 -Exactly
+            Should -Invoke Invoke-OSyncManifestRefresh -Times 1 -Exactly -ParameterFilter { $Category -eq 'pip' }
+        }
+    }
     Context 'happy path - full export -> integrity -> publish' {
         It 'exports all categories in order, publishes, and index.json is the newest file in repoRoot' {
             $repoRoot = Join-Path $TestDrive 'repo'

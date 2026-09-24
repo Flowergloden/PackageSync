@@ -12,7 +12,9 @@
        orchestrator; the B-side apply orchestrator is todo 17).
     2. Pre-flight: python / node / npm / winget must be resolvable for the
        enabled categories - a missing tool is an explicit error BEFORE any
-       staging work (Oracle m7).
+       staging work (Oracle m7). Refresh the enabled package manifests
+       from locally installed versions without prompting; also refresh the
+       runtime whitelist unless -SkipRuntime reuses the published payload.
     3. Creates <stagingRoot>\<yyyyMMddTHHmmssZ>\ - the same ISO8601-basic
        format and source ([datetime]::UtcNow) as the index exportedAtUtc
        (Oracle r7-2).
@@ -261,6 +263,22 @@ function Invoke-OSyncExport {
         Write-OSyncLog -Category 'export' -Level Info -Message "-SkipRuntime: reuse sources verified in '$($config.repoRoot)' (runtime\ + $($runtimeReuseEntries.Count) runtime winget payload(s))." -Config $config | Out-Null
     }
 
+    # Refresh every input manifest before any exporter reads it (including the
+    # runtime tool snapshot). Failures retain the normal category isolation,
+    # but the publish gate must never accept a stale-manifest fallback.
+    $refreshErrors = @{}
+    $refreshCategories = @($enabled | Where-Object { $_ -ne 'dotfiles' })
+    if (-not $SkipRuntime) { $refreshCategories += 'runtime' }
+    foreach ($refreshCategory in $refreshCategories) {
+        try {
+            Invoke-OSyncManifestRefresh -Config $config -Category $refreshCategory
+        }
+        catch {
+            $refreshErrors[$refreshCategory] = "manifest refresh failed: $($_.Exception.Message)"
+            Write-OSyncLog -Category 'export' -Level Error -Message "category '$refreshCategory' $($refreshErrors[$refreshCategory])" -Config $config | Out-Null
+        }
+    }
+
     # --- 3. staging dir: <stagingRoot>\<yyyyMMddTHHmmssZ> (same format/source as index exportedAtUtc) ---
     $stamp = [datetime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
     $staging = Join-Path $config.stagingRoot $stamp
@@ -277,6 +295,7 @@ function Invoke-OSyncExport {
     foreach ($cat in @('winget', 'pip', 'npm', 'dotfiles')) {
         if ($cat -notin $enabled) { continue }
         try {
+            if ($refreshErrors.ContainsKey($cat)) { throw $refreshErrors[$cat] }
             switch ($cat) {
                 'winget' {
                     # config.paths.* are tool-root-relative INPUT manifests
@@ -335,6 +354,7 @@ function Invoke-OSyncExport {
             Write-OSyncLog -Category 'export' -Level Info -Message "category 'runtime' export SKIPPED (-SkipRuntime): reused '$repoRuntimeDir' + $($reusedWingetIds.Count) runtime winget payload(s) from the landing zone." -Config $config | Out-Null
         }
         else {
+            if ($refreshErrors.ContainsKey('runtime')) { throw $refreshErrors['runtime'] }
             $runtimeReport = Export-OSyncRuntime -Config $config -StagingDir $staging
             Write-OSyncLog -Category 'export' -Level Info -Message "category 'runtime' export OK." -Config $config | Out-Null
         }
