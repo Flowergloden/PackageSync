@@ -41,7 +41,10 @@
          legal: bun installs everything from the npm list via the same registry).
      5c. npm LOCAL package prewarm (presence-gated on paths.npmLocalDirs): when the
          key is present and non-empty, the configured directories are scanned for
-         package.json files (the dir itself or its immediate subdirs). Discovered
+         package.json files (the dir itself or its immediate subdirs; a directory
+         declaring a monorepo workspace - pnpm-workspace.yaml / package.json
+         workspaces / lerna.json - additionally contributes its workspace members
+         discovered through the declared glob patterns, recursively). Discovered
          packages are robocopied to a LOCAL scratch dir (npm publish fails on UNC
          paths), then published into the one-shot Verdaccio in phase 1 (ALL publishes
          first so local-to-local deps resolve in any order) via a one-shot dummy-auth
@@ -50,16 +53,18 @@
          install-verified as name@version with a per-package FRESH cache in phase 2. Failures are
          recorded in report.local.failed and do not abort the rest of the export.
          When at least one package was published, <staging>\npm\local-packages.txt
-is delivered with 'name@version  # local: <source dir>' lines for published
+         is delivered with 'name@version  # local: <source dir>' lines for published
          packages and 'name@spec  # deps: <dir>' lines for deps-manifest entries (same
          parser as packages.txt for published lines; deps lines carry a different
          marker). An absent key or an empty array keeps behaviour identical to the
          pre-local baseline.
          A package.json that lacks name/version but has a non-empty 'dependencies'
-         object is treated as a "deps-manifest dir" (second-chance fallback in the
-         discovery pass): its dependency specs are warmed into the one-shot storage
-         snapshot (registry-resolved, like manifest entries) AFTER the main warm loop
-         and BEFORE the local publish phase. Specs containing ':' (file:/link:/
+         OR 'devDependencies' object is treated as a "deps-manifest dir" (second-
+         chance fallback in the discovery pass): its dependency specs are warmed
+         into the one-shot storage snapshot (registry-resolved, like manifest
+         entries) AFTER the main warm loop and BEFORE the local publish phase.
+         Workspace members are ALWAYS treated this way (never published - their
+         'workspace:*' specs cannot be). Specs containing ':' (file:/link:/
          workspace:/git+/http(s):/npm:) are rejected as non-registry-resolvable.
          Specs are deduped by lowercased package name against the manifest entries
          (npm/bun wins) and among deps dirs themselves (first wins).
@@ -720,6 +725,255 @@ function Read-ONpmPackageJson {
     return [pscustomobject]@{ Name = $name; Version = $version }
 }
 
+function Get-ONpmManifestDeps {
+    <#
+      Collects the registry-resolvable install specs ('name@spec' strings) a
+      package.json declares for its own build/runtime dependency tree. Used by
+      the local-package prewarm to harvest dependency specs from
+      "deps-manifest" directories (package.json without name/version) and from
+      discovered monorepo workspace members.
+
+      Harvests BOTH 'dependencies' and 'devDependencies' - a project's build
+      toolchain (typescript/vite/vitest/esbuild/...) lives in devDependencies,
+      and the whole point of the local prewarm is that B can `npm install`
+      offline. Specs whose value contains ':' (file:/link:/workspace:/git+/
+      http(s):/npm:) are NOT filtered here - the warm phase rejects them with
+      a 'skipped-invalid-spec' status so the operator still sees them.
+      Returns an array (possibly empty) of 'name@spec' strings.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        $PkgJson
+    )
+
+    $out = @()
+    if ($null -eq $PkgJson) { return @() }
+    foreach ($field in @('dependencies', 'devDependencies')) {
+        $obj = $null
+        # PS 5.1: property access on a missing member silently returns $null,
+        # so probe existence through PSObject.Properties first.
+        if ($null -ne $PkgJson.PSObject.Properties[$field]) {
+            $obj = $PkgJson.$field
+        }
+        if ($null -eq $obj) { continue }
+        foreach ($prop in $obj.PSObject.Properties) {
+            $spec = "$($prop.Name)@$($prop.Value)"
+            $out += $spec
+        }
+    }
+    return @($out)
+}
+
+function Get-ONpmWorkspacePatterns {
+    <#
+      Reads a monorepo workspace declaration from a directory and returns the
+      raw glob patterns it lists, or an empty array when the directory does
+      not declare a workspace. Supported shapes (first hit wins):
+        - pnpm-workspace.yaml : a 'packages:' block of '- pattern' list items
+          (comments and quoting handled; the block ends at the next top-level
+          key),
+        - package.json 'workspaces' : either an array of patterns or an object
+          with a 'packages' array,
+        - lerna.json 'packages' : an array of patterns.
+      Patterns are returned verbatim (forward slashes kept); expansion and
+      exclusion ('!pattern') handling live in Expand-ONpmWorkspacePackages.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Dir
+    )
+
+    $patterns = @()
+
+    # --- pnpm-workspace.yaml ---
+    $pnpmWs = Join-Path $Dir 'pnpm-workspace.yaml'
+    if (Test-Path -LiteralPath $pnpmWs -PathType Leaf) {
+        $inPackages = $false
+        foreach ($line in @(Get-Content -LiteralPath $pnpmWs -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*#') { continue }
+            if ($line -match '^packages\s*:') { $inPackages = $true; continue }
+            if (-not $inPackages) { continue }
+            if ($line -match '^\s*-\s*(.+?)\s*$') {
+                $val = $Matches[1].Trim().Trim("'").Trim('"').Trim()
+                if ($val.Length -gt 0) { $patterns += $val }
+            }
+            elseif ($line -match '^\S') {
+                # A new top-level key ends the packages block.
+                $inPackages = $false
+            }
+        }
+    }
+
+    # --- package.json 'workspaces' ---
+    if (@($patterns).Count -eq 0) {
+        $pkgJson = Join-Path $Dir 'package.json'
+        if (Test-Path -LiteralPath $pkgJson -PathType Leaf) {
+            try {
+                $pkg = Get-Content -LiteralPath $pkgJson -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+                $ws = $null
+                if ($null -ne $pkg -and $null -ne $pkg.PSObject.Properties['workspaces']) { $ws = $pkg.workspaces }
+                if ($ws -is [string]) {
+                    $patterns += $ws
+                }
+                elseif ($ws -is [System.Array]) {
+                    $patterns += @($ws)
+                }
+                elseif ($null -ne $ws -and $null -ne $ws.PSObject.Properties['packages']) {
+                    $patterns += @($ws.packages)
+                }
+            }
+            catch {
+                # A malformed/unreadable workspace root is not this helper's
+                # problem - the caller records package.json errors separately.
+            }
+        }
+    }
+
+    # --- lerna.json 'packages' ---
+    if (@($patterns).Count -eq 0) {
+        $lerna = Join-Path $Dir 'lerna.json'
+        if (Test-Path -LiteralPath $lerna -PathType Leaf) {
+            try {
+                $j = Get-Content -LiteralPath $lerna -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
+                if ($null -ne $j -and $null -ne $j.PSObject.Properties['packages'] -and $null -ne $j.packages) {
+                    $patterns += @($j.packages)
+                }
+            }
+            catch { }
+        }
+    }
+
+    return @($patterns | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { ([string]$_).Trim() })
+}
+
+function Get-ONpmGlobDirs {
+    <#
+      Recursive segment-walking glob expander for workspace package patterns.
+      'CurrentDir' is the directory the remaining 'Segments' are applied to;
+      a segment of '**' matches zero or more directory levels, a segment
+      containing '*'/'?' matches immediate child directories by name, and a
+      literal segment descends by name. When all segments are consumed the
+      directory is returned ONLY if it holds a package.json. 'node_modules' is
+      never descended into. Returns an array of absolute directory paths.
+
+      Cycle safety: a symlink/junction loop must not make the walker recurse
+      forever. Visited memo keys are the exact (segments, dir) state - a repeat
+      is pruned - and a generous depth cap backstops pathological nesting. A
+      concrete dir reached through different patterns has different segments,
+      so legitimate fan-in is not pruned.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentDir,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyCollection()]
+        [string[]]$Segments,
+
+        # Internal recursion guard (see the cycle-safety note above).
+        [Parameter(Mandatory = $false)]
+        [System.Collections.IDictionary]$Visited = $null,
+
+        [Parameter(Mandatory = $false)]
+        [int]$Depth = 0
+    )
+
+    if ($null -eq $Segments -or @($Segments).Count -eq 0) {
+        if (Test-Path -LiteralPath (Join-Path $CurrentDir 'package.json') -PathType Leaf) {
+            return @($CurrentDir)
+        }
+        return @()
+    }
+    if ($Depth -gt 64) { return @() }
+    if ($null -eq $Visited) { $Visited = @{} }
+
+    $seg = [string]$Segments[0]
+    $rest = @()
+    if (@($Segments).Count -gt 1) { $rest = @($Segments[1..(@($Segments).Count - 1)]) }
+
+    $memoKey = ("{0}|{1}" -f ($Segments -join '>'), $CurrentDir.ToLowerInvariant())
+    if ($Visited.ContainsKey($memoKey)) { return @() }
+    $Visited[$memoKey] = $true
+
+    $out = @()
+    if ($seg -eq '**') {
+        # Zero levels consumed here...
+        $out += @(Get-ONpmGlobDirs -CurrentDir $CurrentDir -Segments $rest -Visited $Visited -Depth ($Depth + 1))
+        # ...and one-or-more levels via each immediate subdirectory.
+        foreach ($sub in @(Get-ChildItem -LiteralPath $CurrentDir -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne 'node_modules' })) {
+            $out += @(Get-ONpmGlobDirs -CurrentDir $sub.FullName -Segments $Segments -Visited $Visited -Depth ($Depth + 1))
+        }
+        return @($out)
+    }
+    if ($seg.Contains('*') -or $seg.Contains('?')) {
+        foreach ($sub in @(Get-ChildItem -LiteralPath $CurrentDir -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne 'node_modules' })) {
+            if ($sub.Name -like $seg) {
+                $out += @(Get-ONpmGlobDirs -CurrentDir $sub.FullName -Segments $rest -Visited $Visited -Depth ($Depth + 1))
+            }
+        }
+        return @($out)
+    }
+    $next = Join-Path $CurrentDir $seg
+    if (Test-Path -LiteralPath $next -PathType Container) {
+        return @(Get-ONpmGlobDirs -CurrentDir $next -Segments $rest -Visited $Visited -Depth ($Depth + 1))
+    }
+    return @()
+}
+
+function Expand-ONpmWorkspacePackages {
+    <#
+      Expands a directory's workspace glob patterns into the concrete
+      workspace-member package directories (any directory holding a
+      package.json). '!pattern' entries are exclusions (applied after
+      inclusion). Absolute patterns and patterns escaping the base directory
+      ('..') are ignored. De-duplicated by lowercased path. Returns an array
+      of absolute directory paths; empty when the dir declares no workspace or
+      nothing matches.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Dir,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyCollection()]
+        [string[]]$Patterns
+    )
+
+    if ($null -eq $Patterns -or @($Patterns).Count -eq 0) { return @() }
+
+    $included = @{}
+    $excluded = @{}
+    foreach ($raw in @($Patterns)) {
+        if ([string]::IsNullOrWhiteSpace([string]$raw)) { continue }
+        $pat = ([string]$raw).Trim()
+        $neg = $false
+        if ($pat.StartsWith('!')) { $neg = $true; $pat = $pat.Substring(1) }
+        $pat = $pat.TrimStart('./').TrimEnd('/')
+        $pat = $pat -replace '/', '\'
+        if ($pat.Length -eq 0) { continue }
+        if ([System.IO.Path]::IsPathRooted($pat) -or $pat.Contains('..')) { continue }
+
+        $segments = @($pat -split '\\' | Where-Object { $_ -ne '' -and $_ -ne '.' })
+        foreach ($m in @(Get-ONpmGlobDirs -CurrentDir $Dir -Segments $segments)) {
+            $key = $m.ToLowerInvariant()
+            if ($neg) { $excluded[$key] = $true } else { $included[$key] = $m }
+        }
+    }
+
+    $result = @()
+    foreach ($key in @($included.Keys)) {
+        if ($excluded.ContainsKey($key)) { continue }
+        $result += $included[$key]
+    }
+    return @($result)
+}
+
 function Get-ONpmLocalPackageDirs {
     <#
       Discovery pass for the npm local-package prewarm. For each configured
@@ -729,18 +983,29 @@ function Get-ONpmLocalPackageDirs {
         - a dir that itself contains package.json IS one package dir,
         - otherwise its IMMEDIATE subdirectories (non-recursive) are scanned
           for package.json files,
+        - a dir that declares a monorepo workspace (pnpm-workspace.yaml /
+          package.json 'workspaces' / lerna.json 'packages') ADDITIONALLY
+          contributes its workspace-member packages, discovered through the
+          declared glob patterns (nested arbitrarily deep),
         - a dir yielding none yields a Warning entry (nothing to publish).
       Every candidate is read via Read-ONpmPackageJson (a read/validation
       failure yields an Error entry). Candidates that fail due to missing
-      name/version but have valid JSON get a SECOND CHANCE: if the
-      'dependencies' object is non-empty the entry becomes a "deps-manifest"
-      entry (Name/Version = $null, Deps = array of 'name@spec' strings,
-      Warning = explanation). A valid JSON with no dependencies at all yields
-      an Error mentioning both acceptable shapes. Invalid JSON and I/O errors
-      never get the deps fallback.
+      name/version but have valid JSON get a SECOND CHANCE: if the combined
+      'dependencies'/'devDependencies' objects are non-empty the entry becomes
+      a "deps-manifest" entry (Name/Version = $null, Deps = array of
+      'name@spec' strings, Warning = explanation). A valid JSON with no
+      dependencies at all yields an Error mentioning both acceptable shapes.
+      Invalid JSON and I/O errors never get the deps fallback.
+      Workspace members are ALWAYS treated as dependency manifests - their
+      'dependencies'/'devDependencies' specs are harvested (Workspace
+      members are the monorepo's own packages, which carry 'workspace:*'
+      specs and must not be published; to publish a private package, point
+      npmLocalDirs directly at it). Non-empty specs warm into the snapshot;
+      a workspace member with nothing to harvest yields a Warning.
       Candidates are de-duplicated by LOWERCASED package name - the first
       occurrence wins, a later same-name candidate is skipped with a Warning
-      entry (npm would reject the duplicate publish anyway).
+      entry (npm would reject the duplicate publish anyway). Workspace-member
+      dirs already claimed as a candidate are not harvested twice.
       Returns entries @{ Dir; Name; Version; Deps; Error; Warning } where at
       most one of Error/Warning is set; Name/Version are only set for
       publishable candidates; Deps is set only for deps-manifest entries.
@@ -782,7 +1047,15 @@ function Get-ONpmLocalPackageDirs {
                 ForEach-Object { $_.FullName })
         }
 
-        if ($candidates.Count -eq 0) {
+        # Monorepo workspace members (nested, discovered via the declared glob
+        # patterns) - harvested as dependency manifests, never published.
+        $workspacePatterns = @(Get-ONpmWorkspacePatterns -Dir $dir)
+        $workspaceDirs = @(Expand-ONpmWorkspacePackages -Dir $dir -Patterns $workspacePatterns)
+        $candidateKeys = @{}
+        foreach ($c in $candidates) { $candidateKeys[$c.ToLowerInvariant()] = $true }
+        $extraWorkspaceDirs = @($workspaceDirs | Where-Object { -not $candidateKeys.ContainsKey($_.ToLowerInvariant()) })
+
+        if ($candidates.Count -eq 0 -and $extraWorkspaceDirs.Count -eq 0) {
             $results += [pscustomobject]@{
                 Dir     = $dir
                 Name    = $null
@@ -806,25 +1079,17 @@ function Get-ONpmLocalPackageDirs {
                 $errMsg = $_.Exception.Message
                 # Second chance: a package.json with valid JSON but missing
                 # name/version may still be a "deps-manifest dir" - it carries
-                # a non-empty 'dependencies' object whose entries we warm as
-                # registry-resolved specs. Only valid-JSON errors qualify for
-                # the fallback; invalid JSON and I/O errors never do.
+                # a non-empty 'dependencies'/'devDependencies' object whose
+                # entries we warm as registry-resolved specs. Only valid-JSON
+                # errors qualify for the fallback; invalid JSON and I/O errors
+                # never do.
                 if ($errMsg -match "no non-empty '(name|version)'") {
                     $isDepsCandidate = $false
                     try {
                         $rawAgain = Get-Content -LiteralPath (Join-Path $pkgDir 'package.json') -Raw -Encoding UTF8 -ErrorAction Stop
                         $pkgAgain = $rawAgain | ConvertFrom-Json
-                        $depsObj = $null
-                        # PS 5.1: PSCustomObject property access without checking
-                        # existence silently returns $null for a missing member.
-                        if ($null -ne $pkgAgain -and $null -ne $pkgAgain.dependencies) {
-                            $depsObj = $pkgAgain.dependencies
-                        }
-                        if ($null -ne $depsObj -and @($depsObj.PSObject.Properties).Count -gt 0) {
-                            $depsArray = @()
-                            foreach ($prop in $depsObj.PSObject.Properties) {
-                                $depsArray += "$($prop.Name)@$($prop.Value)"
-                            }
+                        $depsArray = @(Get-ONpmManifestDeps -PkgJson $pkgAgain)
+                        if (@($depsArray).Count -gt 0) {
                             $results += [pscustomobject]@{
                                 Dir     = $pkgDir
                                 Name    = $null
@@ -847,7 +1112,7 @@ function Get-ONpmLocalPackageDirs {
                         Name    = $null
                         Version = $null
                         Deps    = $null
-                        Error   = "$errMsg (publishable package needs name+version, dependency manifest needs a non-empty 'dependencies' object)"
+                        Error   = "$errMsg (publishable package needs name+version, dependency manifest needs a non-empty 'dependencies' or 'devDependencies' object)"
                         Warning = $null
                     }
                     continue
@@ -885,6 +1150,49 @@ function Get-ONpmLocalPackageDirs {
                 Error   = $null
                 Warning = $null
             }
+        }
+
+        # Workspace members: harvest dependency/devDependency specs (never
+        # publish). A member with nothing warmable still surfaces a Warning so
+        # the operator knows it was seen.
+        foreach ($wdir in $extraWorkspaceDirs) {
+            $entry = $null
+            try {
+                $wRaw = Get-Content -LiteralPath (Join-Path $wdir 'package.json') -Raw -Encoding UTF8 -ErrorAction Stop
+                $wPkg = $wRaw | ConvertFrom-Json
+                $wDeps = @(Get-ONpmManifestDeps -PkgJson $wPkg)
+                if (@($wDeps).Count -gt 0) {
+                    $entry = [pscustomobject]@{
+                        Dir     = $wdir
+                        Name    = $null
+                        Version = $null
+                        Deps    = @($wDeps)
+                        Error   = $null
+                        Warning = "workspace member '$wdir' - harvested $(@($wDeps).Count) dependency spec(s) (workspace packages are not published)"
+                    }
+                }
+                else {
+                    $entry = [pscustomobject]@{
+                        Dir     = $wdir
+                        Name    = $null
+                        Version = $null
+                        Deps    = $null
+                        Error   = $null
+                        Warning = "workspace member '$wdir' declares no dependencies/devDependencies to harvest"
+                    }
+                }
+            }
+            catch {
+                $entry = [pscustomobject]@{
+                    Dir     = $wdir
+                    Name    = $null
+                    Version = $null
+                    Deps    = $null
+                    Error   = "cannot read workspace member '$wdir': $($_.Exception.Message)"
+                    Warning = $null
+                }
+            }
+            $results += $entry
         }
     }
 
@@ -1125,8 +1433,11 @@ function Export-OSyncNpm {
     # --- 5c. discover npm LOCAL packages (presence-gated on paths.npmLocalDirs) ---
     # An absent key or an empty JSON array (PS 5.1 parses empty arrays as
     # $null) keeps the export identical to the pre-local baseline. A configured
-    # dir that is missing, has no package.json, or holds an invalid one is
-    # recorded in localFailed and does NOT abort the remaining export work.
+    # dir that is missing, has no package.json, or holds an invalid one, or a
+    # monorepo workspace whose members cannot be read, is recorded in
+    # localFailed and does NOT abort the remaining export work. Workspaces
+    # declared by a configured dir contribute their members (harvested as
+    # dependency manifests).
     $localEnabled = $false
     $localDirsResolved = @()
     $localFailed = @()

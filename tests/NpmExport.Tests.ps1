@@ -1015,6 +1015,181 @@ Describe 'Get-ONpmLocalPackageDirs' {
         $r[0].Error | Should -BeLike '*not valid JSON*'
         $r[0].Deps | Should -BeNullOrEmpty
     }
+    # --- devDependencies harvest + workspace recursion (2026-10) ---
+    # The original deps fallback only looked at 'dependencies', so a
+    # package.json that declares its build toolchain in 'devDependencies'
+    # (e.g. the understand-anything monorepo root) was rejected as an Error.
+    # devDependencies are now harvested too, and a monorepo workspace
+    # (pnpm-workspace.yaml / package.json workspaces / lerna.json) is walked
+    # via its declared glob patterns so nested members are warmed.
+
+    It 'treats a devDependencies-only package.json as a Deps entry (build toolchain)' {
+        $dir = Join-Path $script:neRoot 'workspacedisc\devonly'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $dir 'package.json'),
+            '{ "name": "root", "devDependencies": { "typescript": "^5.7.0", "vitest": "^3.1.0" } }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $dir {
+            param($dir)
+            Get-ONpmLocalPackageDirs -Dirs @($dir)
+        })
+        $r.Count | Should -Be 1
+        $r[0].Error | Should -BeNullOrEmpty
+        $r[0].Deps | Should -Not -BeNullOrEmpty
+        @($r[0].Deps).Count | Should -Be 2
+        @($r[0].Deps | Where-Object { $_ -eq 'typescript@^5.7.0' }).Count | Should -Be 1
+        @($r[0].Deps | Where-Object { $_ -eq 'vitest@^3.1.0' }).Count | Should -Be 1
+    }
+
+    It 'combines dependencies and devDependencies for the deps fallback' {
+        $dir = Join-Path $script:neRoot 'workspacedisc\both'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $dir 'package.json'),
+            '{ "dependencies": { "fuse.js": "^7.1.0" }, "devDependencies": { "typescript": "^5.7.0" } }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $dir {
+            param($dir)
+            Get-ONpmLocalPackageDirs -Dirs @($dir)
+        })
+        $r.Count | Should -Be 1
+        @($r[0].Deps).Count | Should -Be 2
+        @($r[0].Deps | Where-Object { $_ -eq 'fuse.js@^7.1.0' }).Count | Should -Be 1
+        @($r[0].Deps | Where-Object { $_ -eq 'typescript@^5.7.0' }).Count | Should -Be 1
+    }
+
+    It 'mentions devDependencies in the both-shapes Error when neither is present' {
+        $dir = Join-Path $script:neRoot 'workspacedisc\nodeps2'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $dir 'package.json'),
+            '{ "name": "root" }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $dir {
+            param($dir)
+            Get-ONpmLocalPackageDirs -Dirs @($dir)
+        })
+        $r.Count | Should -Be 1
+        $r[0].Error | Should -BeLike '*devDependencies*'
+    }
+
+    It 'does NOT recurse into a non-workspace package dir (immediate subdirs only)' {
+        $root = Join-Path $script:neRoot 'workspacedisc\plainroot'
+        $nested = Join-Path $root 'packages\deep-pkg'
+        New-Item -ItemType Directory -Path $nested -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $root 'package.json'),
+            '{ "name": "plain-root", "version": "1.0.0" }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $nested 'package.json'),
+            '{ "dependencies": { "should-not-be-seen": "1.0.0" } }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $root {
+            param($root)
+            Get-ONpmLocalPackageDirs -Dirs @($root)
+        })
+        # Only the root itself (a publishable package) is discovered - the
+        # self-dir short-circuit means no workspace walk happens either.
+        $r.Count | Should -Be 1
+        $r[0].Name | Should -Be 'plain-root'
+        @($r | Where-Object { @($_.Deps) -contains 'should-not-be-seen@1.0.0' }).Count | Should -Be 0
+    }
+
+    It 'recursively discovers nested workspace members declared in pnpm-workspace.yaml (root has no top-level package.json)' {
+        $root = Join-Path $script:neRoot 'workspacedisc\pnpm'
+        $core = Join-Path $root 'packages\core'
+        $deep = Join-Path $root 'understand-anything-plugin\packages\dashboard'
+        New-Item -ItemType Directory -Path $core -Force | Out-Null
+        New-Item -ItemType Directory -Path $deep -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $root 'pnpm-workspace.yaml'),
+            "packages:`n  - 'packages/*'`n  - 'understand-anything-plugin/packages/*'`nallowBuilds:`n  esbuild: true`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $core 'package.json'),
+            '{ "name": "@x/core", "version": "0.1.0", "dependencies": { "fuse.js": "^7.1.0" } }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $deep 'package.json'),
+            '{ "name": "@x/dashboard", "version": "0.1.0", "devDependencies": { "vite": "^6.4.2" } }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $root {
+            param($root)
+            Get-ONpmLocalPackageDirs -Dirs @($root)
+        })
+        # Two workspace members, both harvested (workspace packages are never published).
+        $r.Count | Should -Be 2
+        $allDeps = @($r | ForEach-Object { @($_.Deps) })
+        @($allDeps | Where-Object { $_ -eq 'fuse.js@^7.1.0' }).Count | Should -Be 1
+        @($allDeps | Where-Object { $_ -eq 'vite@^6.4.2' }).Count | Should -Be 1
+        @($r | Where-Object { $_.Name }).Count | Should -Be 0
+    }
+
+    It 'harvests a workspace member that only declares devDependencies' {
+        $root = Join-Path $script:neRoot 'workspacedisc\wsdev'
+        $pkg = Join-Path $root 'packages\lib'
+        New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $root 'pnpm-workspace.yaml'), "packages:`n  - 'packages/*'`n", (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $pkg 'package.json'),
+            '{ "name": "@x/lib", "version": "1.0.0", "devDependencies": { "vitest": "^3.1.0" } }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $root {
+            param($root)
+            Get-ONpmLocalPackageDirs -Dirs @($root)
+        })
+        $r.Count | Should -Be 1
+        @($r[0].Deps) | Should -Contain 'vitest@^3.1.0'
+    }
+
+    It 'honors workspace glob exclusions (!pattern) and nested ** patterns' {
+        $root = Join-Path $script:neRoot 'workspacedisc\wsexclude'
+        $keep = Join-Path $root 'plugins\a\pkg-a'
+        $drop = Join-Path $root 'plugins\excluded\pkg-b'
+        New-Item -ItemType Directory -Path $keep -Force | Out-Null
+        New-Item -ItemType Directory -Path $drop -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $root 'pnpm-workspace.yaml'),
+            "packages:`n  - 'plugins/**'`n  - '!plugins/excluded/**'`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $keep 'package.json'),
+            '{ "dependencies": { "a-dep": "1.0.0" } }', (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $drop 'package.json'),
+            '{ "dependencies": { "b-dep": "1.0.0" } }', (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $root {
+            param($root)
+            Get-ONpmLocalPackageDirs -Dirs @($root)
+        })
+        $allDeps = @($r | ForEach-Object { @($_.Deps) })
+        @($allDeps | Where-Object { $_ -eq 'a-dep@1.0.0' }).Count | Should -Be 1
+        @($allDeps | Where-Object { $_ -eq 'b-dep@1.0.0' }).Count | Should -Be 0
+    }
+
+    It 'reads the package.json workspaces array shape' {
+        $root = Join-Path $script:neRoot 'workspacedisc\wsjson'
+        $pkg = Join-Path $root 'packages\web'
+        New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $root 'package.json'),
+            '{ "private": true, "workspaces": [ "packages/*" ] }',
+            (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $pkg 'package.json'),
+            '{ "dependencies": { "react": "^19.0.0" } }', (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $root {
+            param($root)
+            Get-ONpmLocalPackageDirs -Dirs @($root)
+        })
+        # The root package.json has no name/version -> its own deps fallback
+        # (workspaces is not a dependency field) -> Error; the member is harvested.
+        $allDeps = @($r | ForEach-Object { @($_.Deps) })
+        @($allDeps | Where-Object { $_ -eq 'react@^19.0.0' }).Count | Should -Be 1
+    }
+
+    It 'does not double-harvest a workspace member that is also an immediate subdir' {
+        $root = Join-Path $script:neRoot 'workspacedisc\wsdedup'
+        $cfg = Join-Path $root 'cfg'
+        New-Item -ItemType Directory -Path $cfg -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $root 'pnpm-workspace.yaml'), "packages:`n  - 'cfg'`n", (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllText((Join-Path $cfg 'package.json'),
+            '{ "dependencies": { "only-once": "1.0.0" } }', (New-Object System.Text.UTF8Encoding($false)))
+        $r = @(InModuleScope OfflineSync -ArgumentList $root {
+            param($root)
+            Get-ONpmLocalPackageDirs -Dirs @($root)
+        })
+        @($r).Count | Should -Be 1
+        @(@($r[0].Deps) | Where-Object { $_ -eq 'only-once@1.0.0' }).Count | Should -Be 1
+    }
 }
 
 Describe 'Test-ONpmPackageInStorage' {
@@ -1659,4 +1834,3 @@ $report.local.published.Count | Should -Be 1
         @($report.local.failed | Where-Object { $_.Name -eq 'will-fail' -and $_.Error -like '*deps warm failed*' }).Count | Should -Be 1
     }
 }
-
