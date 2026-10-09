@@ -261,3 +261,89 @@ function Test-OSyncWingetNoApplicableInstaller {
     if ($ExitCode -eq -1978335216) { return $true }
     return ($Output -match '(?i)no applicable installer|找不到适用的安装程序')
 }
+
+function Test-OSyncWingetIsPortable {
+    <#
+    .SYNOPSIS
+    Returns true when a package directory's *.yaml declares a portable installer.
+
+    .DESCRIPTION
+    winget expresses portable packaging as `InstallerType: portable`, or as an
+    archive installer (`InstallerType: zip`) whose nested payload is portable
+    (`NestedInstallerType: portable`).  Both forms are matched at any
+    indentation, mirroring Test-OSyncWingetNeedsUserScope's line-based scan.
+
+    This drives the B-side reactive machine->user scope fallback, so the gate is
+    deliberately narrow: every non-portable installer type (wix/msi/exe/inno/
+    burn/nullsoft/msix/appx/...) returns $false.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageDir
+    )
+
+    if (-not [System.IO.Directory]::Exists($PackageDir)) { return $false }
+
+    $yamls = @(Get-ChildItem -LiteralPath $PackageDir -Filter '*.yaml' -File -ErrorAction SilentlyContinue)
+    $portablePattern = '(?im)^\s*(?:InstallerType|NestedInstallerType):\s*portable\b'
+
+    foreach ($yaml in $yamls) {
+        $text = [System.IO.File]::ReadAllText($yaml.FullName, [System.Text.Encoding]::UTF8)
+        if ($text -match $portablePattern) { return $true }
+    }
+    return $false
+}
+
+function Test-OSyncWingetNeedsUserScopeRetry {
+    <#
+    .SYNOPSIS
+    Returns true when a failed winget install is worth retrying with user scope.
+
+    .DESCRIPTION
+    Only permission / portable-class failures qualify:
+
+        -2147024891  0x80070005  E_ACCESSDENIED
+        -1978335150  0x8A150052  PORTABLE_INSTALL_FAILED
+        -1978335148  0x8A150054  PORTABLE_PACKAGE_ALREADY_EXISTS
+        -1978335145  0x8A150057  PORTABLE_UNINSTALL_FAILED
+
+    The signed exit code is the primary signal.  A locale-tolerant text
+    fallback recognises the same conditions when winget renders a localized
+    message, because the CLI can emit localized text instead of the stable
+    code.  Deterministic failures (version not found / no applicable
+    installer) are deliberately NOT matched - retrying those with user scope
+    would only add a second meaningless failure.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $false)]
+        [int]$ExitCode = 0,
+
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
+        [string]$Output = ''
+    )
+
+    if ($ExitCode -in @(
+            -2147024891, # 0x80070005 E_ACCESSDENIED
+            -1978335150, # 0x8A150052 PORTABLE_INSTALL_FAILED
+            -1978335148, # 0x8A150054 PORTABLE_PACKAGE_ALREADY_EXISTS
+            -1978335145  # 0x8A150057 PORTABLE_UNINSTALL_FAILED
+        )) {
+        return $true
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Output)) { return $false }
+
+    # Access denied (English / Chinese) or an explicit hex code in the text.
+    if ($Output -match '(?i)access is denied|拒绝访问|0x80070005') { return $true }
+    if ($Output -match '(?i)0x8a150052|0x8a150054|0x8a150057') { return $true }
+
+    # Portable install/uninstall failure rendered as localized prose.
+    if ($Output -match '(?i)portable' -and $Output -match '(?i)fail|失败|错误') { return $true }
+
+    return $false
+}

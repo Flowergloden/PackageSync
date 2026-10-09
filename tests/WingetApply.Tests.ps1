@@ -773,3 +773,374 @@ ManifestVersion: 1.12.0
         $text -match '(?m)^\s*Dependencies:' | Should -BeExactly $false
     }
 }
+Describe 'Winget.Common: portable type and scope-retry detection (pure functions)' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
+    }
+
+    Context 'Test-OSyncWingetIsPortable' {
+        It 'returns $true for a zip installer with NestedInstallerType: portable' {
+            $dir = Join-Path $TestDrive 'portable-zip'
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $dir 'p.yaml'),
+                "PackageIdentifier: openai.codex`nInstallers:`n- Architecture: x64`n  InstallerType: zip`n  NestedInstallerType: portable",
+                (New-Object System.Text.UTF8Encoding($true)))
+            Test-OSyncWingetIsPortable -PackageDir $dir | Should -BeTrue
+        }
+
+        It 'returns $true for a bare InstallerType: portable' {
+            $dir = Join-Path $TestDrive 'portable-bare'
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $dir 'p.yaml'), 'InstallerType: portable',
+                (New-Object System.Text.UTF8Encoding($true)))
+            Test-OSyncWingetIsPortable -PackageDir $dir | Should -BeTrue
+        }
+
+        It 'returns $false for wix / inno / msix / exe manifests' {
+            foreach ($type in @('wix', 'inno', 'msix', 'exe', 'burn', 'nullsoft')) {
+                $dir = Join-Path $TestDrive ('np-' + $type)
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                [System.IO.File]::WriteAllText((Join-Path $dir 'p.yaml'), "InstallerType: $type",
+                    (New-Object System.Text.UTF8Encoding($true)))
+                Test-OSyncWingetIsPortable -PackageDir $dir | Should -BeFalse
+            }
+        }
+
+        It 'returns $false for a missing directory' {
+            Test-OSyncWingetIsPortable -PackageDir (Join-Path $TestDrive 'does-not-exist') | Should -BeFalse
+        }
+    }
+
+    Context 'Test-OSyncWingetNeedsUserScopeRetry' {
+        It 'returns $true for each permission / portable-class exit code' {
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode -2147024891 | Should -BeTrue   # 0x80070005
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode -1978335150 | Should -BeTrue   # 0x8A150052
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode -1978335148 | Should -BeTrue   # 0x8A150054
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode -1978335145 | Should -BeTrue   # 0x8A150057
+        }
+
+        It 'returns $false for exit 0 and deterministic failures' {
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode 0 | Should -BeFalse
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode -1978335209 | Should -BeFalse  # version not found
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode -1978335216 | Should -BeFalse  # no applicable installer
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode 1 | Should -BeFalse
+        }
+
+        It 'falls back to locale-tolerant access-denied / portable text' {
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode 1 -Output 'Access is denied.' | Should -BeTrue
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode 1 -Output '拒绝访问。' | Should -BeTrue
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode 1 -Output 'error 0x80070005' | Should -BeTrue
+        }
+
+        It 'does not match unrelated output' {
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode 1 -Output 'installer returned 1603' | Should -BeFalse
+            Test-OSyncWingetNeedsUserScopeRetry -ExitCode 1 -Output '' | Should -BeFalse
+        }
+    }
+}
+
+Describe 'WingetApply: portable reactive scope fallback' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\ManifestParse.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\HttpServer.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\State.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetApply.ps1')
+
+        $script:fixtureDir = Join-Path $PSScriptRoot 'fixtures\winget\7zip.7zip'
+
+        $script:WritePortable = {
+            param([string]$Root, [string]$Id)
+            $pkgDir = Join-Path $Root ('winget\{0}' -f $Id)
+            New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+            $stem = 'Tool_1.0.0_x64'
+            [System.IO.File]::WriteAllText((Join-Path $pkgDir ($stem + '.yaml')),
+                "PackageIdentifier: $Id`nPackageVersion: 1.0.0`nInstallers:`n- Architecture: x64`n  InstallerType: zip`n  NestedInstallerType: portable`n  InstallerUrl: https://example.invalid/tool.zip`n  InstallerSha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc`nManifestType: merged`nManifestVersion: 1.12.0",
+                (New-Object System.Text.UTF8Encoding($true)))
+            [System.IO.File]::WriteAllBytes((Join-Path $pkgDir ($stem + '.zip')), [byte[]]@(1, 2, 3))
+            ConvertTo-OSyncWingetYamlContent -YamlPath (Join-Path $pkgDir ($stem + '.yaml')) `
+                -IdDir $pkgDir -Id $Id -HttpBind '127.0.0.1' -HttpPort 8788 | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $Root 'winget\packages.txt'), "$Id@1.0.0`r`n",
+                (New-Object System.Text.UTF8Encoding($true)))
+        }
+
+        $script:NewPortableWork = {
+            param([string]$Root, [string]$Id = 'synthetic.Portable')
+            & $script:WritePortable $Root $Id
+            return $Root
+        }
+
+        $script:NewConfig = {
+            param([string]$StateDir, [string]$Scope = 'machine')
+            return [pscustomobject]@{
+                role     = 'B'
+                stateDir = $StateDir
+                httpPort = 8788
+                winget   = [pscustomobject]@{ scope = $Scope; architecture = 'x64' }
+            }
+        }
+
+        # Records every Invoke-OSyncWingetInstall call (scope + product code)
+        # and serves a per-call result queue for install invocations.
+        $script:calls = @()
+        $script:installQueue = @()
+        $script:lastQueue = @()
+
+        Mock Resolve-OSyncWingetExePath { return 'C:\fake\winget.exe' }
+        Mock Start-OSyncHttpServer { return [pscustomobject]@{ IsStopped = $false } }
+        Mock Stop-OSyncHttpServer { }
+        # Synthetic ARP snapshot so cleanup resolves a product code without
+        # touching the real registry.
+        Mock Get-OSyncWingetUninstallEntries {
+            return @([pscustomobject]@{ Key = '{11111111-2222-3333-4444-555555555555}'; WinGetPackageIdentifier = $script:arpId })
+        }
+        Mock Invoke-OSyncWingetInstall {
+            $script:calls += ,@($Arguments)
+            if ($Arguments[0] -eq 'uninstall') {
+                return [pscustomobject]@{ ExitCode = $script:cleanupExit; TimedOut = $false; Output = 'mocked cleanup' }
+            }
+            if ($script:installQueue.Count -gt 0) {
+                $code = $script:installQueue[0]
+                $script:installQueue = @($script:installQueue | Select-Object -Skip 1)
+            }
+            else {
+                $code = 0
+            }
+            return [pscustomobject]@{ ExitCode = $code; TimedOut = $false; Output = ('mocked install output (exit {0})' -f $code) }
+        }
+    }
+
+    BeforeEach {
+        $script:calls = @()
+        $script:installQueue = @()
+        $script:cleanupExit = 0
+        $script:arpId = 'synthetic.Portable'
+    }
+
+    It 'does NOT fall back for a non-portable access-denied failure (single attempt, plain failed entry)' {
+        $work = Join-Path $TestDrive 'work-np-ad'
+        $pkgDir = Join-Path $work 'winget\np.Pkg'
+        New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $script:fixtureDir '7-Zip_26.02_Machine_X64_wix_zh-CN.yaml') -Destination $pkgDir
+        [System.IO.File]::WriteAllBytes((Join-Path $pkgDir '7-Zip_26.02_Machine_X64_wix_zh-CN.msi'), [byte[]]@(1))
+        ConvertTo-OSyncWingetYamlContent -YamlPath (Join-Path $pkgDir '7-Zip_26.02_Machine_X64_wix_zh-CN.yaml') `
+            -IdDir $pkgDir -Id 'np.Pkg' -HttpBind '127.0.0.1' -HttpPort 8788 | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $work 'winget\packages.txt'), "np.Pkg@26.02`r`n", (New-Object System.Text.UTF8Encoding($true)))
+
+        $script:installQueue = @(-2147024891)
+        $cfg = & $script:NewConfig (Join-Path $TestDrive 'state-np-ad')
+
+        { Invoke-OSyncWingetApply -WorkDir $work -Config $cfg } |
+            Should -Throw -ExpectedMessage '*np.Pkg*'
+
+        # Exactly ONE install call, no cleanup/uninstall call.
+        @($script:calls | Where-Object { $_[0] -eq 'install' }).Count | Should -Be 1
+        @($script:calls | Where-Object { $_[0] -eq 'uninstall' }).Count | Should -Be 0
+        @($script:calls | Where-Object { $_[0] -eq 'install' })[0] | Should -Contain 'machine'
+    }
+
+    It 'falls back to user scope after a portable machine failure, records ScopeFallback, and keeps config scope' {
+        $work = & $script:NewPortableWork (Join-Path $TestDrive 'work-portable-ok')
+        $script:arpId = 'synthetic.Portable'
+        $script:installQueue = @(-2147024891, 0)   # machine denies, user succeeds
+        $script:cleanupExit = -2147024891          # cleanup also denied (must not block)
+        $cfg = & $script:NewConfig (Join-Path $TestDrive 'state-portable-ok')
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config $cfg
+
+        $report.ok.Count | Should -Be 1
+        $report.ok[0].Id | Should -Be 'synthetic.Portable'
+        $report.ok[0].Scope | Should -Be 'user'
+        $report.ok[0].ScopeFallback | Should -BeTrue
+        $report.failed.Count | Should -Be 0
+
+        $installCalls = @($script:calls | Where-Object { $_[0] -eq 'install' })
+        $installCalls.Count | Should -Be 2
+        $installCalls[0] | Should -Contain 'machine'
+        $installCalls[1] | Should -Contain 'user'
+        # Same manifest dir used for both attempts.
+        $installCalls[0][2] | Should -Be $installCalls[1][2]
+
+        # Config scope object is NOT rewritten.
+        $cfg.winget.scope | Should -Be 'machine'
+
+        # Cleanup ran before the user retry and preferred --product-code.
+        $uninstall = @($script:calls | Where-Object { $_[0] -eq 'uninstall' })
+        $uninstall.Count | Should -Be 1
+        $uninstall[0] | Should -Contain '--product-code'
+        $uninstall[0] | Should -Contain '{11111111-2222-3333-4444-555555555555}'
+    }
+
+    It 'records both scope attempts when machine and user both fail, and continues' {
+        $work = & $script:NewPortableWork (Join-Path $TestDrive 'work-portable-both-fail')
+        $script:arpId = 'synthetic.Portable'
+        $script:installQueue = @(-2147024891, -2147024891)
+        $cfg = & $script:NewConfig (Join-Path $TestDrive 'state-portable-both-fail')
+
+        { Invoke-OSyncWingetApply -WorkDir $work -Config $cfg } |
+            Should -Throw -ExpectedMessage '*synthetic.Portable*'
+
+        # The aggregate throw discards the in-flight report, so re-run with a
+        # probe that captures the failed entry via the log JSONL instead.
+        $jsonl = Join-Path (Join-Path $cfg.stateDir 'run\logs') ('osync-{0}.jsonl' -f [DateTime]::UtcNow.ToString('yyyyMMdd'))
+        $lines = @(Get-Content -LiteralPath $jsonl)
+        $scoped = @($lines | Where-Object { $_ -match 'ScopeAttempts' })
+        $scoped.Count | Should -BeGreaterThan 0
+        ($scoped[-1] -match 'machine' -and $scoped[-1] -match 'user') | Should -BeTrue
+    }
+
+    It 'does NOT run proactive cleanup on a first-attempt success' {
+        $work = & $script:NewPortableWork (Join-Path $TestDrive 'work-portable-first-ok')
+        $script:installQueue = @(0)
+        $cfg = & $script:NewConfig (Join-Path $TestDrive 'state-portable-first-ok')
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config $cfg
+
+        $report.ok.Count | Should -Be 1
+        $report.ok[0].Scope | Should -Be 'machine'
+        $report.ok[0].ScopeFallback | Should -BeFalse
+        @($script:calls | Where-Object { $_[0] -eq 'uninstall' }).Count | Should -Be 0
+    }
+
+    It 'falls back to user scope on 0x8A150054 (leftover empty ARP key collision)' {
+        $work = & $script:NewPortableWork (Join-Path $TestDrive 'work-portable-054')
+        $script:arpId = 'synthetic.Portable'
+        $script:installQueue = @(-1978335148, 0)   # machine hits PORTABLE_PACKAGE_ALREADY_EXISTS, user succeeds
+        $cfg = & $script:NewConfig (Join-Path $TestDrive 'state-portable-054')
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config $cfg
+
+        $report.ok.Count | Should -Be 1
+        $report.ok[0].Scope | Should -Be 'user'
+        $report.ok[0].ScopeFallback | Should -BeTrue
+
+        $installCalls = @($script:calls | Where-Object { $_[0] -eq 'install' })
+        $installCalls.Count | Should -Be 2
+        $installCalls[0] | Should -Contain 'machine'
+        $installCalls[1] | Should -Contain 'user'
+        $cfg.winget.scope | Should -Be 'machine'
+    }
+
+    It 'does NOT trigger fallback for a portable deterministic failure (version not found)' {
+        $work = & $script:NewPortableWork (Join-Path $TestDrive 'work-portable-deterministic')
+        $script:installQueue = @(-1978335209)   # version not found
+        $cfg = & $script:NewConfig (Join-Path $TestDrive 'state-portable-deterministic')
+
+        { Invoke-OSyncWingetApply -WorkDir $work -Config $cfg } |
+            Should -Throw -ExpectedMessage '*synthetic.Portable*'
+
+        @($script:calls | Where-Object { $_[0] -eq 'install' }).Count | Should -Be 1
+        @($script:calls | Where-Object { $_[0] -eq 'uninstall' }).Count | Should -Be 0
+    }
+
+    It 'resolves the product code from an injected ARP snapshot and returns $null when absent' {
+        $code = Get-OSyncWingetInstalledProductCode -PackageId 'synthetic.Portable' -UninstallEntries @(
+            [pscustomobject]@{ Key = '{AAAA}'; WinGetPackageIdentifier = 'other.pkg' },
+            [pscustomobject]@{ Key = '{11111111-2222-3333-4444-555555555555}'; WinGetPackageIdentifier = 'synthetic.Portable' }
+        )
+        $code | Should -Be '{11111111-2222-3333-4444-555555555555}'
+
+        $missing = Get-OSyncWingetInstalledProductCode -PackageId 'synthetic.Portable' -UninstallEntries @(
+            [pscustomobject]@{ Key = '{AAAA}'; WinGetPackageIdentifier = 'other.pkg' }
+        )
+        $missing | Should -BeNullOrEmpty
+    }
+
+    It 'logs the first machine exit code and the final user scope on a successful fallback' {
+        $work = & $script:NewPortableWork (Join-Path $TestDrive 'work-portable-log')
+        $script:installQueue = @(-2147024891, 0)
+        $cfg = & $script:NewConfig (Join-Path $TestDrive 'state-portable-log')
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config $cfg
+        $report.ok.Count | Should -Be 1
+
+        $jsonl = Join-Path (Join-Path $cfg.stateDir 'run\logs') ('osync-{0}.jsonl' -f [DateTime]::UtcNow.ToString('yyyyMMdd'))
+        $raw = Get-Content -LiteralPath $jsonl -Raw
+        $raw -match 'scope fallback from machine' | Should -BeTrue
+        $raw -match 'FirstExitCode' | Should -BeTrue
+    }
+}
+Describe 'WingetApply: portable fallback end-to-end (real Invoke-OSyncWingetInstall + fake winget .cmd)' {
+
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\Winget.Common.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\ManifestParse.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetExport.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\HttpServer.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\State.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\WingetApply.ps1')
+
+        # Fake winget: records every command line; uninstall and --scope user
+        # succeed, everything else (machine scope / --version) reports
+        # 0x80070005 (E_ACCESSDENIED).
+        $script:recordFile = Join-Path $TestDrive 'winget-e2e-args.txt'
+        $script:fakeWinget = Join-Path $TestDrive 'fakewinget-e2e.cmd'
+        $fake = @"
+@echo off
+echo %* >> "$($script:recordFile)"
+echo %* | findstr /C:"uninstall" >nul
+if %errorlevel%==0 exit /b 0
+echo %* | findstr /C:"--scope user" >nul
+if %errorlevel%==0 exit /b 0
+exit /b -2147024891
+"@
+        [System.IO.File]::WriteAllText($script:fakeWinget, $fake, [System.Text.Encoding]::ASCII)
+
+        Mock Resolve-OSyncWingetExePath { return $script:fakeWinget }
+        Mock Start-OSyncHttpServer { return [pscustomobject]@{ IsStopped = $false } }
+        Mock Stop-OSyncHttpServer { }
+    }
+
+    BeforeEach {
+        Clear-Content -LiteralPath $script:recordFile -Force -ErrorAction SilentlyContinue
+    }
+
+    It 'portable machine 0x80070005 -> cleanup -> user success: report ScopeFallback and two logged attempts' {
+        $work = Join-Path $TestDrive 'work-e2e-portable'
+        $pkgDir = Join-Path $work 'winget\synthetic.Portable'
+        New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
+        $stem = 'Tool_1.0.0_x64'
+        [System.IO.File]::WriteAllText((Join-Path $pkgDir ($stem + '.yaml')),
+            "PackageIdentifier: synthetic.Portable`nPackageVersion: 1.0.0`nInstallers:`n- Architecture: x64`n  InstallerType: zip`n  NestedInstallerType: portable`n  InstallerUrl: https://example.invalid/tool.zip`n  InstallerSha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc`nManifestType: merged`nManifestVersion: 1.12.0",
+            (New-Object System.Text.UTF8Encoding($true)))
+        [System.IO.File]::WriteAllBytes((Join-Path $pkgDir ($stem + '.zip')), [byte[]]@(1, 2, 3))
+        ConvertTo-OSyncWingetYamlContent -YamlPath (Join-Path $pkgDir ($stem + '.yaml')) `
+            -IdDir $pkgDir -Id 'synthetic.Portable' -HttpBind '127.0.0.1' -HttpPort 8788 | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $work 'winget\packages.txt'), "synthetic.Portable@1.0.0`r`n",
+            (New-Object System.Text.UTF8Encoding($true)))
+
+        $cfg = [pscustomobject]@{
+            role     = 'B'
+            stateDir = (Join-Path $TestDrive 'state-e2e-portable')
+            httpPort = 8788
+            winget   = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
+        }
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config $cfg
+
+        # Real end-to-end path produced a fallback success.
+        $report.ok.Count | Should -Be 1
+        $report.ok[0].Id | Should -Be 'synthetic.Portable'
+        $report.ok[0].ScopeFallback | Should -BeTrue
+        $report.ok[0].Scope | Should -Be 'user'
+        $report.failed.Count | Should -Be 0
+
+        $recorded = Get-Content -LiteralPath $script:recordFile -Raw
+        $recorded -match 'install .*--scope machine' | Should -BeTrue
+        $recorded -match 'install .*--scope user' | Should -BeTrue
+        $recorded -match 'uninstall' | Should -BeTrue
+
+        # Log is observable: both attempts present.
+        $jsonl = Join-Path (Join-Path $cfg.stateDir 'run\logs') ('osync-{0}.jsonl' -f [DateTime]::UtcNow.ToString('yyyyMMdd'))
+        $raw = Get-Content -LiteralPath $jsonl -Raw
+        $raw -match 'scope fallback from machine' | Should -BeTrue
+        $raw -match 'ScopeFallback' | Should -BeTrue
+    }
+}

@@ -47,12 +47,18 @@
 
     Returns the report object on full success:
       { category, wingetExe, wingetExeVersion, ok, satisfied, skipped, failed, packagesTxt }
-    ok/satisfied entries: { Id, Version, Sha256, ExitCode }
+    ok entries:           { Id, Version, Sha256, ExitCode, Scope, ScopeFallback }
+        (Scope/ScopeFallback added by the reactive portable scope fallback;
+        ScopeFallback=$true only when a machine-scope attempt failed and the
+        package was retried with user scope)
+    satisfied entries:    { Id, Version, Sha256, ExitCode }
     skipped entries:      { Id, Version, Sha256, Reason='state-match' }
         (P2 incremental: state record EXACTLY matches the work copy manifest,
         so winget is never invoked for the package - see README 5.8 for the
         manual-uninstall trade-off)
-    failed entries:       { Id, ExitCode, Output }
+    failed entries:       { Id, ExitCode, Output } and, when a scope fallback
+        was attempted, optional { ScopeAttempts = [ {Scope,ExitCode}, ... ] }
+        (always retains the machine and user attempts with their exit codes)
 
   PORT-COUPLING GUARD (Oracle r7-4): the InstallerUrl port is baked in at
   A-side export time and the B config must never override it. Every rewritten
@@ -63,6 +69,16 @@
   winget.exe is RE-DERIVED every run via Resolve-OSyncWingetExePath - a path
   read back from state is never executed (Oracle r3-B1). -WingetExePath is a
   test seam only (same contract as Export-OSyncWinget).
+
+  PORTABLE SCOPE FALLBACK: for portable packages (InstallerType: portable, or
+  zip + NestedInstallerType: portable) a machine-scope install that fails with
+  a permission / portable-class error (0x80070005 / 0x8A150052 / 0x8A150054 / 0x8A150057)
+  is retried ONCE with --scope user. The global config.winget.scope is never
+  modified; the fallback is reactive (never a proactive scope choice) so a
+  healthy machine-scope package keeps its idempotent/repair semantics. A
+  best-effort cleanup (see Invoke-OSyncWingetBestEffortCleanup) runs only on
+  this retry path and never blocks it. Non-portable access-denied failures are
+  NOT retried.
 #>
 
 <#
@@ -368,6 +384,239 @@ function New-OSyncWingetManifestStaging {
 
 <#
 .SYNOPSIS
+    Classifies a raw winget install result into ok / satisfied / timedout / failed.
+
+.DESCRIPTION
+    Pure mapping helper so the first attempt and the reactive scope-fallback
+    retry share a single classification rule. The ordering matches the original
+    inline logic: success codes win over satisfied codes (0 appears in BOTH
+    constant sets and must be reported as ok).
+#>
+function Get-OSyncWingetInstallOutcome {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $false)]
+        [int]$ExitCode = 0,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$TimedOut
+    )
+
+    if ($TimedOut) { return 'timedout' }
+    if ($script:WingetSuccessfulInstallExitCodes -contains $ExitCode) { return 'ok' }
+    if ($script:WingetSatisfiedExitCodes -contains $ExitCode) { return 'satisfied' }
+    return 'failed'
+}
+
+<#
+.SYNOPSIS
+    Runs one `winget install --manifest ... --scope <Scope> ...` attempt.
+
+.DESCRIPTION
+    Owns the whole single-attempt path: build the --scope arguments, invoke
+    Invoke-OSyncWingetInstall, truncate the captured output to the last 15
+    lines, and classify the result. Both the first machine-scope attempt and
+    the user-scope fallback retry call this helper, so the argument set, the
+    tail truncation and the classification cannot drift between the two paths.
+#>
+function Invoke-OSyncWingetInstallAttempt {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WingetExe,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestDir,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Scope,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Architecture,
+
+        [Parameter(Mandatory = $true)]
+        $Entry,
+
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+
+    # --skip-dependencies: when a YAML declares PackageDependencies, winget
+    # unconditionally resolves them against the configured source, which fails
+    # hard in an offline B-end (no source available).  We control the install
+    # order ourselves via packages.txt, so telling winget to skip its own
+    # dependency resolution is both safer and reliable.
+    $installArgs = @(
+        'install',
+        '--manifest', ('"{0}"' -f $ManifestDir),
+        '--scope', $Scope,
+        '--architecture', $Architecture,
+        '--accept-package-agreements',
+        '--accept-source-agreements',
+        '--disable-interactivity',
+        '--skip-dependencies'
+    )
+
+    Write-OSyncLog -Category 'winget' -Level 'Info' `
+        -Message ("Installing winget package {0} from manifest set {1} (scope={2})" -f $Entry.Id, $ManifestDir, $Scope) `
+        -Data @{ Id = $Entry.Id; Version = $Entry.Version; ManifestDir = $ManifestDir; Scope = $Scope } -Config $Config | Out-Null
+
+    $result = Invoke-OSyncWingetInstall -WingetExe $WingetExe -Arguments $installArgs
+
+    # winget source auto-update failures are logged, never blocking: the full
+    # output tail is captured so an offline B still leaves a diagnostic trail.
+    $tail = ''
+    if (-not [string]::IsNullOrWhiteSpace($result.Output)) {
+        $tailLines = @($result.Output -split "`n")
+        $tail = (($tailLines | Select-Object -Last 15) -join "`n").Trim()
+    }
+
+    return [pscustomobject]@{
+        Scope     = $Scope
+        ExitCode  = $result.ExitCode
+        TimedOut  = [bool]$result.TimedOut
+        Outcome   = (Get-OSyncWingetInstallOutcome -ExitCode $result.ExitCode -TimedOut:$result.TimedOut)
+        Tail      = $tail
+        RawOutput = [string]$result.Output
+    }
+}
+
+<#
+.SYNOPSIS
+    Reads winget's Uninstall ARP entries (read-only) for product-code lookup.
+
+.DESCRIPTION
+    Scans the machine (64/32-bit views) and current-user Uninstall hives for
+    subkeys carrying a WinGetPackageIdentifier value and returns one row per
+    entry as { Key, WinGetPackageIdentifier }. Reading the registry normally
+    needs no elevation, so this is safe to call on the failure path.
+#>
+function Get-OSyncWingetUninstallEntries {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param()
+
+    $roots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+
+    $entries = @()
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $keys = @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)
+        foreach ($key in $keys) {
+            $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            if ($null -eq $props) { continue }
+            $idProp = $props.PSObject.Properties['WinGetPackageIdentifier']
+            if ($null -eq $idProp) { continue }
+            $entries += [pscustomobject]@{
+                Key                     = $key.PSChildName
+                WinGetPackageIdentifier = [string]$idProp.Value
+            }
+        }
+    }
+    return $entries
+}
+
+<#
+.SYNOPSIS
+    Returns the ARP subkey name (product code) registered for a winget package Id.
+
+.DESCRIPTION
+    Matches WinGetPackageIdentifier equal to -PackageId (case-insensitive) and
+    returns that subkey's name, or $null when the package has no ARP entry.
+    -UninstallEntries is a test seam: pass a synthetic registry snapshot
+    (rows of { Key, WinGetPackageIdentifier }) to exercise the matching logic
+    without touching the real registry.
+#>
+function Get-OSyncWingetInstalledProductCode {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageId,
+
+        [Parameter(Mandatory = $false)]
+        [object[]]$UninstallEntries
+    )
+
+    if ($PSBoundParameters.ContainsKey('UninstallEntries')) {
+        $entries = @($UninstallEntries)
+    }
+    else {
+        $entries = @(Get-OSyncWingetUninstallEntries)
+    }
+
+    foreach ($entry in $entries) {
+        if ($null -eq $entry) { continue }
+        if ([string]::Equals([string]$entry.WinGetPackageIdentifier, $PackageId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [string]$entry.Key
+        }
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Best-effort removal of a broken winget install before a user-scope retry.
+
+.DESCRIPTION
+    Prefers `uninstall --product-code <GUID>` (the offline B has no source, so
+    `--id` may fail to resolve).  The product code comes from a read-only ARP
+    scan; when it cannot be found the call falls back to `--id <PackageId>`.
+    The whole operation is best-effort: every failure (including the expected
+    repeat of the same access-denied error) is swallowed and only logged, so
+    the caller always proceeds with the user-scope retry.
+#>
+function Invoke-OSyncWingetBestEffortCleanup {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WingetExe,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PackageId,
+
+        [Parameter(Mandatory = $true)]
+        $Config
+    )
+
+    try {
+        $productCode = Get-OSyncWingetInstalledProductCode -PackageId $PackageId
+        if (-not [string]::IsNullOrWhiteSpace($productCode)) {
+            $cleanupArgs = @('uninstall', '--product-code', $productCode, '--accept-source-agreements', '--disable-interactivity')
+            $cleanupTarget = "product-code $productCode"
+        }
+        else {
+            $cleanupArgs = @('uninstall', '--id', $PackageId, '--accept-source-agreements', '--disable-interactivity')
+            $cleanupTarget = "id $PackageId"
+        }
+
+        Write-OSyncLog -Category 'winget' -Level 'Info' `
+            -Message ("winget package {0}: best-effort cleanup before user-scope retry ({1})" -f $PackageId, $cleanupTarget) `
+            -Data @{ Id = $PackageId; CleanupTarget = $cleanupTarget } -Config $Config | Out-Null
+
+        $result = Invoke-OSyncWingetInstall -WingetExe $WingetExe -Arguments $cleanupArgs
+        Write-OSyncLog -Category 'winget' -Level 'Info' `
+            -Message ("winget package {0}: cleanup finished (exit {1}) - continuing regardless" -f $PackageId, $result.ExitCode) `
+            -Data @{ Id = $PackageId; ExitCode = $result.ExitCode; TimedOut = [bool]$result.TimedOut } -Config $Config | Out-Null
+        return $result
+    }
+    catch {
+        Write-OSyncLog -Category 'winget' -Level 'Warning' `
+            -Message ("winget package {0}: cleanup threw ({1}) - continuing regardless" -f $PackageId, $_.Exception.Message) `
+            -Config $Config | Out-Null
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
     Applies every non-runtime winget package from a validated work copy.
 
 .DESCRIPTION
@@ -595,39 +844,15 @@ function Invoke-OSyncWingetApply {
                     -Data @{ Id = $entry.Id; ConfigScope = $scope; OverrideScope = 'user' } -Config $Config | Out-Null
             }
 
-            # --skip-dependencies: when a YAML declares PackageDependencies,
-            # winget unconditionally resolves them against the configured
-            # source, which fails hard in an offline B-end (no source
-            # available).  We control the install order ourselves via
-            # packages.txt, so telling winget to skip its own dependency
-            # resolution is both safer and reliable.
-            $installArgs = @(
-                'install',
-                '--manifest', ('"{0}"' -f $manifestDir),
-                '--scope', $actualScope,
-                '--architecture', $arch,
-                '--accept-package-agreements',
-                '--accept-source-agreements',
-                '--disable-interactivity',
-                '--skip-dependencies'
-            )
+            # Portable gate for the reactive machine->user fallback. Computed
+            # from the ORIGINAL package dir (pkgDir); the staged manifest is an
+            # exact copy, so either would do, but pkgDir is the source of truth.
+            $isPortable = Test-OSyncWingetIsPortable -PackageDir $pkgDir
 
-            Write-OSyncLog -Category 'winget' -Level 'Info' `
-                -Message ("Installing winget package {0} from manifest set {1} (scope={2})" -f $entry.Id, $manifestDir, $actualScope) `
-                -Data @{ Id = $entry.Id; Version = $entry.Version; ManifestDir = $manifestDir; Scope = $actualScope } -Config $Config | Out-Null
+            $first = Invoke-OSyncWingetInstallAttempt -WingetExe $wingetExe -ManifestDir $manifestDir `
+                -Scope $actualScope -Architecture $arch -Entry $entry -Config $Config
 
-            $result = Invoke-OSyncWingetInstall -WingetExe $wingetExe -Arguments $installArgs
-
-            # winget source auto-update failures are logged, never blocking:
-            # the full output tail is captured and logged regardless of the
-            # exit code so an offline B still leaves a diagnostic trail.
-            $tail = ''
-            if (-not [string]::IsNullOrWhiteSpace($result.Output)) {
-                $tailLines = @($result.Output -split "`n")
-                $tail = (($tailLines | Select-Object -Last 15) -join "`n").Trim()
-            }
-
-            if ($result.TimedOut) {
+            if ($first.Outcome -eq 'timedout') {
                 $failure = [pscustomobject]@{ Id = $entry.Id; ExitCode = -1; Output = 'winget install timed out' }
                 $failed += $failure
                 Write-OSyncLog -Category 'winget' -Level 'Warning' `
@@ -636,34 +861,64 @@ function Invoke-OSyncWingetApply {
                 continue
             }
 
-            if ($script:WingetSuccessfulInstallExitCodes -contains $result.ExitCode) {
+            # Reactive scope fallback: portable package + permission/portable
+            # class failure + the attempt actually used machine scope. MSI/EXE
+            # access-denied is NOT retried (user scope cannot repair it), and a
+            # deterministic failure never reaches here.
+            $needsFallback =
+                $isPortable -and
+                ($actualScope -eq 'machine') -and
+                ($first.Outcome -eq 'failed') -and
+                (Test-OSyncWingetNeedsUserScopeRetry -ExitCode $first.ExitCode -Output $first.RawOutput)
+
+            $final = $first
+            $scopeFallback = $false
+
+            if ($needsFallback) {
+                $scopeFallback = $true
+                Write-OSyncLog -Category 'winget' -Level 'Warning' `
+                    -Message ("winget package {0}: portable machine-scope install failed (exit {1}) - attempting user-scope fallback" -f $entry.Id, $first.ExitCode) `
+                    -Data @{ Id = $entry.Id; FirstExitCode = $first.ExitCode; FirstScope = $actualScope; NextScope = 'user' } -Config $Config | Out-Null
+
+                # Best-effort cleanup of the broken machine-level state before
+                # the retry. Cleanup failure (often the same access-denied) is
+                # logged only and never blocks the retry.
+                $null = Invoke-OSyncWingetBestEffortCleanup -WingetExe $wingetExe -PackageId $entry.Id -Config $Config
+
+                $final = Invoke-OSyncWingetInstallAttempt -WingetExe $wingetExe -ManifestDir $manifestDir `
+                    -Scope 'user' -Architecture $arch -Entry $entry -Config $Config
+            }
+
+            if ($final.Outcome -eq 'ok') {
                 $info = Get-OSyncWingetManifestInfo -YamlPath $yamls[0].FullName
                 $ok += [pscustomobject]@{
-                    Id       = $entry.Id
-                    Version  = $info.PackageVersion
-                    Sha256   = $info.InstallerSha256
-                    ExitCode = $result.ExitCode
+                    Id            = $entry.Id
+                    Version       = $info.PackageVersion
+                    Sha256        = $info.InstallerSha256
+                    ExitCode      = $final.ExitCode
+                    Scope         = $final.Scope
+                    ScopeFallback = $scopeFallback
                 }
                 Add-OSyncStateRecord -Category 'winget' -Name $entry.Id `
                     -Version $info.PackageVersion -Sha256 $info.InstallerSha256 -Config $Config | Out-Null
-                $rebootRequired = ($result.ExitCode -eq -1978334967)
+                $rebootRequired = ($final.ExitCode -eq -1978334967)
                 Write-OSyncLog -Category 'winget' -Level 'Info' `
-                    -Message ("winget package {0} installed (exit {1}{2})" -f $entry.Id, $result.ExitCode, $(if ($rebootRequired) { ', reboot required' } else { '' })) `
-                    -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256; ExitCode = $result.ExitCode; RebootRequired = $rebootRequired } -Config $Config | Out-Null
+                    -Message ("winget package {0} installed (exit {1}, scope={2}{3}{4})" -f $entry.Id, $final.ExitCode, $final.Scope, $(if ($scopeFallback) { ', scope fallback from machine' } else { '' }), $(if ($rebootRequired) { ', reboot required' } else { '' })) `
+                    -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256; ExitCode = $final.ExitCode; Scope = $final.Scope; ScopeFallback = $scopeFallback; FirstExitCode = $(if ($scopeFallback) { $first.ExitCode } else { $null }); RebootRequired = $rebootRequired } -Config $Config | Out-Null
             }
-            elseif ($script:WingetSatisfiedExitCodes -contains $result.ExitCode) {
+            elseif ($final.Outcome -eq 'satisfied') {
                 $info = Get-OSyncWingetManifestInfo -YamlPath $yamls[0].FullName
                 $satisfied += [pscustomobject]@{
                     Id       = $entry.Id
                     Version  = $info.PackageVersion
                     Sha256   = $info.InstallerSha256
-                    ExitCode = $result.ExitCode
+                    ExitCode = $final.ExitCode
                 }
                 Add-OSyncStateRecord -Category 'winget' -Name $entry.Id `
                     -Version $info.PackageVersion -Sha256 $info.InstallerSha256 -Config $Config | Out-Null
                 Write-OSyncLog -Category 'winget' -Level 'Info' `
-                    -Message ("winget package {0} already satisfied (exit {1}) - idempotent success" -f $entry.Id, $result.ExitCode) `
-                    -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256; ExitCode = $result.ExitCode } -Config $Config | Out-Null
+                    -Message ("winget package {0} already satisfied (exit {1}, scope={2}) - idempotent success" -f $entry.Id, $final.ExitCode, $final.Scope) `
+                    -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256; ExitCode = $final.ExitCode; Scope = $final.Scope; ScopeFallback = $scopeFallback } -Config $Config | Out-Null
             }
             else {
                 # 0x800700C7 = ERROR_INSTALL_SUSPEND / operation cancelled by
@@ -672,17 +927,25 @@ function Invoke-OSyncWingetApply {
                 # out because no user is present to confirm it. Log a clear
                 # hint so the operator knows this is not a networking error.
                 $uacHint = ''
-                if ($result.ExitCode -eq -2147023673) {
+                if ($final.ExitCode -eq -2147023673) {
                     $uacHint = ' (0x800700C7 = installation cancelled by user - likely UAC prompt timeout; consider SYSTEM principal or /quiet in installer switches)'
                 }
                 $failure = [pscustomobject]@{
                     Id       = $entry.Id
-                    ExitCode = $result.ExitCode
-                    Output   = $tail
+                    ExitCode = $final.ExitCode
+                    Output   = $final.Tail
+                }
+                if ($scopeFallback) {
+                    # Preserve both attempts so an operator can see the machine
+                    # failure that triggered the fallback and the user failure.
+                    $failure | Add-Member -NotePropertyName ScopeAttempts -NotePropertyValue @(
+                        [pscustomobject]@{ Scope = $first.Scope; ExitCode = $first.ExitCode },
+                        [pscustomobject]@{ Scope = $final.Scope; ExitCode = $final.ExitCode }
+                    )
                 }
                 $failed += $failure
                 Write-OSyncLog -Category 'winget' -Level 'Warning' `
-                    -Message ("winget install FAILED for {0} (exit {1}){2} - recorded, continuing" -f $entry.Id, $result.ExitCode, $uacHint) `
+                    -Message ("winget install FAILED for {0} (exit {1}, scope={2}){3} - recorded, continuing" -f $entry.Id, $final.ExitCode, $final.Scope, $uacHint) `
                     -Data $failure -Config $Config | Out-Null
             }
         }
