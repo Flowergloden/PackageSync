@@ -237,21 +237,38 @@ function Publish-OSyncIndex {
     return (Get-Item -LiteralPath $indexPath)
 }
 
+function Write-RcIntegrityLog {
+    param(
+        [Parameter(Mandatory = $false)][AllowNull()]$Config,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [Parameter(Mandatory = $false)]$Data = $null,
+        [Parameter(Mandatory = $false)][string]$Level = 'Info'
+    )
+    if ($null -eq $Config) { return }
+    Write-OSyncLog -Category 'apply' -Level $Level -Message $Message -Data $Data -Config $Config | Out-Null
+}
+
 function Test-OSyncRepoIntegrity {
     <#
     .SYNOPSIS
         Validates a repository against its index.json trust root.
         Returns a result object (not a bool): Overall + per-category status
         'OK' | 'Incomplete' | 'Missing' with missing/corrupt file lists.
+        When Config is supplied, writes stage timings and periodic progress
+        to the apply log.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RepoRoot
+        [string]$RepoRoot,
+        [Parameter(Mandatory = $false)]
+        $Config
     )
 
     $repoFull = [System.IO.Path]::GetFullPath($RepoRoot)
     $indexPath = Join-Path $repoFull 'index.json'
+    $integritySw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-RcIntegrityLog -Config $Config -Message "repository integrity check starting (repoRoot='$repoFull')." -Data @{ repoRoot = $repoFull }
 
     $result = [pscustomobject]@{
         RepoRoot      = $repoFull
@@ -263,150 +280,175 @@ function Test-OSyncRepoIntegrity {
         Categories    = @{}           # category name -> category status object
     }
 
-    # 1) index.json must exist AND parse as JSON. On any failure here the
-    #    whole repository is 'Invalid' and NOTHING is trusted - no category,
-    #    no files.json, no file hash is examined (a broken trust root makes
-    #    every downstream hash chain meaningless).
-    if (-not (Test-Path -LiteralPath $indexPath -PathType Leaf)) {
-        $result.Overall = 'Invalid'
-        $result.IndexError = "index.json not found at '$indexPath'."
-        return $result
-    }
-    $result.IndexSha256 = Get-RcSha256 -Path $indexPath
     try {
-        $index = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($indexPath))
-    } catch {
-        $result.Overall = 'Invalid'
-        $result.IndexError = "index.json is not valid JSON: $($_.Exception.Message)"
-        return $result
-    }
-    if ($null -eq $index -or -not ($index -is [System.Collections.IDictionary])) {
-        $result.Overall = 'Invalid'
-        $result.IndexError = 'index.json is not a JSON object.'
-        return $result
-    }
-    if (-not $index.ContainsKey('categories') -or -not ($index['categories'] -is [System.Collections.IDictionary])) {
-        $result.Overall = 'Invalid'
-        $result.IndexError = "index.json is missing the required 'categories' object."
-        return $result
-    }
-    $result.ExportedAtUtc = $index['exportedAtUtc']
-
-    # 2)-4) per category: files.json exists + sha256 matches the index record,
-    #      files.json parses, then per-file sha256 recheck.
-    $categories = $index['categories']
-    $anyNotOk = $false
-    foreach ($entry in $categories.GetEnumerator()) {
-        $catName = [string]$entry.Key
-        $catResult = [pscustomobject]@{
-            Category       = $catName
-            Status         = 'OK'
-            Reason         = $null
-            FilesJsonPath  = $null
-            ExpectedSha256 = $null
-            ActualSha256   = $null
-            Count          = $null
-            MissingFiles   = @()
-            CorruptFiles   = @()
+        # 1) index.json must exist AND parse as JSON. On any failure here the
+        #    whole repository is 'Invalid' and NOTHING is trusted - no category,
+        #    no files.json, no file hash is examined (a broken trust root makes
+        #    every downstream hash chain meaningless).
+        if (-not (Test-Path -LiteralPath $indexPath -PathType Leaf)) {
+            $result.Overall = 'Invalid'
+            $result.IndexError = "index.json not found at '$indexPath'."
+            return $result
         }
-
-        $rec = $entry.Value
-        if ($null -eq $rec -or -not ($rec -is [System.Collections.IDictionary]) -or
-            -not $rec.ContainsKey('files') -or -not $rec.ContainsKey('sha256')) {
-            $catResult.Status = 'Missing'
-            $catResult.Reason = "malformed index record for category '$catName'."
-            $result.Categories[$catName] = $catResult
-            $anyNotOk = $true
-            continue
-        }
-
-        $filesJsonPath = Join-Path $repoFull ([string]$rec['files'])
-        $catResult.FilesJsonPath = $filesJsonPath
-        $catResult.ExpectedSha256 = [string]$rec['sha256']
-        if ($rec.ContainsKey('count')) { $catResult.Count = [int64]$rec['count'] }
-
-        # 2) files.json exists and its sha256 matches the index record.
-        #    A missing OR mismatching manifest makes the whole category
-        #    'Missing': its file list cannot be trusted either way.
-        if (-not (Test-Path -LiteralPath $filesJsonPath -PathType Leaf)) {
-            $catResult.Status = 'Missing'
-            $catResult.Reason = "files.json not found at '$filesJsonPath'."
-            $result.Categories[$catName] = $catResult
-            $anyNotOk = $true
-            continue
-        }
-        $catResult.ActualSha256 = Get-RcSha256 -Path $filesJsonPath
-        if ($catResult.ActualSha256 -ne $catResult.ExpectedSha256) {
-            $catResult.Status = 'Missing'
-            $catResult.Reason = ("files.json sha256 mismatch for category '{0}' (index recorded '{1}', actual '{2}')." -f
-                $catName, $catResult.ExpectedSha256, $catResult.ActualSha256)
-            $result.Categories[$catName] = $catResult
-            $anyNotOk = $true
-            continue
-        }
-
-        # 3) files.json parses (should be guaranteed by the hash match, but the
-        #    hash is only a byte-level check - keep the structural check anyway).
+        $result.IndexSha256 = Get-RcSha256 -Path $indexPath
         try {
-            $manifest = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($filesJsonPath))
+            $index = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($indexPath))
         } catch {
-            $catResult.Status = 'Missing'
-            $catResult.Reason = "files.json of category '$catName' is not valid JSON: $($_.Exception.Message)"
-            $result.Categories[$catName] = $catResult
-            $anyNotOk = $true
-            continue
+            $result.Overall = 'Invalid'
+            $result.IndexError = "index.json is not valid JSON: $($_.Exception.Message)"
+            return $result
         }
-        if ($null -eq $manifest -or -not ($manifest -is [System.Collections.IDictionary])) {
-            $catResult.Status = 'Missing'
-            $catResult.Reason = "files.json of category '$catName' is not a JSON object."
-            $result.Categories[$catName] = $catResult
-            $anyNotOk = $true
-            continue
+        if ($null -eq $index -or -not ($index -is [System.Collections.IDictionary])) {
+            $result.Overall = 'Invalid'
+            $result.IndexError = 'index.json is not a JSON object.'
+            return $result
         }
+        if (-not $index.ContainsKey('categories') -or -not ($index['categories'] -is [System.Collections.IDictionary])) {
+            $result.Overall = 'Invalid'
+            $result.IndexError = "index.json is missing the required 'categories' object."
+            return $result
+        }
+        $result.ExportedAtUtc = $index['exportedAtUtc']
 
-        # 4) per-file recheck. Paths in files.json are relative to the
-        #    directory CONTAINING files.json (i.e. the category dir).
-        $catDir = Split-Path -Parent $filesJsonPath
-        $missing = New-Object System.Collections.Generic.List[string]
-        $corrupt = New-Object System.Collections.Generic.List[string]
-        foreach ($fileEntry in $manifest.GetEnumerator()) {
-            $relPath = [string]$fileEntry.Key
-            $meta = $fileEntry.Value
-            $filePath = Join-Path $catDir $relPath
-
-            if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
-                $missing.Add($relPath)
-                continue
+        # 2)-4) per category: files.json exists + sha256 matches the index record,
+        #      files.json parses, then per-file sha256 recheck.
+        $categories = $index['categories']
+        Write-RcIntegrityLog -Config $Config -Message ("index.json loaded; validating {0} category(ies) (exportedAtUtc={1}, elapsed={2}s)." -f $categories.Count, $result.ExportedAtUtc, [Math]::Round($integritySw.Elapsed.TotalSeconds, 2)) -Data @{ exportedAtUtc = $result.ExportedAtUtc; categories = $categories.Count; elapsedSeconds = [Math]::Round($integritySw.Elapsed.TotalSeconds, 2) }
+        $anyNotOk = $false
+        foreach ($entry in $categories.GetEnumerator()) {
+            $catName = [string]$entry.Key
+            $catSw = [System.Diagnostics.Stopwatch]::StartNew()
+            $checkedFiles = 0
+            $manifest = $null
+            $catResult = [pscustomobject]@{
+                Category       = $catName
+                Status         = 'OK'
+                Reason         = $null
+                FilesJsonPath  = $null
+                ExpectedSha256 = $null
+                ActualSha256   = $null
+                Count          = $null
+                MissingFiles   = @()
+                CorruptFiles   = @()
             }
+            Write-RcIntegrityLog -Config $Config -Message "category integrity check starting (category='$catName')." -Data @{ category = $catName }
 
-            # Byte-count check first: cheap, catches truncation/growth without
-            # hashing the file at all.
-            if ($meta -is [System.Collections.IDictionary] -and $meta.ContainsKey('bytes')) {
-                $expectedBytes = [int64]$meta['bytes']
-                if ((Get-Item -LiteralPath $filePath -Force).Length -ne $expectedBytes) {
-                    $corrupt.Add($relPath)
+            try {
+                $rec = $entry.Value
+                if ($null -eq $rec -or -not ($rec -is [System.Collections.IDictionary]) -or
+                    -not $rec.ContainsKey('files') -or -not $rec.ContainsKey('sha256')) {
+                    $catResult.Status = 'Missing'
+                    $catResult.Reason = "malformed index record for category '$catName'."
+                    $result.Categories[$catName] = $catResult
+                    $anyNotOk = $true
                     continue
                 }
-            }
 
-            if ($meta -is [System.Collections.IDictionary] -and $meta.ContainsKey('sha256')) {
-                $expectedSha = [string]$meta['sha256']
-                if ((Get-RcSha256 -Path $filePath) -ne $expectedSha) {
-                    $corrupt.Add($relPath)
+                $filesJsonPath = Join-Path $repoFull ([string]$rec['files'])
+                $catResult.FilesJsonPath = $filesJsonPath
+                $catResult.ExpectedSha256 = [string]$rec['sha256']
+                if ($rec.ContainsKey('count')) { $catResult.Count = [int64]$rec['count'] }
+
+                # 2) files.json exists and its sha256 matches the index record.
+                #    A missing OR mismatching manifest makes the whole category
+                #    'Missing': its file list cannot be trusted either way.
+                if (-not (Test-Path -LiteralPath $filesJsonPath -PathType Leaf)) {
+                    $catResult.Status = 'Missing'
+                    $catResult.Reason = "files.json not found at '$filesJsonPath'."
+                    $result.Categories[$catName] = $catResult
+                    $anyNotOk = $true
+                    continue
                 }
+                $catResult.ActualSha256 = Get-RcSha256 -Path $filesJsonPath
+                if ($catResult.ActualSha256 -ne $catResult.ExpectedSha256) {
+                    $catResult.Status = 'Missing'
+                    $catResult.Reason = ("files.json sha256 mismatch for category '{0}' (index recorded '{1}', actual '{2}')." -f
+                        $catName, $catResult.ExpectedSha256, $catResult.ActualSha256)
+                    $result.Categories[$catName] = $catResult
+                    $anyNotOk = $true
+                    continue
+                }
+
+                # 3) files.json parses (should be guaranteed by the hash match, but the
+                #    hash is only a byte-level check - keep the structural check anyway).
+                try {
+                    $manifest = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($filesJsonPath))
+                } catch {
+                    $catResult.Status = 'Missing'
+                    $catResult.Reason = "files.json of category '$catName' is not valid JSON: $($_.Exception.Message)"
+                    $result.Categories[$catName] = $catResult
+                    $anyNotOk = $true
+                    continue
+                }
+                if ($null -eq $manifest -or -not ($manifest -is [System.Collections.IDictionary])) {
+                    $catResult.Status = 'Missing'
+                    $catResult.Reason = "files.json of category '$catName' is not a JSON object."
+                    $result.Categories[$catName] = $catResult
+                    $anyNotOk = $true
+                    continue
+                }
+                Write-RcIntegrityLog -Config $Config -Message ("category manifest validated (category='{0}', files={1}, elapsed={2}s); starting per-file hashes." -f $catName, $manifest.Count, [Math]::Round($catSw.Elapsed.TotalSeconds, 2)) -Data @{ category = $catName; files = $manifest.Count; elapsedSeconds = [Math]::Round($catSw.Elapsed.TotalSeconds, 2) }
+
+                # 4) per-file recheck. Paths in files.json are relative to the
+                #    directory CONTAINING files.json (i.e. the category dir).
+                $catDir = Split-Path -Parent $filesJsonPath
+                $missing = New-Object System.Collections.Generic.List[string]
+                $corrupt = New-Object System.Collections.Generic.List[string]
+                $lastProgressAt = $catSw.Elapsed
+                foreach ($fileEntry in $manifest.GetEnumerator()) {
+                    $checkedFiles++
+                    if (($catSw.Elapsed - $lastProgressAt).TotalSeconds -ge 30) {
+                        Write-RcIntegrityLog -Config $Config -Message ("category integrity check in progress (category='{0}', checked={1}/{2}, missing={3}, corrupt={4}, elapsed={5}s)." -f $catName, $checkedFiles, $manifest.Count, $missing.Count, $corrupt.Count, [Math]::Round($catSw.Elapsed.TotalSeconds, 2)) -Data @{ category = $catName; checked = $checkedFiles; total = $manifest.Count; missing = $missing.Count; corrupt = $corrupt.Count; elapsedSeconds = [Math]::Round($catSw.Elapsed.TotalSeconds, 2) }
+                        $lastProgressAt = $catSw.Elapsed
+                    }
+                    $relPath = [string]$fileEntry.Key
+                    $meta = $fileEntry.Value
+                    $filePath = Join-Path $catDir $relPath
+
+                    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+                        $missing.Add($relPath)
+                        continue
+                    }
+
+                    # Byte-count check first: cheap, catches truncation/growth without
+                    # hashing the file at all.
+                    if ($meta -is [System.Collections.IDictionary] -and $meta.ContainsKey('bytes')) {
+                        $expectedBytes = [int64]$meta['bytes']
+                        if ((Get-Item -LiteralPath $filePath -Force).Length -ne $expectedBytes) {
+                            $corrupt.Add($relPath)
+                            continue
+                        }
+                    }
+
+                    if ($meta -is [System.Collections.IDictionary] -and $meta.ContainsKey('sha256')) {
+                        $expectedSha = [string]$meta['sha256']
+                        if ((Get-RcSha256 -Path $filePath) -ne $expectedSha) {
+                            $corrupt.Add($relPath)
+                        }
+                    }
+                }
+                $catResult.MissingFiles = $missing.ToArray()
+                $catResult.CorruptFiles = $corrupt.ToArray()
+
+                if ($catResult.MissingFiles.Count -gt 0 -or $catResult.CorruptFiles.Count -gt 0) {
+                    $catResult.Status = 'Incomplete'
+                    $anyNotOk = $true
+                }
+
+                $result.Categories[$catName] = $catResult
+            }
+            finally {
+                $catSw.Stop()
+                $fileCount = if ($null -ne $manifest -and $manifest -is [System.Collections.IDictionary]) { $manifest.Count } else { $catResult.Count }
+                Write-RcIntegrityLog -Config $Config -Message ("category integrity check completed (category='{0}', status={1}, files={2}, missing={3}, corrupt={4}, elapsed={5}s)." -f $catName, $catResult.Status, $fileCount, $catResult.MissingFiles.Count, $catResult.CorruptFiles.Count, [Math]::Round($catSw.Elapsed.TotalSeconds, 2)) -Data @{ category = $catName; status = $catResult.Status; files = $fileCount; checked = $checkedFiles; missing = $catResult.MissingFiles.Count; corrupt = $catResult.CorruptFiles.Count; elapsedSeconds = [Math]::Round($catSw.Elapsed.TotalSeconds, 2) }
             }
         }
-        $catResult.MissingFiles = $missing.ToArray()
-        $catResult.CorruptFiles = $corrupt.ToArray()
 
-        if ($catResult.MissingFiles.Count -gt 0 -or $catResult.CorruptFiles.Count -gt 0) {
-            $catResult.Status = 'Incomplete'
-            $anyNotOk = $true
-        }
-
-        $result.Categories[$catName] = $catResult
+        if ($anyNotOk) { $result.Overall = 'Incomplete' }
+        return $result
     }
-
-    if ($anyNotOk) { $result.Overall = 'Incomplete' }
-    return $result
+    finally {
+        $integritySw.Stop()
+        Write-RcIntegrityLog -Config $Config -Message ("repository integrity check completed (overall={0}, categories={1}, elapsed={2}s)." -f $result.Overall, $result.Categories.Count, [Math]::Round($integritySw.Elapsed.TotalSeconds, 2)) -Data @{ overall = $result.Overall; categories = $result.Categories.Count; elapsedSeconds = [Math]::Round($integritySw.Elapsed.TotalSeconds, 2) }
+    }
 }

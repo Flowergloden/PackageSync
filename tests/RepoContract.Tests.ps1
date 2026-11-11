@@ -325,4 +325,21 @@ Describe 'Test-OSyncRepoIntegrity' {
         $r.Categories.big.MissingFiles.Count | Should -Be $entryCount
         $r.Categories.big.CorruptFiles.Count | Should -Be 0
     }
+
+    It 'writes stage timings and per-category progress when Config is supplied' {
+        $repo = New-RcFullRepo -Root (New-RcTestDir)
+        $cfg = [pscustomobject]@{ role = 'B'; stateDir = (Join-Path $repo 'state') }
+
+        $r = Test-OSyncRepoIntegrity -RepoRoot $repo -Config $cfg
+
+        $r.Overall | Should -Be 'OK'
+        $logDir = Join-Path $cfg.stateDir 'run\logs'
+        $log = Get-ChildItem -LiteralPath $logDir -Filter 'osync-*.log' | Select-Object -First 1
+        $text = [System.IO.File]::ReadAllText($log.FullName)
+        $text | Should -Match 'repository integrity check starting'
+        $text | Should -Match 'category integrity check starting \(category=''winget''\)'
+        $text | Should -Match 'category manifest validated \(category=''winget'', files=3, elapsed=\d+(\.\d+)?s\)'
+        $text | Should -Match 'category integrity check completed \(category=''winget'', status=OK, files=3, missing=0, corrupt=0, elapsed=\d+(\.\d+)?s\)'
+        $text | Should -Match 'repository integrity check completed \(overall=OK, categories=2, elapsed=\d+(\.\d+)?s\)'
+    }
 }

@@ -825,7 +825,7 @@ function Invoke-OSyncApply {
     # skipped - nothing downstream is trusted.
     $integrity = $null
     try {
-        $integrity = Test-OSyncRepoIntegrity -RepoRoot $repoRoot
+        $integrity = Test-OSyncRepoIntegrity -RepoRoot $repoRoot -Config $Config
     }
     catch {
         $result.outcome = 'skipped'
@@ -887,6 +887,8 @@ function Invoke-OSyncApplyPackagesRound {
     $enabled = @(Get-OSyncApplyEnabledCategories -Config $Config)
 
     # [2] Bootstrap self-heal (packages/SYSTEM only - Oracle m11 / Momus m4).
+    $bootstrapCheckSw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-OSyncLog -Category 'apply' -Level Info -Message 'packages round: state read and runtime drift check starting.' -Config $Config | Out-Null
     $state = Get-OSyncState -Category 'winget' -Config $Config
     $bootstrapped = ($true -eq $state.bootstrapped)
     $result.bootstrapped = $bootstrapped
@@ -899,6 +901,10 @@ function Invoke-OSyncApplyPackagesRound {
     # bootstrap (the switch is an operator opt-out of reinstalling a drifted
     # runtime payload, not of the initial bootstrap).
     $needBootstrap = (-not $bootstrapped) -or ($drift -and -not $SkipRuntime)
+    $bootstrapCheckSw.Stop()
+    Write-OSyncLog -Category 'apply' -Level Info `
+        -Message ("packages round: state read and runtime drift check completed (bootstrapped={0}, runtimeDrift={1}, needBootstrap={2}, elapsed={3}s)." -f $bootstrapped, $drift, $needBootstrap, [Math]::Round($bootstrapCheckSw.Elapsed.TotalSeconds, 2)) `
+        -Data @{ bootstrapped = $bootstrapped; drift = $drift; needBootstrap = $needBootstrap; elapsedSeconds = [Math]::Round($bootstrapCheckSw.Elapsed.TotalSeconds, 2) } -Config $Config | Out-Null
     if (-not $WhatIf -and $needBootstrap) {
         Write-OSyncLog -Category 'apply' -Level Info `
             -Message ("packages round: bootstrap self-heal triggered (bootstrapped={0}, runtimeDrift={1})." -f $bootstrapped, $drift) `
@@ -933,11 +939,18 @@ function Invoke-OSyncApplyPackagesRound {
     # ones - a dotfiles-only config still gets a packages-task work copy.
     $pending = @()
     $plans = [ordered]@{}
+    $planningSw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-OSyncLog -Category 'apply' -Level Info -Message ("packages round: pending planning starting (enabled='{0}')." -f ($enabled -join ',')) -Data @{ enabled = @($enabled) } -Config $Config | Out-Null
     foreach ($cat in $enabled) {
         $catResult = $null
         if ($Integrity.Categories.ContainsKey($cat)) { $catResult = $Integrity.Categories[$cat] }
         $catOk = ($null -ne $catResult) -and ($catResult.Status -eq 'OK')
-        if (-not $catOk) { continue }
+        if (-not $catOk) {
+            Write-OSyncLog -Category 'apply' -Level Info -Message ("copy plan '{0}' skipped because repository integrity status is '{1}'." -f $cat, $catResult.Status) -Data @{ category = $cat; integrityStatus = $catResult.Status } -Config $Config | Out-Null
+            continue
+        }
+        $planSw = [System.Diagnostics.Stopwatch]::StartNew()
+        Write-OSyncLog -Category 'apply' -Level Info -Message "copy plan '$cat' starting." -Data @{ category = $cat } -Config $Config | Out-Null
         try {
             $plan = Get-OSyncApplyCategoryPlan -Category $cat -Config $Config -Integrity $Integrity -ExportedAtUtc $ExportedAtUtc -RepoRoot $RepoRoot
         }
@@ -948,10 +961,15 @@ function Invoke-OSyncApplyPackagesRound {
                 currentManifest = $null; baselineManifest = $null; stats = New-OApplyTransferStats
             }
         }
+        $planSw.Stop()
         $plans[$cat] = $plan
         if ($plan.mode -in @('full', 'delta')) { $pending += $cat }
-        Write-OSyncLog -Category 'apply' -Level Info -Message ("copy plan '{0}': mode={1}, base={2}, reason={3}." -f $cat, $plan.mode, $plan.baseExportedAtUtc, $plan.fallbackReason) -Data (Get-OApplyPlanReport -Plan $plan) -Config $Config | Out-Null
+        $planLogData = Get-OApplyPlanReport -Plan $plan
+        $planLogData | Add-Member -NotePropertyName elapsedSeconds -NotePropertyValue ([Math]::Round($planSw.Elapsed.TotalSeconds, 2))
+        Write-OSyncLog -Category 'apply' -Level Info -Message ("copy plan '{0}' completed: mode={1}, base={2}, reason={3}, elapsed={4}s." -f $cat, $plan.mode, $plan.baseExportedAtUtc, $plan.fallbackReason, [Math]::Round($planSw.Elapsed.TotalSeconds, 2)) -Data $planLogData -Config $Config | Out-Null
     }
+    $planningSw.Stop()
+    Write-OSyncLog -Category 'apply' -Level Info -Message ("packages round: pending planning completed (pending='{0}', elapsed={1}s)." -f ($pending -join ','), [Math]::Round($planningSw.Elapsed.TotalSeconds, 2)) -Data @{ pending = @($pending); elapsedSeconds = [Math]::Round($planningSw.Elapsed.TotalSeconds, 2) } -Config $Config | Out-Null
     $result.pendingCategories = @($pending)
     $result | Add-Member -NotePropertyName copyPlans -NotePropertyValue ([ordered]@{}) -Force
     foreach ($cat in $plans.Keys) { $result.copyPlans[$cat] = Get-OApplyPlanReport -Plan $plans[$cat] }
@@ -989,7 +1007,11 @@ function Invoke-OSyncApplyPackagesRound {
         Write-OSyncLog -Category 'apply' -Level Info -Message "round skipped: $($result.skipReason)" -Config $Config | Out-Null
         # No generation this round -> no verified source to refresh from.
         $result.refreshSkippedReason = 'no generation built this round (nothing pending) - tool-only changes are covered by the bootstrap drift path.'
+        $cleanupSw = [System.Diagnostics.Stopwatch]::StartNew()
+        Write-OSyncLog -Category 'apply' -Level Info -Message 'packages round: no-pending work cleanup starting.' -Config $Config | Out-Null
         $result.cleaned = (Invoke-OSyncApplyWorkCleanup -StateDir $stateDir -Keep 2)
+        $cleanupSw.Stop()
+        Write-OSyncLog -Category 'apply' -Level Info -Message ("packages round: no-pending work cleanup completed (removed={0}, elapsed={1}s)." -f $result.cleaned, [Math]::Round($cleanupSw.Elapsed.TotalSeconds, 2)) -Data @{ removed = $result.cleaned; elapsedSeconds = [Math]::Round($cleanupSw.Elapsed.TotalSeconds, 2) } -Config $Config | Out-Null
         return $result
     }
 
