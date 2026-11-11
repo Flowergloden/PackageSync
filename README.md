@@ -308,7 +308,7 @@ chezmoi、bun 与 VC_redist（App Installer 链不再导出/安装，见 3.2）�
 
 ### 5.8 winget 增量同步（跳过未变包）
 
-winget 类别在两端各有一层增量跳过，**信任根链（index.json → files.json → 逐文件 SHA256）完全不变**——增量只省「下载/安装执行」，不省任何校验。
+winget 类别在两端各有一层增量跳过，实际导出、复制与安装仍遵循完整信任根链（index.json → files.json → 逐文件 SHA256）。此外，B 端非 WhatIf 轮次若确认当前 `index.json` 同代已全部应用且已完成 bootstrap，会因不消费任何仓库载荷而直接 NO-OP，不再重复全仓逐文件哈希；packages 轮次还要求无 runtime 漂移。新代、状态不确定或需要 runtime 自愈时仍执行完整校验。
 
 **A 端导出（P1，复用先前成功代）**：钉版条目 `Id@version` 满足以下全部条件时，优先从本地最新成功代的 `winget\<Id>\` 复制载荷进 staging，本地代缺失/损坏或包不可复用时才检查共享 `repoRoot`，**不调用 `winget download`**（导出报告 `reused` 数组记录）：
 

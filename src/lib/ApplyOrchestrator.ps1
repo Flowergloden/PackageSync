@@ -26,6 +26,10 @@
   Round flow (packages mode):
       [1] Trust root: Test-OSyncRepoIntegrity. Index invalid / unparseable ->
           whole round skipped (Metis B2). exportedAtUtc is the generation id.
+          A non-WhatIf round whose current generation is already applied for
+          every enabled category, with bootstrap complete and no runtime drift,
+          skips per-file repository hashing because it consumes no repo payload.
+          Any uncertainty falls back to the full check.
       [2] Bootstrap self-heal: when state.bootstrapped != true (needs the
           runtime payload - chezmoi.exe/tools - Momus r4-M2) OR the runtime
           content hashes (runtimeWingetHash / runtimeFilesHash) drifted vs
@@ -754,6 +758,65 @@ function Invoke-OSyncApplyOneCategory {
     return [pscustomobject]@{ Status = 'ok'; Message = "$Category apply completed (no status field)."; LastApplied = $null }
 }
 
+function Get-OApplyAlreadyAppliedGeneration {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)][ValidateSet('packages', 'dotfiles')][string]$Mode,
+        [Parameter(Mandatory = $true)][string]$RepoRoot
+    )
+
+    try {
+        $indexPath = Join-Path $RepoRoot 'index.json'
+        if (-not (Test-Path -LiteralPath $indexPath -PathType Leaf)) { return $null }
+        $index = ConvertFrom-OApplyJson -Text ([System.IO.File]::ReadAllText($indexPath))
+        if ($null -eq $index -or $index -isnot [System.Collections.IDictionary] -or
+            -not $index.ContainsKey('categories') -or $index['categories'] -isnot [System.Collections.IDictionary]) {
+            return $null
+        }
+        $exportedAtUtc = Get-OApplyIndexExportedAtUtc -Index $index
+        if ([string]::IsNullOrWhiteSpace($exportedAtUtc) -or $exportedAtUtc -notmatch '^\d{8}T\d{6}Z$') { return $null }
+        Assert-OExportedAtUtc -ExportedAtUtc $exportedAtUtc
+
+        $systemState = Get-OSyncState -Category 'winget' -Config $Config
+        if ($true -ne $systemState.bootstrapped) { return $null }
+        if ($Mode -eq 'packages') {
+            if (Test-OSyncRuntimeDrift -RepoRoot $RepoRoot -State $systemState) { return $null }
+            $categories = @(Get-OSyncApplyEnabledCategories -Config $Config)
+        }
+        else {
+            $categories = @('dotfiles')
+        }
+        foreach ($cat in $categories) {
+            if (Test-OSyncCategoryNewer -Category $cat -ExportedAtUtc $exportedAtUtc -Config $Config) { return $null }
+        }
+        return $exportedAtUtc
+    }
+    catch {
+        return $null
+    }
+}
+
+function Complete-OApplyNoPendingRound {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)]$Result,
+        [Parameter(Mandatory = $true)][string]$ExportedAtUtc
+    )
+    $Result.outcome = 'skipped'
+    $Result.skipReason = 'nothing pending - all enabled categories are already applied or content-equivalent to their verified baselines (repository generation ' + $ExportedAtUtc + ').'
+    Write-OSyncLog -Category 'apply' -Level Info -Message "round skipped: $($Result.skipReason)" -Config $Config | Out-Null
+    $Result.refreshSkippedReason = 'no generation built this round (nothing pending) - tool-only changes are covered by the bootstrap drift path.'
+    $cleanupSw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-OSyncLog -Category 'apply' -Level Info -Message 'packages round: no-pending work cleanup starting.' -Config $Config | Out-Null
+    $Result.cleaned = (Invoke-OSyncApplyWorkCleanup -StateDir ([string]$Config.stateDir) -Keep 2)
+    $cleanupSw.Stop()
+    Write-OSyncLog -Category 'apply' -Level Info -Message ("packages round: no-pending work cleanup completed (removed={0}, elapsed={1}s)." -f $Result.cleaned, [Math]::Round($cleanupSw.Elapsed.TotalSeconds, 2)) -Data @{ removed = $Result.cleaned; elapsedSeconds = [Math]::Round($cleanupSw.Elapsed.TotalSeconds, 2) } -Config $Config | Out-Null
+    return $Result
+}
+
 function Invoke-OSyncApply {
     <#
       Runs one B-side apply round (see the module header for the full flow).
@@ -820,6 +883,38 @@ function Invoke-OSyncApply {
     Write-OSyncLog -Category 'apply' -Level Info `
         -Message ("apply round starting (mode={0}, repoRoot='{1}', category='{2}', whatIf={3})." -f $mode, $repoRoot, ($Category -join ','), $WhatIf) `
         -Data @{ mode = $mode; repoRoot = $repoRoot; category = @($Category); whatIf = [bool]$WhatIf } -Config $Config | Out-Null
+
+    # A fully-applied current generation consumes no repository payload. Avoid
+    # re-hashing every category just to reach the same no-pending decision.
+    # Any uncertainty falls through to the full trust-root check below.
+    if (-not $WhatIf) {
+        $alreadyApplied = Get-OApplyAlreadyAppliedGeneration -Config $Config -Mode $mode -RepoRoot $repoRoot
+        if (-not [string]::IsNullOrWhiteSpace([string]$alreadyApplied)) {
+            $result.exportedAtUtc = [string]$alreadyApplied
+            $result.bootstrapped = $true
+            $result | Add-Member -NotePropertyName copyPlans -NotePropertyValue ([ordered]@{}) -Force
+            $fastCategories = if ($mode -eq 'packages') { @(Get-OSyncApplyEnabledCategories -Config $Config) } else { @('dotfiles') }
+            foreach ($cat in $fastCategories) {
+                $catState = Get-OSyncState -Category $cat -Config $Config
+                $last = [string]$catState.lastApplied[$cat]
+                $plan = [pscustomobject]@{
+                    category = $cat; mode = 'skip'; baseExportedAtUtc = $last; baseDir = $null
+                    fallbackReason = 'already applied'; currentManifest = $null; baselineManifest = $null
+                    stats = New-OApplyTransferStats
+                }
+                $result.copyPlans[$cat] = Get-OApplyPlanReport -Plan $plan
+            }
+            Write-OSyncLog -Category 'apply' -Level Info -Message ("repository integrity check skipped: generation {0} is already applied; no repository payload is required this round." -f $alreadyApplied) -Data @{ exportedAtUtc = $alreadyApplied; reason = 'already-applied-no-op' } -Config $Config | Out-Null
+            if ($mode -eq 'dotfiles') {
+                $result.outcome = 'skipped'
+                $result.skipReason = "dotfiles already at generation $alreadyApplied."
+                $result.categories['dotfiles'] = New-OApplyCategoryResult -Category 'dotfiles' -Status 'not-pending' -Message $result.skipReason -LastApplied $alreadyApplied
+                Write-OSyncLog -Category 'apply' -Level Info -Message "dotfiles round skipped: $($result.skipReason)" -Config $Config | Out-Null
+                return $result
+            }
+            return (Complete-OApplyNoPendingRound -Config $Config -Result $result -ExportedAtUtc ([string]$alreadyApplied))
+        }
+    }
 
     # [1] Trust root (Metis B2). An invalid/unparseable index -> whole round
     # skipped - nothing downstream is trusted.
@@ -1002,17 +1097,7 @@ function Invoke-OSyncApplyPackagesRound {
 
     # Pending-only category work copy; runtime remains complete.
     if ($pending.Count -eq 0) {
-        $result.outcome = 'skipped'
-        $result.skipReason = 'nothing pending - all enabled categories are already applied or content-equivalent to their verified baselines (repository generation ' + $ExportedAtUtc + ').'
-        Write-OSyncLog -Category 'apply' -Level Info -Message "round skipped: $($result.skipReason)" -Config $Config | Out-Null
-        # No generation this round -> no verified source to refresh from.
-        $result.refreshSkippedReason = 'no generation built this round (nothing pending) - tool-only changes are covered by the bootstrap drift path.'
-        $cleanupSw = [System.Diagnostics.Stopwatch]::StartNew()
-        Write-OSyncLog -Category 'apply' -Level Info -Message 'packages round: no-pending work cleanup starting.' -Config $Config | Out-Null
-        $result.cleaned = (Invoke-OSyncApplyWorkCleanup -StateDir $stateDir -Keep 2)
-        $cleanupSw.Stop()
-        Write-OSyncLog -Category 'apply' -Level Info -Message ("packages round: no-pending work cleanup completed (removed={0}, elapsed={1}s)." -f $result.cleaned, [Math]::Round($cleanupSw.Elapsed.TotalSeconds, 2)) -Data @{ removed = $result.cleaned; elapsedSeconds = [Math]::Round($cleanupSw.Elapsed.TotalSeconds, 2) } -Config $Config | Out-Null
-        return $result
+        return (Complete-OApplyNoPendingRound -Config $Config -Result $result -ExportedAtUtc $ExportedAtUtc)
     }
 
     # runtime Incomplete -> the whole round is skipped (chezmoi.exe and the

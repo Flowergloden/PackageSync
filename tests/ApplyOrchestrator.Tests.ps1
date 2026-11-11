@@ -206,9 +206,11 @@ Describe 'ApplyOrchestrator: packages round - work copy + apply' {
         Mock Invoke-OSyncWingetApply { throw 'should not be called' }
         Mock Invoke-OSyncPipApply { throw 'should not be called' }
         Mock Invoke-OSyncNpmApply { throw 'should not be called' }
+        Mock Test-OSyncRepoIntegrity { throw 'full repository hashing must not run for an already-applied generation' }
         $result = Invoke-OSyncApply -Config $cfg -Category @('winget', 'pip', 'npm')
 
         $result.outcome | Should -Be 'skipped'
+        Should -Invoke Test-OSyncRepoIntegrity -Times 0 -Exactly
         $result.skipReason | Should -BeLike '*nothing pending*'
         $result.generation | Should -BeNullOrEmpty
         $script:ApplyCalls | Should -BeNullOrEmpty
@@ -493,6 +495,27 @@ Describe 'ApplyOrchestrator: bootstrap self-heal (packages only)' {
 
         $result.bootstrapRan | Should -Be $true
         $result.outcome | Should -Be 'ok'
+    }
+
+    It 'does not bypass full integrity for runtime drift in an already-applied generation' {
+        $repo = Join-Path $TestDrive 'b3-noop-drift'
+        $null = & $script:NewRepo $repo
+        $index = [System.IO.File]::ReadAllText((Join-Path $repo 'index.json')) | ConvertFrom-Json
+        $ts = [string]$index.exportedAtUtc
+        $stateDir = Join-Path $TestDrive 'sb3-noop-drift'
+        $cfg = & $script:NewConfig $stateDir @{ repoRoot = $repo }
+        $null = Set-OSyncBootstrapComplete -Config $cfg -Bw $repo
+        foreach ($cat in @('winget', 'pip', 'npm', 'dotfiles')) {
+            $null = Set-OSyncLastApplied -Category $cat -ExportedAtUtc $ts -Config $cfg
+        }
+        [System.IO.File]::WriteAllText((Join-Path $repo 'runtime\runtime-winget.txt'), "drifted`r`n")
+        Mock Test-OSyncRepoIntegrity { throw 'full integrity required for runtime drift' }
+
+        $result = Invoke-OSyncApply -Config $cfg -Category @('winget')
+
+        $result.skipReason | Should -BeLike '*full integrity required for runtime drift*'
+        $result.bootstrapRan | Should -Be $false
+        Should -Invoke Test-OSyncRepoIntegrity -Times 1 -Exactly
     }
 
     It 'WhatIf never triggers the bootstrap (zero changes)' {
