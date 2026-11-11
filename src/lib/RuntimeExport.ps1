@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   RuntimeExport.ps1 - A-side runtime bootstrap payload export.
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
@@ -589,6 +589,20 @@ function Invoke-ORuntimeNpmInstall {
     }
 }
 
+function Set-OSyncRuntimeLockIdentity {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$BuildDir)
+    foreach ($rel in @('package-lock.json', 'node_modules\.package-lock.json')) {
+        $path = Join-Path $BuildDir $rel
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $text = [System.IO.File]::ReadAllText($path)
+        $updated = [regex]::Replace($text, '("name"\s*:\s*")[^"]*(")', '${1}pakage-sync-verdaccio$2', 1)
+        if ($updated -ne $text) {
+            [System.IO.File]::WriteAllText($path, $updated, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    }
+}
+
 function Export-OSyncRuntime {
     <#
       The runtime bootstrap payload export. See the file header for the
@@ -728,6 +742,7 @@ function Export-OSyncRuntime {
         $tail = ((@($installResult.Output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 5) -join '; ')
         throw "Export-OSyncRuntime: 'npm install verdaccio@$verdaccioVersion' failed (exit $($installResult.ExitCode)): $tail"
     }
+    Set-OSyncRuntimeLockIdentity -BuildDir $buildDir
     $null = Invoke-OSyncRobocopy -Source $buildDir -Destination $verdaccioDir -ExtraArgs @('/E')
     # Remove the LOCAL build dir. node_modules paths can exceed MAX_PATH (260
     # chars); delete via the \\?\ long-path prefix (verified, todo 8).

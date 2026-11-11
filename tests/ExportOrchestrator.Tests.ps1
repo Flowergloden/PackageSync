@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Pester 5 unit tests for src\lib\ExportOrchestrator.ps1 - the A-side
@@ -540,6 +540,24 @@ Describe 'ExportOrchestrator' {
             Test-Path -LiteralPath (Join-Path $repoRoot 'winget\Python.Python.3.12\python.yaml') | Should -Be $true
         }
 
+        It 'prefers the latest successful local generation for -SkipRuntime' {
+            $repoRoot = Join-Path $TestDrive 'repo-local-runtime'
+            $stagingRoot = Join-Path $TestDrive 'staging-local-runtime'
+            $toolRoot = Join-Path $TestDrive 'tool-local-runtime'
+            New-OTestRepo -ToolRoot $toolRoot
+            $localGen = Join-Path $stagingRoot '20261101T000000Z'
+            New-OTestPublishedRuntime -RepoRoot $localGen
+            [System.IO.File]::WriteAllText((Join-Path $localGen 'export-report.json'),
+                (@{ success = $true; stagingDir = $localGen } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($true)))
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
+
+            $report = Invoke-OSyncExport -ConfigPath $cfg -Category 'winget,pip,npm,dotfiles' -SkipRuntime -Quiet
+
+            $report.success | Should -BeTrue
+            $report.categories.runtime.report.reusedFrom | Should -Be $localGen
+            Test-Path -LiteralPath (Join-Path $report.stagingDir 'runtime\tool\README.md') | Should -BeTrue
+        }
+
         It 'throws fail-fast when no previous runtime payload exists (no staging work)' {
             $repoRoot = Join-Path $TestDrive 'repo13'
             $stagingRoot = Join-Path $TestDrive 'staging13'
@@ -574,5 +592,164 @@ Describe 'ExportOrchestrator' {
             $script:CallLog.Count | Should -Be 0
             @(Get-ChildItem -LiteralPath $stagingRoot -Directory -ErrorAction SilentlyContinue).Count | Should -Be 0
         }
+    }
+
+    Context 'no-change export' {
+        It 'reports success without publishing or advancing the formal index' {
+            $repoRoot = Join-Path $TestDrive 'repo-noop'
+            $stagingRoot = Join-Path $TestDrive 'staging-noop'
+            $toolRoot = Join-Path $TestDrive 'tool-noop'
+            New-OTestRepo -ToolRoot $toolRoot
+            $cfg = New-OTestConfigFile -ToolRoot $toolRoot -RepoRoot $repoRoot -StagingRoot $stagingRoot
+            $first = Invoke-OSyncExport -ConfigPath $cfg -Quiet
+            $indexPath = Join-Path $repoRoot 'index.json'
+            $before = [System.IO.File]::ReadAllBytes($indexPath)
+            $beforeMtime = (Get-Item -LiteralPath $indexPath).LastWriteTimeUtc
+            Start-Sleep -Milliseconds 1100
+
+            $second = Invoke-OSyncExport -ConfigPath $cfg -Quiet
+
+            $first.published | Should -BeTrue
+            $second.success | Should -BeTrue
+            $second.published | Should -BeFalse
+            $second.noOp | Should -BeTrue
+            $second.publishedCategories | Should -BeNullOrEmpty
+            [System.IO.File]::ReadAllBytes($indexPath) | Should -Be $before
+            (Get-Item -LiteralPath $indexPath).LastWriteTimeUtc | Should -Be $beforeMtime
+            foreach ($plan in $second.publication.Values) {
+                $plan.copiedFiles | Should -Be 0
+                $plan.deletedFiles | Should -Be 0
+            }
+        }
+    }
+}
+
+Describe 'ExportOrchestrator: content-based incremental publication' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\Util.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\Logging.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\RepoContract.ps1')
+        . (Join-Path $PSScriptRoot '..\src\lib\ExportOrchestrator.ps1')
+        $script:PublishTestConfig = [pscustomobject]@{ role = 'A'; repoRoot = $null; consoleEcho = $false }
+    }
+
+    BeforeEach {
+        $script:publishRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $script:publishRepo = Join-Path $script:publishRoot 'repo'
+        $script:publishStaging = Join-Path $script:publishRoot 'staging'
+        $script:PublishTestConfig.repoRoot = $script:publishRepo
+        foreach ($root in @($script:publishRepo, $script:publishStaging)) {
+            New-Item -ItemType Directory -Path (Join-Path $root 'winget\pkg') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $root 'pip') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $root 'winget\pkg\same.yaml'), 'same')
+            [System.IO.File]::WriteAllText((Join-Path $root 'pip\requirements.txt'), 'six==1.17.0')
+            $null = New-OSyncFilesManifest -Dir (Join-Path $root 'winget')
+            $null = New-OSyncFilesManifest -Dir (Join-Path $root 'pip')
+            $null = Publish-OSyncIndex -StagingDir $root
+        }
+    }
+
+    It 'reuses identical content even when timestamps differ' {
+        (Get-Item -LiteralPath (Join-Path $script:publishStaging 'winget\pkg\same.yaml')).LastWriteTimeUtc = [DateTime]::UtcNow.AddDays(1)
+        $null = New-OSyncFilesManifest -Dir (Join-Path $script:publishStaging 'winget')
+
+        $plan = Get-OSyncPublishCategoryPlan -Category winget -StagingDir $script:publishStaging -RepoRoot $script:publishRepo
+
+        $plan.changed | Should -BeFalse
+        $plan.copy.Count | Should -Be 0
+        $plan.reuse.Count | Should -Be 1
+        $plan.reusedBytes | Should -Be 4
+    }
+
+    It 'plans additions, changes, deletions and missing-target repairs by content' {
+        [System.IO.File]::WriteAllText((Join-Path $script:publishRepo 'winget\pkg\change.yaml'), 'old')
+        [System.IO.File]::WriteAllText((Join-Path $script:publishRepo 'winget\pkg\delete.yaml'), 'delete')
+        $null = New-OSyncFilesManifest -Dir (Join-Path $script:publishRepo 'winget')
+        $null = Publish-OSyncIndex -StagingDir $script:publishRepo
+        [System.IO.File]::WriteAllText((Join-Path $script:publishStaging 'winget\pkg\change.yaml'), 'new')
+        [System.IO.File]::WriteAllText((Join-Path $script:publishStaging 'winget\pkg\new.yaml'), 'new-file')
+        $null = New-OSyncFilesManifest -Dir (Join-Path $script:publishStaging 'winget')
+        Remove-Item -LiteralPath (Join-Path $script:publishRepo 'winget\pkg\same.yaml') -Force
+
+        $plan = Get-OSyncPublishCategoryPlan -Category winget -StagingDir $script:publishStaging -RepoRoot $script:publishRepo
+
+        @($plan.copy.relativePath | Sort-Object) | Should -Be @('pkg/change.yaml', 'pkg/new.yaml', 'pkg/same.yaml')
+        $plan.delete.relativePath | Should -Be 'pkg/delete.yaml'
+        $plan.repairReasons | Should -Contain 'target missing: pkg/same.yaml'
+    }
+
+    It 'falls back to a full category plan when the published manifest is damaged' {
+        [System.IO.File]::WriteAllText((Join-Path $script:publishRepo 'winget\files.json'), '{broken')
+
+        $plan = Get-OSyncPublishCategoryPlan -Category winget -StagingDir $script:publishStaging -RepoRoot $script:publishRepo
+
+        $plan.mode | Should -Be 'full'
+        $plan.changed | Should -BeTrue
+        $plan.copy.Count | Should -Be 1
+        $plan.fallbackReason | Should -Match 'unreadable'
+    }
+
+    It 'writes only changed payloads, deletes stale files and preserves unchanged index records' {
+        [System.IO.File]::WriteAllText((Join-Path $script:publishRepo 'winget\pkg\delete.yaml'), 'delete')
+        $null = New-OSyncFilesManifest -Dir (Join-Path $script:publishRepo 'winget')
+        $null = Publish-OSyncIndex -StagingDir $script:publishRepo
+        $oldIndex = [System.IO.File]::ReadAllText((Join-Path $script:publishRepo 'index.json')) | ConvertFrom-Json
+        $oldPipRecord = $oldIndex.categories.pip.sha256
+        $sameTarget = Join-Path $script:publishRepo 'pip\requirements.txt'
+        $sameMtime = (Get-Item -LiteralPath $sameTarget).LastWriteTimeUtc
+        [System.IO.File]::WriteAllText((Join-Path $script:publishStaging 'winget\pkg\same.yaml'), 'changed')
+        $null = New-OSyncFilesManifest -Dir (Join-Path $script:publishStaging 'winget')
+        $null = Publish-OSyncIndex -StagingDir $script:publishStaging
+
+        $result = Invoke-OSyncIncrementalPublish -StagingDir $script:publishStaging -RepoRoot $script:publishRepo -Config $script:PublishTestConfig
+
+        $result.published | Should -BeTrue
+        $result.publishedCategories | Should -Be @('winget')
+        $result.plans.winget.copiedFiles | Should -Be 1
+        $result.plans.winget.deletedFiles | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $script:publishRepo 'winget\pkg\delete.yaml') | Should -BeFalse
+        (Get-Item -LiteralPath $sameTarget).LastWriteTimeUtc | Should -Be $sameMtime
+        $newIndex = [System.IO.File]::ReadAllText((Join-Path $script:publishRepo 'index.json')) | ConvertFrom-Json
+        $newIndex.categories.pip.sha256 | Should -Be $oldPipRecord
+        $newIndex.categories.winget.sha256 | Should -Not -Be $oldIndex.categories.winget.sha256
+    }
+
+    It 'returns a successful no-op plan without touching the formal index' {
+        $indexPath = Join-Path $script:publishRepo 'index.json'
+        $before = [System.IO.File]::ReadAllBytes($indexPath)
+        $beforeMtime = (Get-Item -LiteralPath $indexPath).LastWriteTimeUtc
+        Start-Sleep -Milliseconds 30
+
+        $result = Invoke-OSyncIncrementalPublish -StagingDir $script:publishStaging -RepoRoot $script:publishRepo -Config $script:PublishTestConfig
+
+        $result.noOp | Should -BeTrue
+        $result.published | Should -BeFalse
+        [System.IO.File]::ReadAllBytes($indexPath) | Should -Be $before
+        (Get-Item -LiteralPath $indexPath).LastWriteTimeUtc | Should -Be $beforeMtime
+    }
+
+    It 'does not advance the index when a payload copy fails' {
+        [System.IO.File]::WriteAllText((Join-Path $script:publishStaging 'winget\pkg\same.yaml'), 'changed')
+        $null = New-OSyncFilesManifest -Dir (Join-Path $script:publishStaging 'winget')
+        $null = Publish-OSyncIndex -StagingDir $script:publishStaging
+        $indexPath = Join-Path $script:publishRepo 'index.json'
+        $before = [System.IO.File]::ReadAllText($indexPath)
+        Mock Copy-Item { throw 'injected copy failure' } -ParameterFilter { $LiteralPath -like '*\staging\winget\pkg\*' }
+
+        { Invoke-OSyncIncrementalPublish -StagingDir $script:publishStaging -RepoRoot $script:publishRepo -Config $script:PublishTestConfig } | Should -Throw -ExpectedMessage '*injected copy failure*'
+        [System.IO.File]::ReadAllText($indexPath) | Should -Be $before
+    }
+
+    It 'does not advance the index when a stale-file deletion fails' {
+        [System.IO.File]::WriteAllText((Join-Path $script:publishRepo 'winget\pkg\delete.yaml'), 'delete')
+        $null = New-OSyncFilesManifest -Dir (Join-Path $script:publishRepo 'winget')
+        $null = Publish-OSyncIndex -StagingDir $script:publishRepo
+        $null = Publish-OSyncIndex -StagingDir $script:publishStaging
+        $indexPath = Join-Path $script:publishRepo 'index.json'
+        $before = [System.IO.File]::ReadAllText($indexPath)
+        Mock Remove-Item { throw 'injected delete failure' } -ParameterFilter { $LiteralPath -like '*\repo\winget\pkg\delete.yaml' }
+
+        { Invoke-OSyncIncrementalPublish -StagingDir $script:publishStaging -RepoRoot $script:publishRepo -Config $script:PublishTestConfig } | Should -Throw -ExpectedMessage '*injected delete failure*'
+        [System.IO.File]::ReadAllText($indexPath) | Should -Be $before
     }
 }

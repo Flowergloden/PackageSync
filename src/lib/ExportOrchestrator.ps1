@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   ExportOrchestrator.ps1 - A-side export orchestration for PakageSync.
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
@@ -19,28 +19,23 @@
        format and source ([datetime]::UtcNow) as the index exportedAtUtc
        (Oracle r7-2).
     4. Runs Export-OSyncWinget/Pip/Npm/Dotfiles/Runtime for the enabled
-       categories (runtime always runs - it is the bootstrap payload every
-       category depends on - unless -SkipRuntime reuses the payloads already
-       published in <repoRoot>). Each category is try/caught into the export
-       report (ok/failed per package); one category's failure does NOT
-       block the others.
+       categories (runtime always runs unless -SkipRuntime reuses the latest
+       successful local generation, falling back to <repoRoot>). Each category
+       is try/caught into the export report; one failure does NOT block others.
     5. Per category New-OSyncFilesManifest, then Publish-OSyncIndex - the
        index.json is the LAST index artifact written into the staging root.
     6. Test-OSyncRepoIntegrity on the staging root: publish only when
-       Overall == 'OK' AND no category failed; otherwise abort with the
-       report (Metis B2).
-    7. Publish: per category Invoke-OSyncRobocopy <staging>\<cat>
-       <repoRoot>\<cat> /MIR, then LAST Copy-Item index.json <repoRoot>\
-       (Metis B2: the ordering is a local guarantee only; out-of-order
-       transfer is caught by the B-side integrity check).
-    8. Export report JSON + logging.
-    9. After a successful publish, clean <stagingRoot> keeping only the
-       newest 3 generations (Momus M4 - disk exhaustion guard). The
-       A-side-only tool dir .verdaccio-a is never a generation and is
-       never touched.
+       Overall == 'OK' AND no category failed; otherwise abort with the report.
+    7. Invoke-OSyncIncrementalPublish compares parsed files.json maps and only
+       copies changed payloads/deletes stale files. Unchanged categories retain
+       their published manifest and index record. index.json is written LAST;
+       an all-unchanged run is a successful no-op and leaves it untouched.
+    8. Export report JSON + logging, including per-category transfer stats.
+    9. After a successful publish/no-op, clean <stagingRoot> keeping only the
+       newest 3 generations. The A-side-only .verdaccio-a dir is never touched.
 
-  Returns a SINGLE report object (Success = $true only when the full
-  export -> integrity -> publish chain succeeded). Every Write-OSyncLog
+  Returns a SINGLE report object (Success = $true for a published run or a
+  content-equivalent no-op). Every Write-OSyncLog
   call is piped to Out-Null - Write-OSyncLog RETURNS the JSONL path and a
   bare call would leak strings into the output stream (documented gotcha).
 #>
@@ -142,14 +137,193 @@ function Write-OSyncExportReport {
     [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($true)))
 }
 
+function Get-OSyncPublishCategoryPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Category,
+        [Parameter(Mandatory = $true)][string]$StagingDir,
+        [Parameter(Mandatory = $true)][string]$RepoRoot
+    )
+
+    $currentDir = Join-Path $StagingDir $Category
+    $repoDir = Join-Path $RepoRoot $Category
+    $currentManifest = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText((Join-Path $currentDir 'files.json')))
+    if ($null -eq $currentManifest -or $currentManifest -isnot [System.Collections.IDictionary]) {
+        throw "Get-OSyncPublishCategoryPlan: current '$Category/files.json' is not a JSON object."
+    }
+
+    $publishedIndex = $null
+    $publishedRecord = $null
+    $publishedManifest = $null
+    $fallbackReason = $null
+    $indexPath = Join-Path $RepoRoot 'index.json'
+    if (-not (Test-Path -LiteralPath $indexPath -PathType Leaf)) {
+        $fallbackReason = 'published index.json is missing'
+    }
+    else {
+        try {
+            $publishedIndex = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($indexPath))
+            if ($null -eq $publishedIndex -or $publishedIndex -isnot [System.Collections.IDictionary] -or
+                -not $publishedIndex.ContainsKey('categories') -or $publishedIndex['categories'] -isnot [System.Collections.IDictionary] -or
+                -not $publishedIndex['categories'].ContainsKey($Category)) {
+                $fallbackReason = "published index has no usable record for '$Category'"
+            }
+            else {
+                $publishedRecord = $publishedIndex['categories'][$Category]
+                $publishedFiles = Join-Path $repoDir 'files.json'
+                if (-not (Test-Path -LiteralPath $publishedFiles -PathType Leaf)) {
+                    $fallbackReason = "published '$Category/files.json' is missing"
+                }
+                else {
+                    $publishedManifest = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($publishedFiles))
+                    if ($null -eq $publishedManifest -or $publishedManifest -isnot [System.Collections.IDictionary]) {
+                        $fallbackReason = "published '$Category/files.json' is not a JSON object"
+                    }
+                }
+            }
+        }
+        catch {
+            $fallbackReason = "published index or '$Category/files.json' is unreadable: $($_.Exception.Message)"
+            $publishedManifest = $null
+        }
+    }
+
+    $copy = @()
+    $reuse = @()
+    $delete = @()
+    $repairReasons = @()
+    if ($null -ne $fallbackReason) {
+        foreach ($entry in $currentManifest.GetEnumerator()) {
+            $meta = $entry.Value
+            $copy += [pscustomobject]@{ relativePath = [string]$entry.Key; bytes = [int64]$meta['bytes']; sha256 = [string]$meta['sha256'] }
+        }
+    }
+    else {
+        foreach ($entry in $currentManifest.GetEnumerator()) {
+            $rel = [string]$entry.Key
+            $meta = $entry.Value
+            $item = [pscustomobject]@{ relativePath = $rel; bytes = [int64]$meta['bytes']; sha256 = [string]$meta['sha256'] }
+            $same = $publishedManifest.ContainsKey($rel)
+            if ($same) {
+                $old = $publishedManifest[$rel]
+                $same = ($old -is [System.Collections.IDictionary]) -and
+                    ($old.ContainsKey('bytes')) -and ($old.ContainsKey('sha256')) -and
+                    ([int64]$old['bytes'] -eq $item.bytes) -and
+                    ([string]::Equals([string]$old['sha256'], $item.sha256, [System.StringComparison]::OrdinalIgnoreCase))
+            }
+            if (-not $same) {
+                $copy += $item
+                continue
+            }
+            $target = Join-Path $repoDir ($rel.Replace('/', '\'))
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                $copy += $item
+                $repairReasons += "target missing: $rel"
+                continue
+            }
+            if ((Get-Item -LiteralPath $target -Force).Length -ne $item.bytes) {
+                $copy += $item
+                $repairReasons += "target length differs: $rel"
+                continue
+            }
+            $reuse += $item
+        }
+        foreach ($entry in $publishedManifest.GetEnumerator()) {
+            $rel = [string]$entry.Key
+            if (-not $currentManifest.ContainsKey($rel)) {
+                $old = $entry.Value
+                $delete += [pscustomobject]@{ relativePath = $rel; bytes = [int64]$old['bytes']; sha256 = [string]$old['sha256'] }
+            }
+        }
+    }
+
+    $copiedBytes = ($copy | Measure-Object -Property bytes -Sum).Sum
+    $reusedBytes = ($reuse | Measure-Object -Property bytes -Sum).Sum
+    $deletedBytes = ($delete | Measure-Object -Property bytes -Sum).Sum
+    $mode = if ($null -eq $fallbackReason) { 'incremental' } else { 'full' }
+    return [pscustomobject]@{
+        category          = $Category
+        mode              = $mode
+        changed           = ($mode -eq 'full' -or $copy.Count -gt 0 -or $delete.Count -gt 0)
+        copy              = $copy
+        reuse             = $reuse
+        delete            = $delete
+        copiedFiles       = $copy.Count
+        copiedBytes       = $(if ($null -eq $copiedBytes) { 0 } else { [int64]$copiedBytes })
+        reusedFiles       = $reuse.Count
+        reusedBytes       = $(if ($null -eq $reusedBytes) { 0 } else { [int64]$reusedBytes })
+        deletedFiles      = $delete.Count
+        deletedBytes      = $(if ($null -eq $deletedBytes) { 0 } else { [int64]$deletedBytes })
+        fallbackReason    = $fallbackReason
+        repairReasons     = $repairReasons
+        publishedRecord   = $publishedRecord
+    }
+}
+
+function Invoke-OSyncIncrementalPublish {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$StagingDir,
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $false)]$Config
+    )
+
+    $currentIndexPath = Join-Path $StagingDir 'index.json'
+    $currentIndex = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($currentIndexPath))
+    $publishedIndexPath = Join-Path $RepoRoot 'index.json'
+
+    $plans = [ordered]@{}
+    $publishedCategories = @()
+    foreach ($entry in @($currentIndex['categories'].GetEnumerator())) {
+        $cat = [string]$entry.Key
+        $plan = Get-OSyncPublishCategoryPlan -Category $cat -StagingDir $StagingDir -RepoRoot $RepoRoot
+        $plans[$cat] = $plan
+        Write-OSyncLog -Category 'export' -Level Info -Message ("publish plan '{0}': mode={1}, copy={2}/{3} bytes, reuse={4}/{5} bytes, delete={6}/{7} bytes, fallback={8}." -f $cat, $plan.mode, $plan.copiedFiles, $plan.copiedBytes, $plan.reusedFiles, $plan.reusedBytes, $plan.deletedFiles, $plan.deletedBytes, $plan.fallbackReason) -Config $Config | Out-Null
+        if (-not $plan.changed) {
+            $currentIndex['categories'][$cat] = $plan.publishedRecord
+            continue
+        }
+
+        $sourceDir = Join-Path $StagingDir $cat
+        $targetDir = Join-Path $RepoRoot $cat
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        foreach ($item in $plan.copy) {
+            $rel = $item.relativePath
+            $source = Join-Path $sourceDir ($rel.Replace('/', '\'))
+            $target = Join-Path $targetDir ($rel.Replace('/', '\'))
+            New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+            Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+        }
+        foreach ($item in $plan.delete) {
+            $target = Join-Path $targetDir ($item.relativePath.Replace('/', '\'))
+            if (Test-Path -LiteralPath $target -PathType Leaf) {
+                Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+            }
+        }
+        Copy-Item -LiteralPath (Join-Path $sourceDir 'files.json') -Destination (Join-Path $targetDir 'files.json') -Force -ErrorAction Stop
+        $publishedCategories += $cat
+        Write-OSyncLog -Category 'export' -Level Info -Message "published changed category '$cat' -> '$targetDir'." -Config $Config | Out-Null
+    }
+
+    $changed = @($plans.Values | Where-Object { $_.changed })
+    if ($changed.Count -eq 0) {
+        Write-OSyncLog -Category 'export' -Level Info -Message 'publish NO-OP: every delivered file matches the published repository; index.json and exportedAtUtc left unchanged.' -Config $Config | Out-Null
+        return [pscustomobject]@{ published = $false; noOp = $true; indexCopied = $false; publishedCategories = @(); plans = $plans }
+    }
+
+    New-Item -ItemType Directory -Path $RepoRoot -Force | Out-Null
+    Write-RcTextFile -Path $publishedIndexPath -Text (ConvertTo-OSyncJson -InputObject $currentIndex)
+    Write-OSyncLog -Category 'export' -Level Info -Message "index.json written LAST to '$publishedIndexPath'." -Config $Config | Out-Null
+    return [pscustomobject]@{ published = $true; noOp = $false; indexCopied = $true; publishedCategories = $publishedCategories; plans = $plans }
+}
+
 function Invoke-OSyncExport {
     <#
     .SYNOPSIS
         Runs the full A-side export pipeline: per-category export into a
         fresh <stagingRoot>\<yyyyMMddTHHmmssZ>\ generation, files.json +
         index.json, integrity gate, publish to <repoRoot>, staging cleanup.
-        Returns the export report object (Success = $true only on a fully
-        published run).
+        Returns the export report object (Success = $true on publish or no-op).
     #>
     [CmdletBinding()]
     param(
@@ -167,14 +341,11 @@ function Invoke-OSyncExport {
         [switch]$Quiet,
 
         # Skips the runtime re-export (VC_redist/bun downloads, Python/Node
-        # winget downloads, portable Verdaccio build, tool snapshot) and
-        # REUSES the payloads already published in <repoRoot> instead:
-        # runtime\ is mirrored into the staging generation and each runtime
-        # winget entry's <repoRoot>\winget\<Id>\ payload is copied into
-        # <staging>\winget\<Id>\. The reused files are re-manifested into
-        # this generation, so the trust chain (index -> files.json -> per-
-        # file sha256) is unchanged. Requires a previous full export - the
-        # pre-check fails fast when the reuse sources are absent.
+        # winget downloads, portable Verdaccio build, tool snapshot) and reuses
+        # the latest successful local generation, falling back to repoRoot.
+        # runtime\ and every runtime winget entry are mirrored into staging and
+        # re-manifested, preserving index -> files.json -> per-file sha256.
+        # The pre-check fails fast when neither source is complete.
         [Parameter(Mandatory = $false)]
         [switch]$SkipRuntime
     )
@@ -244,23 +415,32 @@ function Invoke-OSyncExport {
     # winget\<Id>\ (the runtime winget entries live inside the winget
     # category dir, see RuntimeExport.ps1 step 4). ---
     $runtimeReuseEntries = @()
+    $runtimeReuseRoot = $null
     if ($SkipRuntime) {
-        $repoRuntimeDir = Join-Path $config.repoRoot 'runtime'
-        if (-not (Test-Path -LiteralPath $repoRuntimeDir -PathType Container)) {
-            throw "Export-OfflineRepo: -SkipRuntime requires a previously published runtime payload at '$repoRuntimeDir' - run a full export (without -SkipRuntime) first."
-        }
+        $localExport = Get-OSyncLatestSuccessfulExport -StagingRoot $config.stagingRoot
+        $candidateRoots = @()
+        if (-not [string]::IsNullOrWhiteSpace($localExport)) { $candidateRoots += $localExport }
+        $candidateRoots += $config.repoRoot
         $runtimeWingetListPath = Resolve-OSyncConfigPath -Config $config -Path $config.paths.runtimeWhitelist
         $runtimeReuseEntries = @(Read-OSyncWingetList -Path $runtimeWingetListPath)
-        $missingPayloads = @()
-        foreach ($entry in $runtimeReuseEntries) {
-            if (-not (Test-Path -LiteralPath (Join-Path $config.repoRoot "winget\$($entry.Id)") -PathType Container)) {
-                $missingPayloads += $entry.Id
+        foreach ($candidateRoot in $candidateRoots) {
+            $candidateRuntimeDir = Join-Path $candidateRoot 'runtime'
+            if (-not (Test-Path -LiteralPath $candidateRuntimeDir -PathType Container)) { continue }
+            $missingPayloads = @()
+            foreach ($entry in $runtimeReuseEntries) {
+                if (-not (Test-Path -LiteralPath (Join-Path $candidateRoot "winget\$($entry.Id)") -PathType Container)) {
+                    $missingPayloads += $entry.Id
+                }
+            }
+            if ($missingPayloads.Count -eq 0) {
+                $runtimeReuseRoot = $candidateRoot
+                break
             }
         }
-        if ($missingPayloads.Count -gt 0) {
-            throw "Export-OfflineRepo: -SkipRuntime: runtime winget payload(s) missing from '$($config.repoRoot)\winget': $($missingPayloads -join ', ') - run a full export (without -SkipRuntime) first."
+        if ($null -eq $runtimeReuseRoot) {
+            throw "Export-OfflineRepo: -SkipRuntime requires a previously published runtime payload in the latest successful local export or '$($config.repoRoot)'; runtime winget payload(s) missing or runtime directory absent (last candidate missing: $($missingPayloads -join ', ')) - run a full export (without -SkipRuntime) first."
         }
-        Write-OSyncLog -Category 'export' -Level Info -Message "-SkipRuntime: reuse sources verified in '$($config.repoRoot)' (runtime\ + $($runtimeReuseEntries.Count) runtime winget payload(s))." -Config $config | Out-Null
+        Write-OSyncLog -Category 'export' -Level Info -Message "-SkipRuntime: reuse sources verified in '$runtimeReuseRoot' (runtime\ + $($runtimeReuseEntries.Count) runtime winget payload(s))." -Config $config | Out-Null
     }
 
     # Refresh every input manifest before any exporter reads it (including the
@@ -329,29 +509,29 @@ function Invoke-OSyncExport {
 
     # runtime: the bootstrap payload - always delivered when any category is
     # enabled. -SkipRuntime skips the re-export (downloads/builds/snapshot)
-    # and REUSES the payloads already published in <repoRoot> (validated in
-    # the pre-check above); the reused files are re-manifested into this
+    # and reuses the selected local/repo source (validated in the pre-check);
+    # the reused files are re-manifested into this
     # generation, so the trust chain is unchanged. The reuse runs at the same
     # pipeline position as a real export (after the category exports), so the
     # runtime winget payloads land in <staging>\winget\<Id>\ exactly as
     # Export-OSyncRuntime would have placed them.
     try {
         if ($SkipRuntime) {
-            $repoRuntimeDir = Join-Path $config.repoRoot 'runtime'
+            $repoRuntimeDir = Join-Path $runtimeReuseRoot 'runtime'
             $null = Invoke-OSyncRobocopy -Source $repoRuntimeDir -Destination (Join-Path $staging 'runtime') -ExtraArgs @('/MIR')
             $reusedWingetIds = @()
             foreach ($entry in $runtimeReuseEntries) {
-                $null = Invoke-OSyncRobocopy -Source (Join-Path $config.repoRoot "winget\$($entry.Id)") -Destination (Join-Path $staging "winget\$($entry.Id)") -ExtraArgs @('/MIR')
+                $null = Invoke-OSyncRobocopy -Source (Join-Path $runtimeReuseRoot "winget\$($entry.Id)") -Destination (Join-Path $staging "winget\$($entry.Id)") -ExtraArgs @('/MIR')
                 $reusedWingetIds += $entry.Id
             }
             $runtimeReport = [pscustomobject]@{
                 category         = 'runtime'
                 status           = 'ok'
                 reused           = $true
-                reusedFrom       = $config.repoRoot
+                reusedFrom       = $runtimeReuseRoot
                 runtimeWingetIds = $reusedWingetIds
             }
-            Write-OSyncLog -Category 'export' -Level Info -Message "category 'runtime' export SKIPPED (-SkipRuntime): reused '$repoRuntimeDir' + $($reusedWingetIds.Count) runtime winget payload(s) from the landing zone." -Config $config | Out-Null
+            Write-OSyncLog -Category 'export' -Level Info -Message "category 'runtime' export SKIPPED (-SkipRuntime): reused '$repoRuntimeDir' + $($reusedWingetIds.Count) runtime winget payload(s)." -Config $config | Out-Null
         }
         else {
             if ($refreshErrors.ContainsKey('runtime')) { throw $refreshErrors['runtime'] }
@@ -385,38 +565,32 @@ function Invoke-OSyncExport {
     $publishable = ($integrity.Overall -eq 'OK') -and ($failedCategories.Count -eq 0)
 
     $published = $false
+    $noOp = $false
     $publishedCategories = @()
     $indexCopied = $false
     $publishError = $null
+    $publishPlans = [ordered]@{}
     $cleanup = [pscustomobject]@{ Kept = @(); Removed = @() }
 
     if (-not $publishable) {
         Write-OSyncLog -Category 'export' -Level Error -Message ("publish ABORTED - integrity={0}, failed categories=[{1}]." -f $integrity.Overall, ($failedCategories -join ',')) -Config $config | Out-Null
     }
     else {
-        # --- 7. publish: per category /MIR, then index.json LAST (Metis B2) ---
         try {
-            New-Item -ItemType Directory -Path $config.repoRoot -Force | Out-Null
-            foreach ($cat in @('winget', 'pip', 'npm', 'dotfiles', 'runtime')) {
-                $catDir = Join-Path $staging $cat
-                if (-not (Test-Path -LiteralPath $catDir -PathType Container)) { continue }
-                $null = Invoke-OSyncRobocopy -Source $catDir -Destination (Join-Path $config.repoRoot $cat) -ExtraArgs @('/MIR')
-                $publishedCategories += $cat
-                Write-OSyncLog -Category 'export' -Level Info -Message "published category '$cat' -> '$($config.repoRoot)\$cat'." -Config $config | Out-Null
-            }
-            Copy-Item -LiteralPath $indexFile.FullName -Destination (Join-Path $config.repoRoot 'index.json') -Force
-            $indexCopied = $true
-            $published = $true
-            Write-OSyncLog -Category 'export' -Level Info -Message "index.json copied LAST to '$($config.repoRoot)\index.json'." -Config $config | Out-Null
-
-            # --- 9. cleanup: keep only the newest 3 generations (Momus M4) ---
+            $publishResult = Invoke-OSyncIncrementalPublish -StagingDir $staging -RepoRoot $config.repoRoot -Config $config
+            $published = $publishResult.published
+            $noOp = $publishResult.noOp
+            $publishedCategories = $publishResult.publishedCategories
+            $indexCopied = $publishResult.indexCopied
+            $publishPlans = $publishResult.plans
             $cleanup = Invoke-OSyncStagingCleanup -StagingRoot $config.stagingRoot -Keep 3
             Write-OSyncLog -Category 'export' -Level Info -Message ("staging cleanup: kept [{0}], removed [{1}]." -f ($cleanup.Kept -join ','), ($cleanup.Removed -join ',')) -Config $config | Out-Null
         }
         catch {
             $publishError = $_.Exception.Message
             $published = $false
-            Write-OSyncLog -Category 'export' -Level Error -Message "publish FAILED: $publishError" -Config $config | Out-Null
+            $noOp = $false
+            Write-OSyncLog -Category 'export' -Level Error -Message "publish FAILED: $publishError; index.json was not advanced by this run." -Config $config | Out-Null
         }
     }
 
@@ -441,11 +615,13 @@ function Invoke-OSyncExport {
             categories = $integrity.Categories
         }
         published           = $published
+        noOp                = $noOp
         publishedCategories = $publishedCategories
+        publication         = $publishPlans
         indexCopied         = $indexCopied
         publishError        = $publishError
         cleanup             = $cleanup
-        success             = $published
+        success             = ($published -or $noOp)
     }
 
     $reportPath = Join-Path $staging 'export-report.json'

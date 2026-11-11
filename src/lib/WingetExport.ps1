@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   WingetExport.ps1 - A-side winget whitelist download + YAML InstallerUrl rewrite.
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
@@ -627,11 +627,89 @@ function Invoke-OSyncWingetDownloadWithRetry {
         $attempt++
     }
 }
+function Get-OSyncLatestSuccessfulExport {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StagingRoot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($StagingRoot) -or
+        -not (Test-Path -LiteralPath $StagingRoot -PathType Container)) {
+        return $null
+    }
+    $generations = @(Get-ChildItem -LiteralPath $StagingRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d{8}T\d{6}Z$' } |
+        Sort-Object Name -Descending)
+    foreach ($generation in $generations) {
+        $reportPath = Join-Path $generation.FullName 'export-report.json'
+        if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) { continue }
+        try {
+            $report = ConvertFrom-RcJson -Text ([System.IO.File]::ReadAllText($reportPath))
+            if ($null -eq $report -or $report -isnot [System.Collections.IDictionary] -or
+                -not $report.ContainsKey('success') -or $true -ne [bool]$report['success']) {
+                continue
+            }
+            if ($report.ContainsKey('stagingDir') -and -not [string]::IsNullOrWhiteSpace([string]$report['stagingDir'])) {
+                $reported = [System.IO.Path]::GetFullPath([string]$report['stagingDir']).TrimEnd('\')
+                $candidate = [System.IO.Path]::GetFullPath($generation.FullName).TrimEnd('\')
+                if (-not [string]::Equals($reported, $candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    continue
+                }
+            }
+            return $generation.FullName
+        }
+        catch {
+            continue
+        }
+    }
+    return $null
+}
+
+function Copy-OSyncWingetReusedPackageLocalFirst {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]$Entry,
+        [Parameter(Mandatory = $true)][string]$PkgStagingDir,
+        [Parameter(Mandatory = $true)]$Config
+    )
+
+    $roots = @()
+    $stagingRootProp = $Config.PSObject.Properties['stagingRoot']
+    if ($null -ne $stagingRootProp -and -not [string]::IsNullOrWhiteSpace([string]$stagingRootProp.Value)) {
+        $local = Get-OSyncLatestSuccessfulExport -StagingRoot ([string]$stagingRootProp.Value)
+        if (-not [string]::IsNullOrWhiteSpace($local)) { $roots += $local }
+    }
+    $repoRoot = [string]$Config.repoRoot
+    if ($roots -notcontains $repoRoot) { $roots += $repoRoot }
+
+    foreach ($root in $roots) {
+        $candidateConfig = $Config | Select-Object -Property *
+        $candidateConfig.repoRoot = $root
+        try {
+            if (Copy-OSyncWingetReusedPackage -Entry $Entry -PkgStagingDir $PkgStagingDir -Config $candidateConfig) {
+                return $true
+            }
+        }
+        catch {
+            Write-OSyncLog -Category 'winget' -Level 'Warning' `
+                -Message ("reuse source '{0}' failed for {1} ({2}) - trying the next source" -f $root, $Entry.Id, $_.Exception.Message) `
+                -Data @{ Id = $Entry.Id; ReuseRoot = $root; Error = $_.Exception.Message } -Config $Config | Out-Null
+        }
+        if (Test-Path -LiteralPath $PkgStagingDir) {
+            Remove-Item -LiteralPath $PkgStagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $false
+}
+
 function Copy-OSyncWingetReusedPackage {
     <#
     .SYNOPSIS
-    Incremental export: reuses the PREVIOUS published payload of a pinned
-    whitelist entry when it provably matches, skipping `winget download`.
+    Incremental export: reuses a pinned entry from the selected local/repo
+    source when it provably matches, skipping `winget download`.
 
     .DESCRIPTION
     All five gates must pass, otherwise the caller falls back to a real
@@ -761,11 +839,11 @@ function Export-OSyncWinget {
     and writes <StagingDir>\winget\packages.txt with ONLY the successful IDs.
 
     .DESCRIPTION
-    INCREMENTAL (P1): a PINNED entry whose previous published payload passes
-    every gate of Copy-OSyncWingetReusedPackage is copied from
-    <repoRoot>\winget\<Id>\ instead of being re-downloaded; reused IDs are
-    reported in the report's reused array and count as ok for packages.txt.
-    A reuse-check failure always falls back to a real download.
+    INCREMENTAL (P1): a PINNED entry whose previous payload passes every gate
+    is copied from the latest successful local export, with <repoRoot> as the
+    fallback source, instead of being re-downloaded. Reused IDs are reported in
+    the report's reused array and count as ok for packages.txt. A reuse-check
+    failure in both sources falls back to a real download.
 
     Per-package download failures (non-zero exit, timeout, no manifest
     downloaded - including UA-403 blocks and nonexistent versions) are
@@ -774,11 +852,10 @@ function Export-OSyncWinget {
     with 5s and 15s backoff. When the configured machine scope has no
     applicable installer, the same package is retried once with user scope
     before it is recorded as failed. A rewrite/leak-assertion failure is a
-    tool bug, not a
-    per-package condition, and therefore throws (the whole export fails).
+    tool bug, not a per-package condition, and throws the whole export.
 
-    Returns the export report object and also writes it to
-    <StagingDir>\winget\export-report.json.
+    Returns the export report object and writes it locally to
+    <StagingDir>\reports\winget-export-report.json, outside the category manifest.
     #>
     [CmdletBinding()]
     param(
@@ -847,7 +924,7 @@ function Export-OSyncWinget {
         # inside the check falls back to a real download (fail-safe).
         $reuseOk = $false
         try {
-            $reuseOk = Copy-OSyncWingetReusedPackage -Entry $entry -PkgStagingDir $pkgDir -Config $Config
+            $reuseOk = Copy-OSyncWingetReusedPackageLocalFirst -Entry $entry -PkgStagingDir $pkgDir -Config $Config
         }
         catch {
             Write-OSyncLog -Category 'winget' -Level 'Warning' `
@@ -1020,7 +1097,9 @@ function Export-OSyncWinget {
     }
 
     $reportJson = ConvertTo-OSyncJson -InputObject $report
-    [System.IO.File]::WriteAllText((Join-Path $wingetDir 'export-report.json'), $reportJson, (New-Object System.Text.UTF8Encoding($true)))
+    $reportsDir = Join-Path $StagingDir 'reports'
+    New-Item -ItemType Directory -Path $reportsDir -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $reportsDir 'winget-export-report.json'), $reportJson, (New-Object System.Text.UTF8Encoding($true)))
 
     Write-OSyncLog -Category 'winget' -Level 'Info' `
         -Message ("winget export round done: {0} ok ({1} reused, {2} downloaded), {3} failed" -f $okReport.Count, $reused.Count, ($okReport.Count - $reused.Count), $failed.Count) `

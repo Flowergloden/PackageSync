@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Pester 5 unit tests for src\lib\ApplyOrchestrator.ps1 and the
@@ -1000,5 +1000,220 @@ Describe 'Invoke-OfflineApply entry: apply.lock behavior' {
 
         $r.ExitCode | Should -Be 1
         ($r.Output + $r.Error) | Should -BeLike '*role*B*'
+    }
+}
+
+
+Describe 'ApplyOrchestrator: content-aware delta work copies' {
+    BeforeAll {
+        Import-Module (Join-Path $PSScriptRoot '..\src\OfflineSync.psd1') -Force
+
+        $script:NewDeltaConfig = {
+            param([string]$RepoRoot, [string]$StateDir)
+            return [pscustomobject]@{
+                role = 'B'; repoRoot = $RepoRoot; stateDir = $StateDir
+                httpPort = 8788; verdaccioPort = 4873
+                categories = [pscustomobject]@{ winget = $true; pip = $true; npm = $true; dotfiles = $true }
+                winget = [pscustomobject]@{ scope = 'machine'; architecture = 'x64' }
+                pip = [pscustomobject]@{ upgradeOnApply = $true }
+            }
+        }
+        $script:WriteDeltaRepo = {
+            param([string]$Root)
+            foreach ($dir in @('runtime', 'winget\Demo.App\Dependencies', 'winget\OpenJS.NodeJS.LTS', 'pip', 'npm', 'dotfiles')) {
+                New-Item -ItemType Directory -Path (Join-Path $Root $dir) -Force | Out-Null
+            }
+            [System.IO.File]::WriteAllText((Join-Path $Root 'runtime\runtime-winget.txt'), 'Python.Python.3.12@3.12.10')
+            [System.IO.File]::WriteAllText((Join-Path $Root 'winget\packages.txt'), 'Demo.App@1.0.0')
+            [System.IO.File]::WriteAllText((Join-Path $Root 'winget\Demo.App\app.yaml'), 'PackageVersion: 1.0.0')
+            [System.IO.File]::WriteAllBytes((Join-Path $Root 'winget\Demo.App\app.exe'), [byte[]]@(1, 2, 3, 4, 5))
+            [System.IO.File]::WriteAllBytes((Join-Path $Root 'winget\Demo.App\Dependencies\dep.exe'), [byte[]]@(6, 7, 8))
+            [System.IO.File]::WriteAllBytes((Join-Path $Root 'winget\OpenJS.NodeJS.LTS\node.exe'), [byte[]]@(10, 11, 12))
+            [System.IO.File]::WriteAllText((Join-Path $Root 'pip\requirements.txt'), 'six==1.17.0')
+            [System.IO.File]::WriteAllText((Join-Path $Root 'npm\packages.txt'), 'is-odd@3.0.1')
+            [System.IO.File]::WriteAllText((Join-Path $Root 'dotfiles\chezmoi.toml'), '[data]')
+            foreach ($cat in @('runtime', 'winget', 'pip', 'npm', 'dotfiles')) {
+                $null = New-OSyncFilesManifest -Dir (Join-Path $Root $cat)
+            }
+            $null = Publish-OSyncIndex -StagingDir $Root
+            return ([System.IO.File]::ReadAllText((Join-Path $Root 'index.json')) | ConvertFrom-Json).exportedAtUtc
+        }
+        $script:PublishDeltaChange = {
+            param([string]$Root, [string]$Category = 'winget')
+            Start-Sleep -Milliseconds 1100
+            $null = New-OSyncFilesManifest -Dir (Join-Path $Root $Category)
+            $null = Publish-OSyncIndex -StagingDir $Root
+            return ([System.IO.File]::ReadAllText((Join-Path $Root 'index.json')) | ConvertFrom-Json).exportedAtUtc
+        }
+    }
+
+    BeforeEach {
+        Mock Test-OSyncLandingReadyForRefresh { $false } -ModuleName OfflineSync
+        $script:DeltaApplyCalls = @()
+        Mock Invoke-OSyncWingetApply { $script:DeltaApplyCalls += 'winget'; return [pscustomobject]@{ status = 'ok' } } -ModuleName OfflineSync
+        Mock Invoke-OSyncPipApply { $script:DeltaApplyCalls += 'pip'; return [pscustomobject]@{ status = 'ok' } } -ModuleName OfflineSync
+        Mock Invoke-OSyncNpmApply { $script:DeltaApplyCalls += 'npm'; return [pscustomobject]@{ status = 'ok' } } -ModuleName OfflineSync
+        Mock Invoke-OSyncDotfilesApply { $script:DeltaApplyCalls += 'dotfiles'; return [pscustomobject]@{ status = 'ok' } } -ModuleName OfflineSync
+        $script:deltaRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $script:deltaRepo = Join-Path $script:deltaRoot 'repo'
+        $script:deltaState = Join-Path $script:deltaRoot 'state'
+        $script:deltaTs1 = & $script:WriteDeltaRepo $script:deltaRepo
+        $script:deltaCfg = & $script:NewDeltaConfig $script:deltaRepo $script:deltaState
+        $null = Set-OSyncBootstrapComplete -Config $script:deltaCfg -Bw $script:deltaRepo
+    }
+
+    It 'uses per-category baselines and copies only runtime plus pending winget' {
+        $first = Invoke-OSyncApply -Config $script:deltaCfg
+        $null = Invoke-OSyncApply -Config $script:deltaCfg -Category @('dotfiles')
+        [System.IO.File]::WriteAllText((Join-Path $script:deltaRepo 'winget\Demo.App\app.yaml'), 'PackageVersion: 1.0.1')
+        $ts2 = & $script:PublishDeltaChange $script:deltaRepo
+        $script:DeltaApplyCalls = @()
+
+        $second = Invoke-OSyncApply -Config $script:deltaCfg
+
+        $second.outcome | Should -Be 'ok'
+        $second.pendingCategories | Should -Be @('winget')
+        $second.copyPlans.winget.mode | Should -Be 'delta'
+        $second.copyPlans.winget.baseExportedAtUtc | Should -Be $script:deltaTs1
+        $second.copyPlans.pip.mode | Should -Be 'skip'
+        $second.copyPlans.npm.mode | Should -Be 'skip'
+        $second.copyPlans.dotfiles.mode | Should -Be 'skip'
+        Test-Path -LiteralPath (Join-Path $second.generation 'runtime\files.json') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $second.generation 'winget\files.json') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $second.generation 'winget\OpenJS.NodeJS.LTS\node.exe') | Should -BeTrue
+        foreach ($cat in @('pip', 'npm', 'dotfiles')) {
+            Test-Path -LiteralPath (Join-Path $second.generation $cat) | Should -BeFalse
+        }
+        $second.copyPlans.winget.stats.repoCopiedFiles | Should -Be 2
+        $second.copyPlans.winget.stats.hardLinkedFiles | Should -Be 4
+        Test-Path -LiteralPath (Join-Path $second.generation 'copy-plan.json') | Should -BeTrue
+        $script:DeltaApplyCalls | Should -Be @('winget')
+        $state = Get-OSyncState -Category winget -Config $script:deltaCfg
+        $state.lastApplied.winget | Should -Be $ts2
+        $state.lastApplied.pip | Should -Be $script:deltaTs1
+        $state.lastApplied.npm | Should -Be $script:deltaTs1
+        $userState = Get-OSyncState -Category dotfiles -Config $script:deltaCfg
+        $userState.lastApplied.dotfiles | Should -Be $script:deltaTs1
+
+        $dotfiles = Invoke-OSyncApply -Config $script:deltaCfg -Category @('dotfiles')
+        $dotfiles.outcome | Should -Be 'skipped'
+        $script:DeltaApplyCalls | Should -Be @('winget')
+    }
+
+    It 'copies one changed installer while hard-linking YAML and dependencies' {
+        $null = Invoke-OSyncApply -Config $script:deltaCfg
+        [System.IO.File]::WriteAllBytes((Join-Path $script:deltaRepo 'winget\Demo.App\app.exe'), [byte[]]@(9, 9, 9, 9, 9, 9))
+        $null = & $script:PublishDeltaChange $script:deltaRepo
+
+        $result = Invoke-OSyncApply -Config $script:deltaCfg -Category @('winget')
+
+        $result.copyPlans.winget.stats.copiedFiles | Should -Be 2
+        $result.copyPlans.winget.stats.copiedBytes | Should -Be (6 + (Get-Item -LiteralPath (Join-Path $script:deltaRepo 'winget\files.json')).Length)
+        $result.copyPlans.winget.stats.hardLinkedFiles | Should -Be 4
+        [System.IO.File]::ReadAllBytes((Join-Path $result.generation 'winget\Demo.App\app.exe')) | Should -Be @([byte]9, 9, 9, 9, 9, 9)
+    }
+
+    It 'falls back to baseline copy when hard-link creation fails' {
+        $null = Invoke-OSyncApply -Config $script:deltaCfg
+        [System.IO.File]::WriteAllText((Join-Path $script:deltaRepo 'winget\Demo.App\app.yaml'), 'PackageVersion: 1.0.1')
+        $null = & $script:PublishDeltaChange $script:deltaRepo
+        Mock New-Item { throw 'hard link disabled' } -ParameterFilter { $ItemType -eq 'HardLink' } -ModuleName OfflineSync
+
+        $result = Invoke-OSyncApply -Config $script:deltaCfg -Category @('winget')
+
+        $result.outcome | Should -Be 'ok'
+        $result.copyPlans.winget.stats.hardLinkedFiles | Should -Be 0
+        $result.copyPlans.winget.stats.baselineCopiedFiles | Should -Be 4
+        $result.copyPlans.winget.stats.reusedFiles | Should -Be 4
+    }
+
+    It 'falls back to repo copy when an unchanged baseline file is unavailable' {
+        $null = Invoke-OSyncApply -Config $script:deltaCfg
+        $base = Join-Path $script:deltaState "work\$($script:deltaTs1)\winget\Demo.App\app.exe"
+        Remove-Item -LiteralPath $base -Force
+        [System.IO.File]::WriteAllText((Join-Path $script:deltaRepo 'winget\Demo.App\app.yaml'), 'PackageVersion: 1.0.1')
+        $null = & $script:PublishDeltaChange $script:deltaRepo
+
+        $result = Invoke-OSyncApply -Config $script:deltaCfg -Category @('winget')
+
+        $result.outcome | Should -Be 'ok'
+        $result.copyPlans.winget.stats.repoCopiedFiles | Should -Be 3
+        $result.copyPlans.winget.stats.reusedFiles | Should -Be 3
+    }
+
+    It 'deletes an invalid delta generation and leaves lastApplied unchanged' {
+        $null = Invoke-OSyncApply -Config $script:deltaCfg
+        [System.IO.File]::WriteAllText((Join-Path $script:deltaRepo 'winget\Demo.App\app.yaml'), 'PackageVersion: 1.0.1')
+        $ts2 = & $script:PublishDeltaChange $script:deltaRepo
+        $realMaterializer = (Get-Command New-OSyncWingetDeltaWorkCopy).ScriptBlock
+        Mock New-OSyncWingetDeltaWorkCopy {
+            param($RepoRoot, $BaseDir, $Destination, $CurrentManifest, $BaselineManifest)
+            $stats = & $realMaterializer -RepoRoot $RepoRoot -BaseDir $BaseDir -Destination $Destination -CurrentManifest $CurrentManifest -BaselineManifest $BaselineManifest
+            [System.IO.File]::WriteAllText((Join-Path $Destination 'Demo.App\app.yaml'), 'corrupted')
+            return $stats
+        } -ModuleName OfflineSync
+
+        $result = Invoke-OSyncApply -Config $script:deltaCfg -Category @('winget')
+
+        $result.outcome | Should -Be 'failed'
+        Test-Path -LiteralPath (Join-Path $script:deltaState "work\$ts2") | Should -BeFalse
+        (Get-OSyncState -Category winget -Config $script:deltaCfg).lastApplied.winget | Should -Be $script:deltaTs1
+    }
+
+    It 'falls back to full when the lastApplied baseline was removed' {
+        $null = Invoke-OSyncApply -Config $script:deltaCfg
+        Remove-Item -LiteralPath (Join-Path $script:deltaState "work\$($script:deltaTs1)") -Recurse -Force
+        [System.IO.File]::WriteAllText((Join-Path $script:deltaRepo 'winget\Demo.App\app.yaml'), 'PackageVersion: 1.0.1')
+        $null = & $script:PublishDeltaChange $script:deltaRepo
+
+        $result = Invoke-OSyncApply -Config $script:deltaCfg -Category @('winget')
+
+        $result.copyPlans.winget.mode | Should -Be 'full'
+        $result.copyPlans.winget.fallbackReason | Should -Match 'missing'
+        Test-Path -LiteralPath (Join-Path $result.generation 'winget\Demo.App\app.exe') | Should -BeTrue
+    }
+
+    It 'keeps npm full when npm and winget are pending together' {
+        $null = Invoke-OSyncApply -Config $script:deltaCfg
+        $null = Invoke-OSyncApply -Config $script:deltaCfg -Category @('dotfiles')
+        [System.IO.File]::WriteAllText((Join-Path $script:deltaRepo 'winget\Demo.App\app.yaml'), 'PackageVersion: 1.0.1')
+        [System.IO.File]::WriteAllText((Join-Path $script:deltaRepo 'npm\packages.txt'), 'is-odd@3.0.2')
+        $null = & $script:PublishDeltaChange $script:deltaRepo 'winget'
+        $null = & $script:PublishDeltaChange $script:deltaRepo 'npm'
+
+        $result = Invoke-OSyncApply -Config $script:deltaCfg
+
+        $result.pendingCategories | Should -Be @('winget', 'npm')
+        $result.copyPlans.winget.mode | Should -Be 'delta'
+        $result.copyPlans.npm.mode | Should -Be 'full'
+        Test-Path -LiteralPath (Join-Path $result.generation 'npm\packages.txt') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $result.generation 'pip') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $result.generation 'dotfiles') | Should -BeFalse
+    }
+
+    It 'omits deleted dependencies from the new logical work copy' {
+        $null = Invoke-OSyncApply -Config $script:deltaCfg
+        Remove-Item -LiteralPath (Join-Path $script:deltaRepo 'winget\Demo.App\Dependencies\dep.exe') -Force
+        [System.IO.File]::WriteAllText((Join-Path $script:deltaRepo 'winget\Demo.App\app.yaml'), 'PackageVersion: 1.0.1')
+        $null = & $script:PublishDeltaChange $script:deltaRepo
+
+        $result = Invoke-OSyncApply -Config $script:deltaCfg -Category @('winget')
+
+        $result.copyPlans.winget.stats.deletedFiles | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $result.generation 'winget\Demo.App\Dependencies\dep.exe') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $result.generation 'winget\Demo.App\app.exe') | Should -BeTrue
+    }
+
+    It 'protects verified lastApplied baselines during routine cleanup' {
+        $null = Invoke-OSyncApply -Config $script:deltaCfg
+        $work = Join-Path $script:deltaState 'work'
+        foreach ($ts in @('20261102T000000Z', '20261103T000000Z', '20261104T000000Z')) {
+            New-Item -ItemType Directory -Path (Join-Path $work $ts) -Force | Out-Null
+        }
+
+        $null = Invoke-OSyncApplyWorkCleanup -StateDir $script:deltaState -Keep 2
+
+        Test-Path -LiteralPath (Join-Path $work $script:deltaTs1) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $work '20261102T000000Z') | Should -BeFalse
     }
 }

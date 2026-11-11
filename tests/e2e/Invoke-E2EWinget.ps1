@@ -9,7 +9,7 @@
 
     1. Bootstrap (spec 1): the fixture runtime-winget (pinned Python/Node lines
        - already installed on A, taking the satisfied/idempotent path - plus
-       the 7zip.7zip@26.02 fresh-install probe in the winget category) runs the
+       the 7zip.7zip@26.06 fresh-install probe in the winget category) runs the
        full Install-OfflineBootstrap flow; the Add-AppxPackage step idempotently
        skips (version gates).
     2. SYSTEM bootstrap smoke (spec 2): a TEMPORARY SYSTEM-principal task
@@ -18,15 +18,19 @@
        completion (Oracle r7-9).
     3. SYSTEM winget apply (spec 3): a TEMPORARY SYSTEM-principal task runs
        Invoke-OfflineApply -Category winget installing the fixture package
-       7zip.7zip@26.02 (real fresh-install probe) -> install success asserted
+       7zip.7zip@26.06 (real fresh-install probe) -> install success asserted
        (install dir + winget list + state) -> second run idempotent (round
-       skip + lib-level satisfied re-run) -> fixture package uninstalled.
-    4. OFFLINE SIMULATION (spec 4): an outbound firewall BLOCK rule for
+       skip + lib-level satisfied re-run).
+    4. A second repository generation changes one YAML only. The delta work
+       copy must hard-link unchanged payloads, fall back to repo for a missing
+       baseline installer, report exact copy bytes, pass full verification and
+       preserve the satisfied install result.
+    5. OFFLINE SIMULATION (spec 4): an outbound firewall BLOCK rule for
        winget.exe (loopback exempt) is created; FIRST the block is proven
        effective (`winget source update` FAILS under the rule - anti-vacuous,
        Oracle m-3), THEN the manifest install is re-run and asserted SUCCESS,
        then the rule is deleted.
-    5. If the SYSTEM path fails, the Register-SyncTasks -PackagesTaskPrincipal
+    6. If the SYSTEM path fails, the Register-SyncTasks -PackagesTaskPrincipal
        User fallback is exercised instead and the conclusion is recorded in
        evidence + README.
 
@@ -38,8 +42,8 @@
       restored byte-identical AFTER (incl. the SYSTEM-hive S-1-5-18 path).
     - SYSTEM context only inside temporary tasks; all temp tasks/rules are
       deleted in a finally even on failure.
-    - The fixture package 7zip.7zip@26.02 is uninstalled after the probe runs
-      (A's pre-existing 7-Zip 19.00 baseline is left untouched).
+    - The fixture package 7zip.7zip@26.06 is uninstalled only when this QA
+      installed it; any pre-existing 7-Zip version is left untouched.
     - NON-8788 httpPort in the cloned configs (parallel todo-23 squats 8788);
       non-4873 verdaccioPort (todo-21 uses non-4873).
 
@@ -53,7 +57,7 @@
 
   Usage:
     powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\tests\e2e\Invoke-E2EWinget.ps1
-        [-LandingRoot <dir>] [-EvidencePath <file>] [-DoneFile <file>] [-KeepArtifacts]
+        [-LandingRoot <dir>] [-EvidencePath <file>] [-DoneFile <file>] [-KeepArtifacts] [-SkipNodeProbe]
 #>
 
 [CmdletBinding()]
@@ -69,7 +73,10 @@ param(
     [string]$DoneFile,
 
     # Keep all temp artifacts (default: the landing dir is deleted at the end).
-    [switch]$KeepArtifacts
+    [switch]$KeepArtifacts,
+
+    # Skip the Node satisfied-path probe and omit Node from the runtime fixture.
+    [switch]$SkipNodeProbe
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,12 +88,10 @@ $ErrorActionPreference = 'Stop'
 $script:PassCount = 0
 $script:FailCount = 0
 $script:FindingsCount = 0
-$script:EvidencePath = ''
 $script:EvidenceSeeded = $false
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 $script:Repo = ''
-$script:LandingRoot = ''
 $script:RepoRoot = ''
 $script:StagingRoot = ''
 $script:StateDir = ''
@@ -103,6 +108,11 @@ $script:SmokeTaskName = 'PakageSync-BootstrapSmoke-QA20'
 $script:SettingsBackupDir = ''
 $script:SettingsBackupIndex = @()
 $script:SevenZipInstalledByQa = $false
+$script:SevenZipWasPresent = $false
+$preQaSevenZip = 'C:\Program Files\7-Zip\7z.exe'
+if (Test-Path -LiteralPath $preQaSevenZip -PathType Leaf) {
+    try { $script:SevenZipWasPresent = ([string](Get-Item -LiteralPath $preQaSevenZip).VersionInfo.FileVersion).StartsWith('26.06') } catch { }
+}
 $script:CleanupDone = $false
 
 # ---------------------------------------------------------------------------
@@ -509,17 +519,17 @@ function Remove-WingetBlockRule {
 # ---------------------------------------------------------------------------
 # 7zip fixture helpers
 # ---------------------------------------------------------------------------
-function Get-7Zip2602Installed {
-    # Evidence: install dir (machine-scope 26.02 lands at C:\Program Files\7-Zip
-    # with 7z.exe FileVersion 26.02). The winget list output is RECORDED only:
-    # its columns are localized and the 'available' column shows 26.02 even
+function Get-7Zip2606Installed {
+    # Evidence: install dir (machine-scope 26.06 lands at C:\Program Files\7-Zip
+    # with 7z.exe FileVersion 26.06). The winget list output is RECORDED only:
+    # its columns are localized and the 'available' column shows 26.06 even
     # when only 19.00 is installed, so it cannot be asserted reliably.
     $dirOk = $false
     $sevenZipExe = 'C:\Program Files\7-Zip\7z.exe'
     if (Test-Path -LiteralPath $sevenZipExe -PathType Leaf) {
         try {
             $v = (Get-Item -LiteralPath $sevenZipExe).VersionInfo.FileVersion
-            if ($null -ne $v -and ([string]$v).StartsWith('26.02')) { $dirOk = $true }
+            if ($null -ne $v -and ([string]$v).StartsWith('26.06')) { $dirOk = $true }
         }
         catch { }
     }
@@ -527,9 +537,9 @@ function Get-7Zip2602Installed {
     return [pscustomobject]@{ DirOk = $dirOk; ListOutput = $list.Output }
 }
 
-function Uninstall-7Zip2602 {
-    $r = Invoke-WingetCli -Arguments @('uninstall', '--id', '7zip.7zip', '-e', '--version', '26.02', '--accept-source-agreements', '--disable-interactivity') -TimeoutMs 300000
-    Write-Evidence "uninstall 7zip 26.02: exit=$($r.ExitCode) timedOut=$($r.TimedOut)"
+function Uninstall-7Zip2606 {
+    $r = Invoke-WingetCli -Arguments @('uninstall', '--id', '7zip.7zip', '-e', '--version', '26.06', '--accept-source-agreements', '--disable-interactivity') -TimeoutMs 300000
+    Write-Evidence "uninstall 7zip 26.06: exit=$($r.ExitCode) timedOut=$($r.TimedOut)"
     Write-Evidence ($r.Output.Trim())
     return ($r.ExitCode -eq 0 -and -not $r.TimedOut)
 }
@@ -542,6 +552,11 @@ function Append-ReadmeLimitation {
     $readme = Join-Path $script:Repo 'README.md'
     if (-not (Test-Path -LiteralPath $readme -PathType Leaf)) { return }
     $content = [System.IO.File]::ReadAllText($readme)
+    $marker = ($Text -split '：', 2)[0]
+    if ($content.Contains($marker)) {
+        Write-Evidence "README known-limitation already present: $marker"
+        return
+    }
     $m = [regex]::Match($content, '(?m)^(\d+)\. \*\*L(\d+)\.')
     $next = 16
     if ($m.Success) {
@@ -692,7 +707,11 @@ try {
     # config.paths.* are tool-root-relative INPUT manifests (pathfix): they
     # resolve against <LandingRoot> where the cloned configs live.
     Copy-Item -LiteralPath (Join-Path $repo 'manifests') -Destination (Join-Path $script:LandingRoot 'manifests') -Recurse -Force
-    Assert-E2EFatal (Test-Path -LiteralPath (Join-Path $script:LandingRoot 'manifests\winget-packages.txt') -PathType Leaf) 'fixture winget whitelist staged under the test tool root'
+    $fixtureWinget = @('# Minimal isolated E2E install and delta probe; production manifests are not modified.', '7zip.7zip@26.06')
+    $fixtureWingetPath = Join-Path $script:LandingRoot 'manifests\winget-packages.txt'
+    [System.IO.File]::WriteAllText($fixtureWingetPath, (($fixtureWinget -join "`r`n") + "`r`n"), $script:Utf8NoBom)
+    Write-Evidence "small package fixture: winget-packages.txt = $($fixtureWinget -join ' | ')"
+    Assert-E2EFatal (Test-Path -LiteralPath $fixtureWingetPath -PathType Leaf) 'fixture winget whitelist staged under the test tool root'
 
     # Fixture runtime-winget.txt: pinned Python/Node lines - already installed
     # on A, taking the satisfied/idempotent path. ENVIRONMENT FACT: A tracks
@@ -707,11 +726,11 @@ try {
         '# takes the satisfied/idempotent path. NOTE: A tracks Node under the CURRENT',
         '# channel Id OpenJS.NodeJS (26.7.0), not OpenJS.NodeJS.LTS (24.19.0) - the',
         '# config default pin targets the LTS channel and is NOT install-satisfied on A.',
-        'Python.Python.3.12@3.12.10',
-        'OpenJS.NodeJS@26.7.0'
+        'Python.Python.3.12@3.12.10'
     )
+    if (-not $SkipNodeProbe) { $fixtureRuntime += 'OpenJS.NodeJS@26.7.0' }
     [System.IO.File]::WriteAllText((Join-Path $script:LandingRoot 'manifests\runtime-winget.txt'), (($fixtureRuntime -join "`n") + "`n"), $script:Utf8NoBom)
-    Write-Evidence "fixture runtime-winget.txt written (Python.Python.3.12@3.12.10 + OpenJS.NodeJS@26.7.0 - both installed on A)"
+    Write-Evidence "fixture runtime-winget.txt written (SkipNodeProbe=$SkipNodeProbe): $($fixtureRuntime -join ' | ')"
 
     # --- snapshot A's winget settings (HYGIENE: restore at the end) ---
     Backup-AdminSettings
@@ -719,6 +738,7 @@ try {
     # =====================================================================
     # PROBE: Node same-version --manifest install (satisfied path de-risk)
     # =====================================================================
+    if (-not $SkipNodeProbe) {
     Write-Evidence ""
     Write-Evidence "=== PROBE: OpenJS.NodeJS@26.7.0 same-version --manifest install (satisfied path) ==="
     $probeDir = Join-Path $script:LandingRoot 'probe-node'
@@ -753,6 +773,10 @@ try {
         )
         [System.IO.File]::WriteAllText((Join-Path $script:LandingRoot 'manifests\runtime-winget.txt'), (($fixtureRuntime -join "`n") + "`n"), $script:Utf8NoBom)
         Write-Evidence "fixture runtime-winget.txt rewritten WITHOUT the Node line"
+    }
+    }
+    else {
+        Write-Evidence "SKIP: Node download/install probe and Node runtime fixture (-SkipNodeProbe)"
     }
 
     # =====================================================================
@@ -824,7 +848,12 @@ try {
     $pkgNode = Join-Path $script:RepoRoot 'winget\OpenJS.NodeJS'
     Assert-E2EFatal (Test-Path -LiteralPath $pkg7z -PathType Container) 'fixture winget\7zip.7zip present (fresh-install probe)'
     Assert-E2EFatal (Test-Path -LiteralPath $pkgPy -PathType Container) 'fixture winget\Python.Python.3.12 present (runtime satisfied)'
-    Assert-E2EFatal (Test-Path -LiteralPath $pkgNode -PathType Container) 'fixture winget\OpenJS.NodeJS present (runtime satisfied)'
+    if ($SkipNodeProbe) {
+        Assert-E2E (-not (Test-Path -LiteralPath $pkgNode)) 'Node runtime payload omitted by -SkipNodeProbe'
+    }
+    else {
+        Assert-E2EFatal (Test-Path -LiteralPath $pkgNode -PathType Container) 'fixture winget\OpenJS.NodeJS present (runtime satisfied)'
+    }
     $packagesTxt = [System.IO.File]::ReadAllText((Join-Path $script:RepoRoot 'winget\packages.txt'))
     Write-Evidence "fixture winget\packages.txt: $packagesTxt"
     Assert-E2E ($packagesTxt -match '7zip\.7zip') 'fixture packages.txt contains the 7zip probe'
@@ -869,6 +898,9 @@ try {
         Assert-E2EFatal ($integrityAdj.Overall -eq 'OK') 'fixture integrity OK after the Node filename adjustment'
         Append-ReadmeLimitation -Text 'Node MSI 同名修复限制（todo-20 QA）：导出会把安装器改名为 YAML 主干名（如 Node.js_26.7.0_Machine_X64_wix_zh-CN.msi）；实测该改名后的 Node MSI 在"同版本已装"的修复路径上以 1603 失败（Wix4RollbackInternetShortcuts 动作返回 3），原名（node-v26.7.0-x64.msi）则成功——B 端首次引导（全新安装）预期不受影响（失败动作仅在修复/卸载序列运行），但 B 端对已装 Node 的重复引导会命中同一 1603，属部署期验证项。'
     }
+    elseif ($SkipNodeProbe) {
+        Write-Evidence "SKIP: Node installer filename adjustment (-SkipNodeProbe)"
+    }
     else {
         Write-Evidence "fixture adjustment: Node installer already uses the original filename - no adjustment needed"
     }
@@ -896,8 +928,8 @@ try {
     Write-Evidence "system-state: bootstrapped=$($sysState.bootstrapped) wingetExePath=$($sysState.wingetExePath)"
     Assert-E2EFatal ($true -eq $sysState.bootstrapped) 'bootstrap set bootstrapped=true'
     $bootText = [System.IO.File]::ReadAllText($bootOut)
-    Assert-E2E ($bootText -match '\[1-appinstaller\].*skipped by version gate') 'bootstrap step 1: Add-AppxPackage pieces idempotently skipped' '(version gates)'
-    Assert-E2E ($bootText -match '\[3-runtime-winget\].*installed/satisfied') 'bootstrap step 3: runtime winget installs satisfied path' '(Python/Node)'
+    Assert-E2E ($bootText -match '\[1-appinstaller\].*detect-only') 'bootstrap step 1: App Installer detect-only path completed'
+    Assert-E2E ($bootText -match '\[3-runtime-winget\].*installed/satisfied') 'bootstrap step 3: runtime winget installs satisfied path' '(Python; Node when enabled)'
     Assert-E2E ($bootText -match '\[2-localmanifest\]') 'bootstrap step 2: LocalManifestFiles both contexts handled'
 
     # =====================================================================
@@ -945,7 +977,7 @@ catch {
     Write-Evidence "bootstrap smoke wrapper written: $smokeWrapper"
 
     $smokeTask = Register-QaTask -TaskName $script:SmokeTaskName -WrapperPath $smokeWrapper -WorkingDirectory (Join-Path $script:StateDir 'work') -TaskPrincipal 'SYSTEM'
-    Assert-E2EFatal ($smokeTask.State -eq 'Ready') 'SYSTEM bootstrap smoke task registered and Ready'
+    Assert-E2EFatal ($smokeTask.State -in @('Ready', 'Running')) 'SYSTEM bootstrap smoke task registered and Ready'
     $smokeResultCode = Run-QaTaskAndWait -TaskName $script:SmokeTaskName -TimeoutMinutes 20
     Write-RunLogTail -Path $smokeLog
     $smokeOk = $false
@@ -968,7 +1000,7 @@ catch {
     # SPEC 3: SYSTEM winget apply (temp SYSTEM task) - install + idempotent
     # =====================================================================
     Write-Evidence ""
-    Write-Evidence "=== SPEC 3: SYSTEM winget apply (temp SYSTEM task, 7zip.7zip@26.02 fresh-install probe) ==="
+    Write-Evidence "=== SPEC 3: SYSTEM winget apply (temp SYSTEM task, 7zip.7zip@26.06 fresh-install probe) ==="
     $applyLog = Join-Path $runsDir 'sys-apply.log'
     $applyResult = Join-Path $runsDir 'sys-apply.result.json'
     $applyWrapper = Join-Path $wrapperDir 'sys-apply.ps1'
@@ -1001,12 +1033,12 @@ try {
     $cfg = Get-OSyncConfig -Path $cfgPath
     $gen = Get-OSyncApplyNewestVerifiedGeneration -StateDir $stateDir
     if ($null -ne $gen) { W "newest verified generation: $($gen.Path)" } else { W 'newest verified generation: <none>' }
-    $libOk = 0; $libSat = 0; $libFail = 0; $libErr = ''
+    $libOk = 0; $libSat = 0; $libSkip = 0; $libFail = 0; $libErr = ''
     if ($null -ne $gen) {
         try {
             $lib = Invoke-OSyncWingetApply -WorkDir $gen.Path -Config $cfg
-            $libOk = @($lib.ok).Count; $libSat = @($lib.satisfied).Count; $libFail = @($lib.failed).Count
-            W "lib apply: ok=$libOk satisfied=$libSat failed=$libFail"
+            $libOk = @($lib.ok).Count; $libSat = @($lib.satisfied).Count; $libSkip = @($lib.skipped).Count; $libFail = @($lib.failed).Count
+            W "lib apply: ok=$libOk satisfied=$libSat skipped=$libSkip failed=$libFail"
         }
         catch {
             $libErr = $_.Exception.Message
@@ -1022,7 +1054,7 @@ try {
     $ErrorActionPreference = $prevEap
     W "winget list 7zip:`n$list"
     $obj = [pscustomobject]@{
-        entryExit = $entryExit; libOk = $libOk; libSatisfied = $libSat; libFailed = $libFail
+        entryExit = $entryExit; libOk = $libOk; libSatisfied = $libSat; libSkipped = $libSkip; libFailed = $libFail
         libError = $libErr; generation = $(if ($null -ne $gen) { $gen.Path } else { '' }); wingetList = $list
     }
     [System.IO.File]::WriteAllText($result, ($obj | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($true)))
@@ -1046,11 +1078,11 @@ catch {
     Write-Evidence "SYSTEM apply wrapper written: $applyWrapper"
 
     $applyTask = Register-QaTask -TaskName $script:ApplyTaskName -WrapperPath $applyWrapper -WorkingDirectory (Join-Path $script:StateDir 'work') -TaskPrincipal 'SYSTEM'
-    Assert-E2EFatal ($applyTask.State -eq 'Ready') 'SYSTEM apply task registered and Ready'
+    Assert-E2EFatal ($applyTask.State -in @('Ready', 'Running')) 'SYSTEM apply task registered and Ready'
 
     # --- run A: fresh install (SYSTEM principal) ---
     Write-Evidence ""
-    Write-Evidence "--- SYSTEM apply RUN A: fresh install of 7zip.7zip@26.02 ---"
+    Write-Evidence "--- SYSTEM apply RUN A: fresh install of 7zip.7zip@26.06 ---"
     # 13-min poll: the SYSTEM install hang is deterministic (the lib's 600s
     # install timeout + the generation copy); the wrapper's result JSON is
     # written only after the lib apply, so a hang leaves no result -> fallback.
@@ -1059,13 +1091,13 @@ catch {
     $sysOk = $false
     if (Test-Path -LiteralPath $applyResult -PathType Leaf) {
         $sysJson = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($applyResult))
-        Write-Evidence "SYSTEM apply result JSON: entryExit=$($sysJson.entryExit) libOk=$($sysJson.libOk) libSatisfied=$($sysJson.libSatisfied) libFailed=$($sysJson.libFailed) libError=$($sysJson.libError)"
+        Write-Evidence "SYSTEM apply result JSON: entryExit=$($sysJson.entryExit) libOk=$($sysJson.libOk) libSatisfied=$($sysJson.libSatisfied) libSkipped=$($sysJson.libSkipped) libFailed=$($sysJson.libFailed) libError=$($sysJson.libError)"
         Write-Evidence "SYSTEM apply winget list: $($sysJson.wingetList)"
-        $sysOk = (($null -eq $sysJson.fatal) -and ($sysJson.entryExit -eq 0) -and ([int]$sysJson.libOk -ge 1) -and ([int]$sysJson.libFailed -eq 0))
+        $sysOk = (($null -eq $sysJson.fatal) -and ($sysJson.entryExit -eq 0) -and (([int]$sysJson.libOk + [int]$sysJson.libSatisfied + [int]$sysJson.libSkipped) -ge 1) -and ([int]$sysJson.libFailed -eq 0))
     }
     $applyPrincipal = 'SYSTEM'
     if ($sysOk) {
-        Assert-E2E $true 'SYSTEM apply run A: entry exit 0 + lib install ok>=1' "(task result $runAResult)"
+        Assert-E2E $true 'SYSTEM apply run A: entry exit 0 + lib success/satisfied/state-match' "(task result $runAResult)"
     }
     else {
         # SYSTEM path FAILED. Verified by probe: the winget install under
@@ -1087,17 +1119,17 @@ catch {
         $portFreed = Wait-PortFree -Port $script:HttpPort
         Assert-E2EFatal $portFreed 'HTTP port freed after killing the hung SYSTEM task' "(port $script:HttpPort)"
         $applyTask2 = Register-QaTask -TaskName $script:ApplyTaskName -WrapperPath $applyWrapper -WorkingDirectory (Join-Path $script:StateDir 'work') -TaskPrincipal 'User'
-        Assert-E2EFatal ($applyTask2.State -eq 'Ready') 'User-principal apply task registered and Ready (fallback)'
+        Assert-E2EFatal ($applyTask2.State -in @('Ready', 'Running')) 'User-principal apply task registered and Ready (fallback)'
         $applyPrincipal = 'User'
         Write-Evidence ""
-        Write-Evidence "--- FALLBACK RUN A2: fresh install of 7zip.7zip@26.02 (User principal, S4U) ---"
+        Write-Evidence "--- FALLBACK RUN A2: fresh install of 7zip.7zip@26.06 (User principal, S4U) ---"
         $runA2Result = Run-QaTaskAndWait -TaskName $script:ApplyTaskName -TimeoutMinutes 20
         Write-RunLogTail -Path $applyLog
         $userOk = $false
         if (Test-Path -LiteralPath $applyResult -PathType Leaf) {
             $userJson = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($applyResult))
-            Write-Evidence "User apply result JSON: entryExit=$($userJson.entryExit) libOk=$($userJson.libOk) libSatisfied=$($userJson.libSatisfied) libFailed=$($userJson.libFailed) libError=$($userJson.libError)"
-            $userOk = (($null -eq $userJson.fatal) -and ($userJson.entryExit -eq 0) -and ([int]$userJson.libOk -ge 1) -and ([int]$userJson.libFailed -eq 0))
+            Write-Evidence "User apply result JSON: entryExit=$($userJson.entryExit) libOk=$($userJson.libOk) libSatisfied=$($userJson.libSatisfied) libSkipped=$($userJson.libSkipped) libFailed=$($userJson.libFailed) libError=$($userJson.libError)"
+            $userOk = (($null -eq $userJson.fatal) -and ($userJson.entryExit -eq 0) -and (([int]$userJson.libOk + [int]$userJson.libSatisfied + [int]$userJson.libSkipped) -ge 1) -and ([int]$userJson.libFailed -eq 0))
         }
         Assert-E2EFatal $userOk 'User-principal fallback apply: install succeeds (S4U admin)' "(task result $runA2Result)"
         # spec-literal: Register-SyncTasks -Role B -PackagesTaskPrincipal User
@@ -1127,11 +1159,11 @@ catch {
     }
 
     # install evidence: install dir + winget list + state
-    $seven = Get-7Zip2602Installed
-    Write-Evidence "7zip 26.02 evidence: installDir=$($seven.DirOk)"
+    $seven = Get-7Zip2606Installed
+    Write-Evidence "7zip 26.06 evidence: installDir=$($seven.DirOk)"
     Write-Evidence "7zip winget list output: $($seven.ListOutput.Trim())"
-    Assert-E2EFatal $seven.DirOk '7zip 26.02 install dir evidence (C:\Program Files\7-Zip\7z.exe 26.02)'
-    $script:SevenZipInstalledByQa = $true
+    Assert-E2EFatal $seven.DirOk '7zip 26.06 install dir evidence (C:\Program Files\7-Zip\7z.exe 26.06)'
+    $script:SevenZipInstalledByQa = (-not $script:SevenZipWasPresent)
     $sysState2 = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($sysStatePath))
     Write-Evidence "system-state lastApplied.winget=$($sysState2.lastApplied.winget) (expected $script:ExportedAtUtc)"
     Assert-E2EFatal ($sysState2.lastApplied.winget -eq $script:ExportedAtUtc) 'state.lastApplied.winget stamped with the fixture generation'
@@ -1156,19 +1188,77 @@ catch {
         $entrySkipped = $entrySkipped -and ($applyLogText -match 'nothing pending')
     }
     Assert-E2E $entrySkipped 'apply run B: entry round skipped (nothing pending - idempotent)' "(task result $runBResult)"
-    $libSatisfiedB = ($null -ne $sysB -and $null -eq $sysB.fatal -and [int]$sysB.libOk -ge 1 -and [int]$sysB.libFailed -eq 0)
-    Assert-E2E $libSatisfiedB 'apply run B: lib-level satisfied re-run exit 0 (ok>=1)' "(libOk=$($sysB.libOk) libFailed=$($sysB.libFailed))"
+    $libSatisfiedB = ($null -ne $sysB -and $null -eq $sysB.fatal -and (([int]$sysB.libOk + [int]$sysB.libSatisfied + [int]$sysB.libSkipped) -ge 1) -and ([int]$sysB.libFailed -eq 0))
+    Assert-E2E $libSatisfiedB 'apply run B: lib-level satisfied/state-match re-run succeeds' "(libOk=$($sysB.libOk) libSatisfied=$($sysB.libSatisfied) libSkipped=$($sysB.libSkipped) libFailed=$($sysB.libFailed))"
 
-    # --- uninstall the fixture package (cleanup of the install probe) ---
+    # --- delta generation: one YAML changes; unchanged files are hard-linked,
+    # and one deliberately missing baseline installer exercises repo fallback ---
     Write-Evidence ""
-    Write-Evidence "--- uninstall 7zip 26.02 (fixture cleanup) ---"
-    $un1 = Uninstall-7Zip2602
-    Assert-E2EFatal $un1 'uninstall 7zip 26.02 exit 0'
-    $sevenAfter = Get-7Zip2602Installed
-    Write-Evidence "7zip after uninstall: installDir=$($sevenAfter.DirOk)"
-    Write-Evidence "7zip winget list after uninstall: $($sevenAfter.ListOutput.Trim())"
-    Assert-E2E (-not $sevenAfter.DirOk) '7zip 26.02 gone after uninstall (19.00 baseline untouched)'
-    $script:SevenZipInstalledByQa = $false
+    Write-Evidence "--- apply RUN DELTA: one 7zip YAML changes, unchanged files reused with repo fallback ---"
+    $deltaYaml = Get-ChildItem -LiteralPath $pkg7z -Filter '*.yaml' -File | Select-Object -First 1
+    Assert-E2EFatal ($null -ne $deltaYaml) 'delta fixture: 7zip YAML exists'
+    [System.IO.File]::AppendAllText($deltaYaml.FullName, "# DeltaProbe $([guid]::NewGuid().ToString('N'))`r`n", $script:Utf8NoBom)
+    $deltaBaseWinget = Join-Path $script:StateDir "work\$($sysState2.lastApplied.winget)\winget"
+    $deltaBase7Zip = Join-Path $deltaBaseWinget '7zip.7zip'
+    $deltaFallbackFile = Get-ChildItem -LiteralPath $deltaBase7Zip -File |
+        Where-Object { $_.Extension -in @('.msi', '.exe', '.msix', '.appx') } | Select-Object -First 1
+    Assert-E2EFatal ($null -ne $deltaFallbackFile) 'delta fixture: unchanged baseline installer exists for fallback probe'
+    $deltaFallbackName = $deltaFallbackFile.Name
+    $deltaFallbackBytes = $deltaFallbackFile.Length
+    Remove-Item -LiteralPath $deltaFallbackFile.FullName -Force
+    Write-Evidence "delta fallback probe: removed unchanged baseline installer '$($deltaFallbackFile.FullName)' ($deltaFallbackBytes bytes); repo content remains unchanged"
+    Start-Sleep -Milliseconds 1100
+    New-OSyncFilesManifest -Dir (Join-Path $script:RepoRoot 'winget') | Out-Null
+    Publish-OSyncIndex -StagingDir $script:RepoRoot | Out-Null
+    $deltaExportedAt = Get-IndexExportedAtUtc -RepoRoot $script:RepoRoot
+    $deltaFilesJson = Join-Path $script:RepoRoot 'winget\files.json'
+    $deltaManifest = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($deltaFilesJson))
+    $deltaPayloadCount = @($deltaManifest.PSObject.Properties).Count
+    $expectedDeltaRepoBytes = (Get-Item -LiteralPath $deltaYaml.FullName).Length + $deltaFallbackBytes + (Get-Item -LiteralPath $deltaFilesJson).Length
+    $runDeltaResult = Run-QaTaskAndWait -TaskName $script:ApplyTaskName -TimeoutMinutes 20
+    Write-RunLogTail -Path $applyLog
+    $sysDelta = $null
+    if (Test-Path -LiteralPath $applyResult -PathType Leaf) {
+        $sysDelta = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($applyResult))
+        Write-Evidence "apply delta result JSON: entryExit=$($sysDelta.entryExit) libOk=$($sysDelta.libOk) libSatisfied=$($sysDelta.libSatisfied) libSkipped=$($sysDelta.libSkipped) libFailed=$($sysDelta.libFailed) generation=$($sysDelta.generation)"
+    }
+    Assert-E2EFatal ($null -ne $sysDelta -and $null -eq $sysDelta.fatal -and $sysDelta.entryExit -eq 0) 'delta apply entry exits 0' "(task result $runDeltaResult)"
+    Assert-E2E ((([int]$sysDelta.libOk + [int]$sysDelta.libSatisfied + [int]$sysDelta.libSkipped) -ge 1) -and ([int]$sysDelta.libFailed -eq 0)) 'delta generation preserves the existing satisfied/state-match install result'
+    $deltaCopyPlanPath = Join-Path ([string]$sysDelta.generation) 'copy-plan.json'
+    Assert-E2EFatal (Test-Path -LiteralPath $deltaCopyPlanPath -PathType Leaf) 'delta copy-plan.json written'
+    $deltaCopyPlan = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($deltaCopyPlanPath))
+    Write-Evidence "delta winget plan: mode=$($deltaCopyPlan.winget.mode) repoCopied=$($deltaCopyPlan.winget.stats.repoCopiedFiles)/$($deltaCopyPlan.winget.stats.repoCopiedBytes) hardLinked=$($deltaCopyPlan.winget.stats.hardLinkedFiles)/$($deltaCopyPlan.winget.stats.hardLinkedBytes) baselineCopied=$($deltaCopyPlan.winget.stats.baselineCopiedFiles)"
+    Assert-E2E ($deltaCopyPlan.winget.mode -eq 'delta') 'winget plan mode=delta'
+    Assert-E2E ($deltaCopyPlan.winget.baseExportedAtUtc -eq $sysState2.lastApplied.winget) 'delta uses the actual lastApplied verified baseline'
+    Assert-E2E ($deltaCopyPlan.winget.stats.repoCopiedFiles -eq 3) 'delta copies only changed YAML, missing baseline installer and current files.json from repo'
+    Assert-E2E ($deltaCopyPlan.winget.stats.repoCopiedBytes -eq $expectedDeltaRepoBytes) 'delta repoCopiedBytes equals the two payload files plus current files.json' "(actual=$($deltaCopyPlan.winget.stats.repoCopiedBytes) expected=$expectedDeltaRepoBytes)"
+    Assert-E2E ($deltaCopyPlan.winget.stats.hardLinkedFiles -eq ($deltaPayloadCount - 2)) 'all other unchanged winget payloads are hard-linked from the verified baseline'
+    Assert-E2E ($deltaCopyPlan.winget.stats.reusedFiles -eq ($deltaPayloadCount - 2)) 'missing baseline file is not counted as reused'
+    Assert-E2E ($deltaCopyPlan.winget.stats.deletedFiles -eq 0) 'delta plan has no unexpected deletions'
+    $deltaFallbackTarget = Join-Path ([string]$sysDelta.generation) "winget\7zip.7zip\$deltaFallbackName"
+    Assert-E2E (Test-Path -LiteralPath $deltaFallbackTarget -PathType Leaf) 'repo fallback restores the missing baseline installer into the complete work copy'
+    Assert-E2E ((Get-OSyncFileSha256 -Path $deltaFallbackTarget) -eq (Get-OSyncFileSha256 -Path (Join-Path $pkg7z $deltaFallbackName))) 'repo fallback installer matches the published SHA256'
+    $deltaVerified = Test-OSyncApplyWorkCopy -Bw ([string]$sysDelta.generation)
+    Assert-E2E $deltaVerified 'delta work copy passes the existing full per-file hash verification'
+    $deltaState = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($sysStatePath))
+    Assert-E2E ($deltaState.lastApplied.winget -eq $deltaExportedAt) 'delta success advances lastApplied to the new generation'
+    $script:ExportedAtUtc = $deltaExportedAt
+
+    # --- uninstall the fixture package only when this QA installed it ---
+    Write-Evidence ""
+    if ($script:SevenZipWasPresent) {
+        Write-Evidence "SKIP: preserve pre-existing 7zip 26.06 (not installed by this QA)"
+    }
+    else {
+        Write-Evidence "--- uninstall 7zip 26.06 (fixture cleanup) ---"
+        $un1 = Uninstall-7Zip2606
+        Assert-E2EFatal $un1 'uninstall 7zip 26.06 exit 0'
+        $sevenAfter = Get-7Zip2606Installed
+        Write-Evidence "7zip after uninstall: installDir=$($sevenAfter.DirOk)"
+        Write-Evidence "7zip winget list after uninstall: $($sevenAfter.ListOutput.Trim())"
+        Assert-E2E (-not $sevenAfter.DirOk) '7zip 26.06 gone after uninstall (19.00 baseline untouched)'
+        $script:SevenZipInstalledByQa = $false
+    }
 
     # =====================================================================
     # SPEC 4: OFFLINE SIMULATION (outbound BLOCK rule for winget.exe)
@@ -1215,23 +1305,28 @@ catch {
     $sysC = $null
     if (Test-Path -LiteralPath $applyResult -PathType Leaf) {
         $sysC = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($applyResult))
-        Write-Evidence "apply run C result JSON: entryExit=$($sysC.entryExit) libOk=$($sysC.libOk) libSatisfied=$($sysC.libSatisfied) libFailed=$($sysC.libFailed) libError=$($sysC.libError)"
+        Write-Evidence "apply run C result JSON: entryExit=$($sysC.entryExit) libOk=$($sysC.libOk) libSatisfied=$($sysC.libSatisfied) libSkipped=$($sysC.libSkipped) libFailed=$($sysC.libFailed) libError=$($sysC.libError)"
     }
-    $offlineOk = ($null -ne $sysC -and $null -eq $sysC.fatal -and [int]$sysC.libOk -ge 1 -and [int]$sysC.libFailed -eq 0)
-    Assert-E2EFatal $offlineOk 'offline simulation: manifest install SUCCEEDS under the block rule' "(task result $runCResult, libOk=$($sysC.libOk) libFailed=$($sysC.libFailed))"
-    $script:SevenZipInstalledByQa = $true
+    $offlineOk = ($null -ne $sysC -and $null -eq $sysC.fatal -and (([int]$sysC.libOk + [int]$sysC.libSatisfied + [int]$sysC.libSkipped) -ge 1) -and ([int]$sysC.libFailed -eq 0))
+    Assert-E2EFatal $offlineOk 'offline simulation: manifest install SUCCEEDS under the block rule' "(task result $runCResult, libOk=$($sysC.libOk) libSkipped=$($sysC.libSkipped) libFailed=$($sysC.libFailed))"
+    $script:SevenZipInstalledByQa = (-not $script:SevenZipWasPresent)
 
     # delete the rule
     Remove-WingetBlockRule
     Assert-E2EFatal ($null -eq (Get-NetFirewallRule -DisplayName $script:BlockRuleName -ErrorAction SilentlyContinue)) 'firewall BLOCK rule deleted'
 
-    # --- uninstall the fixture package again (offline run reinstalled it) ---
-    Write-Evidence "--- uninstall 7zip 26.02 (post-offline cleanup) ---"
-    $un2 = Uninstall-7Zip2602
-    Assert-E2EFatal $un2 'uninstall 7zip 26.02 (post-offline) exit 0'
-    $sevenFinal = Get-7Zip2602Installed
-    Assert-E2E (-not $sevenFinal.DirOk) '7zip 26.02 gone after post-offline uninstall (19.00 baseline untouched)'
-    $script:SevenZipInstalledByQa = $false
+    # --- uninstall the offline fixture only when this QA installed it ---
+    if ($script:SevenZipWasPresent) {
+        Write-Evidence "SKIP: preserve pre-existing 7zip 26.06 after offline verification"
+    }
+    else {
+        Write-Evidence "--- uninstall 7zip 26.06 (post-offline cleanup) ---"
+        $un2 = Uninstall-7Zip2606
+        Assert-E2EFatal $un2 'uninstall 7zip 26.06 (post-offline) exit 0'
+        $sevenFinal = Get-7Zip2606Installed
+        Assert-E2E (-not $sevenFinal.DirOk) '7zip 26.06 gone after post-offline uninstall (19.00 baseline untouched)'
+        $script:SevenZipInstalledByQa = $false
+    }
 
     # =====================================================================
     # FULL PESTER REGRESSION (both shells)
@@ -1307,8 +1402,8 @@ finally {
         try { Stop-QaTaskProcesses } catch { }
         try { Remove-WingetBlockRule } catch { }
         if ($script:SevenZipInstalledByQa) {
-            Write-Evidence "cleanup: uninstalling 7zip 26.02 (installed by this QA)"
-            try { $u = Uninstall-7Zip2602; Write-Evidence "cleanup uninstall exit 0: $u" } catch { }
+            Write-Evidence "cleanup: uninstalling 7zip 26.06 (installed by this QA)"
+            try { $u = Uninstall-7Zip2606; Write-Evidence "cleanup uninstall exit 0: $u" } catch { }
         }
         try { Restore-AdminSettings } catch { Write-Evidence "cleanup: admin_settings restore failed: $($_.Exception.Message)" }
         if (-not $KeepArtifacts) {

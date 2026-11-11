@@ -1,4 +1,4 @@
-﻿# PakageSync — A→B 单向离线同步 运维手册
+# PakageSync — A→B 单向离线同步 运维手册
 
 > 配套工作计划：`.omo/plans/ab-one-way-sync.md`。本文档面向部署/运维人员，覆盖架构、威胁模型、首次部署、清单编辑、日常运维动作与全部已知限制。
 > 角色：**A** = 外网机（可联网，负责导出）；**B** = 内网机（不可联网，负责校验与安装）。A↔B 之间无任何直连，文件只能经**既有 SMB 单向服务**从 A 流向 B。
@@ -51,7 +51,7 @@
 
 1. 安装 Node.js/npm（npm 类别导出与预热需要；B 端 runtime 的 Node 由 winget 管线安装，A 侧自身需可用 npm）。
 2. 按「四、清单编辑指南」编辑五份清单：`manifests\winget-packages.txt`、`manifests\requirements.txt`、`manifests\npm-packages.txt`、`manifests\bun-packages.txt`（可空，见 4.5）、`manifests\dotfiles\`（chezmoi 源态）。
-3. （可选）核对 `config\packagesync.json`：`repoRoot`、`stagingRoot`、端口（8788/4873/4874）、`categories`、运行时钉版 `pins.*`（含 `pins.bun`——bun 运行时本体的钉版下载，`sha256` 走 5.6 的 PIN-ME 流程；**整节删除 `pins.bun` 即整体关闭 bun**，旧 config 无 bun 键不受影响）。
+3. （可选）核对 `config\packagesync.json`：`repoRoot`、`stagingRoot`、端口（8788/4873/4874）、`categories`、运行时钉版 `pins.*`（含 `pins.bun`——bun 运行时本体的钉版下载，`sha256` 走 5.6 的 PIN-ME 流程；**整节删除 `pins.bun` 即整体关闭 bun**，旧 config 无 bun 键不受影响）。默认 `stagingRoot=C:\PakageSync-staging` 必须使用 A 端本地 NTFS 路径：逐代 staging、`.verdaccio-a` 与可复用载荷缓存均只写该本地目录，共享 `repoRoot` 仅承载正式发布仓库；部署到其他位置时也应保持这一边界。
 4. 注册 A 端计划任务（每日 02:00 自动导出）：
 
 ```powershell
@@ -61,7 +61,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Register-SyncTask
    - 注册任务 `PakageSync-Export`：当前用户、LogonType S4U（注销也运行）、RunLevel Highest、StartWhenAvailable。
    - 也可手动触发验证：`powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\src\Export-OfflineRepo.ps1 [-ConfigPath <path>] [-Category winget,pip,npm,dotfiles]`。
    - 手动运行时控制台**默认实时回显**进度（里程碑日志行 + winget/pip/npm 子进程输出，winget 侧 250ms 节流 + CR 折叠），无需另开窗口尾随日志；需要静默（只看日志文件）时加 `-Quiet`。无人值守计划任务不受此开关影响。
-   - `-SkipRuntime`：跳过 runtime 重导出（VC_redist/bun 下载、Python/Node winget 下载、Verdaccio 构建、tool 快照），改为**复用落盘区上一代已发布载荷**（`runtime\` + `winget\` 下的 Python/Node 目录复制进新 staging 代并重新入清单）——信任链（index → files.json → 逐文件 SHA256）完全不变，仅省去下载/构建耗时；`runtime\tool` 快照随之保持上一代内容。要求已做过至少一次完整导出，否则 fail-fast 报错（不做任何 staging 工作）。
+   - `-SkipRuntime`：跳过 runtime 重导出（VC_redist/bun 下载、Python/Node winget 下载、Verdaccio 构建、tool 快照），优先复用本地最新成功代的 `runtime\` 与 `winget\` Python/Node 载荷，缺失或本地代不可用时才回退共享 `repoRoot`；复用文件复制进新 staging 代并重新入清单，信任链不变。要求本地或共享中至少存在一套完整载荷，否则 fail-fast。
+   - **内容级增量发布**：A 端按各类别 `files.json` 的相对路径、字节数与 SHA256 仅复制新增/变化载荷并删除失效文件；未变化类别不重写，其旧 `files.json` 与索引记录原样保留，正式 `index.json` 始终最后写入。报告 `publication` 按类记录 `copiedFiles/copiedBytes`、`reusedFiles/reusedBytes`、`deletedFiles/deletedBytes`、`mode` 与 `fallbackReason`。
+   - **无变化导出是成功的 NO-OP**：全部交付内容一致时返回 `success=true`、`published=false`、`noOp=true`（入口退出码 0），不更新共享 `index.json`、`exportedAtUtc` 或其 mtime，B 端不会看到新代。
 
 ### 3.2 B 端（内网机）
 
@@ -232,7 +234,7 @@ pip 清单（4.2）之外的**私有 wheel 通道**：把运维人员预先备�
 - **钉版追加**：从 wheel 文件名解析 `name==version`，追加进**交付的** `<staging>\pip\requirements.txt`，行尾带 `# local: <文件名>` 标记注释（UTF-8 BOM 与 CRLF/LF 均保持原样；无新增钉版时该文件完全不重写）。**原始 `manifests\requirements.txt` 绝不被修改**，A 端 `pip download -r` 也只跑原始清单。
 - **去重**：与清单已有钉版按 PEP 503 归一化（小写、`-_.` 折叠为 `-`）比较——清单已钉同名包时 wheel 仍复制但**不重复追加**（报告 `copied-pin-exists`），避免 B 端 `pip install` 报 "Double requirement given"。
 - **平台责任**：局部 wheel 必须匹配 B 端平台钉版（`pip.downloadArgs` 的 `win_amd64`/`cp312` 等），否则 B 端 apply 时 `pip install` 失败——这属操作员责任，导出不做平台校验。
-- **导出报告**：`<staging>\pip\export-report.json` 新增 `local` 数组，`action` 取值 `copied` / `copied-pin-exists` / `skipped-sdist` / `skipped-unparseable` / `missing-dir`。
+- **导出报告**：winget/pip 类别报告分别写入本代本地 `<staging>\reports\winget-export-report.json` 与 `<staging>\reports\pip-export-report.json`，不进入类别 `files.json`，也不发布到共享仓库。pip 报告的 `local` 数组中，`action` 取值 `copied` / `copied-pin-exists` / `skipped-sdist` / `skipped-unparseable` / `missing-dir`。
 
 ## 五、运维手册
 
@@ -308,7 +310,7 @@ chezmoi、bun 与 VC_redist（App Installer 链不再导出/安装，见 3.2）�
 
 winget 类别在两端各有一层增量跳过，**信任根链（index.json → files.json → 逐文件 SHA256）完全不变**——增量只省「下载/安装执行」，不省任何校验。
 
-**A 端导出（P1，复用已发布载荷）**：钉版条目 `Id@version` 满足以下全部条件时，直接从落盘区现有 `winget\<Id>\` 复制载荷进 staging，**不调用 `winget download`**（导出报告 `reused` 数组记录）：
+**A 端导出（P1，复用先前成功代）**：钉版条目 `Id@version` 满足以下全部条件时，优先从本地最新成功代的 `winget\<Id>\` 复制载荷进 staging，本地代缺失/损坏或包不可复用时才检查共享 `repoRoot`，**不调用 `winget download`**（导出报告 `reused` 数组记录）：
 
 1. 条目已钉版（未钉版条目追踪「导出时最新版」，永远全量下载）；
 2. 落盘区存在该包上一版载荷与 `winget\files.json`；
@@ -318,7 +320,13 @@ winget 类别在两端各有一层增量跳过，**信任根链（index.json →
 
 任何条件不满足或复用检查自身报错 → 回退正常下载（fail-safe 方向），不视为导出失败。
 
-**B 端 apply（P2，state 匹配跳过）**：安装循环前，比较工作副本 YAML 的 `PackageVersion` + 首个 `InstallerSha256` 与 `system-state.json` 的 `winget[<Id>]` 记录；两者**完全一致**则跳过该包的 `winget install`（记入 apply 报告 `skipped` 数组；全部命中时连本地 HTTP 服务都不启动）。state 记录只在真实安装成功/已满足后写入，因此匹配即证明「B 正运行 exactly 这份载荷」。
+**B 端类别计划与 winget 文件级 delta**：packages/user 两轮分别读取各类自己的 `lastApplied`，仅接受对应 `work\<ts>` 中同时存在 `.verified` 与可解析 `files.json` 的基线。当前索引的类别清单哈希与基线一致时计划为 `skip`：不复制、不安装，也不虚推进 `lastApplied`。首次应用、基线缺失/未验证/损坏时回退 `full`；其余 winget 更新使用 `delta`，pip/npm/dotfiles pending 时仍完整复制该类别。只有实际 pending 的类别与完整 runtime 进入新 work，npm 与 winget 同时 pending 时二者分别走 full/delta。
+
+winget delta 仅从现在 repo 复制新增/变化文件及当前 `files.json`；未变化文件优先硬链接到已验证基线，失败则复制基线，基线文件缺失时再从 repo 复制。当前清单已删除的包、安装器或依赖不会进入新代。新代仍是逻辑完整目录，现有安装、本地 HTTP、runtime winget 包和自刷新消费方式不变。apply 结果与本代本地 `copy-plan.json` 按类记录 `mode`、`baseExportedAtUtc`、`fallbackReason`，以及 `copiedFiles/copiedBytes`、`reusedFiles/reusedBytes`、`deletedFiles/deletedBytes` 和硬链接/基线复制明细。
+
+**校验与保留策略不变的安全边界**：新 work 写入 `.verified` 前仍逐文件执行全量 bytes/SHA256 复核；任一变化文件损坏会删除新代且不推进该类 `lastApplied`。清理除保留最新两代外，还保护 system/user state 中各类 `lastApplied` 引用的已验证基线。首次 bootstrap 与 runtime 漂移 self-heal 的独立工作副本仍走原有全量路径，不在本轮 delta 优化范围内。
+
+**B 端包级安装跳过（P2，state 匹配）**：安装循环前，比较工作副本 YAML 的 `PackageVersion` + 首个 `InstallerSha256` 与 `system-state.json` 的 `winget[<Id>]` 记录；两者**完全一致**则跳过该包的 `winget install`（记入 apply 报告 `skipped` 数组；全部命中时连本地 HTTP 服务都不启动）。state 记录只在真实安装成功/已满足后写入，因此匹配即证明「B 正运行 exactly 这份载荷」。
 
 > **取舍须知**：B 上**手动卸载**的包在其 state 记录仍匹配时不会自动重装（winget 根本不会被调用）。恢复方法：删除 `C:\ProgramData\PakageSync\state\system-state.json` 中对应的 `winget.<Id>` 记录（或升级钉版版本）后重跑 apply。
 

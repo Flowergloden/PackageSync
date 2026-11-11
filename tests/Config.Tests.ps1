@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 # Config.Tests.ps1 - Pester 5 tests for src\lib\Config.ps1 (Get-OSyncConfig).
 
 Describe 'OfflineSync config loading (Get-OSyncConfig)' {
@@ -32,7 +32,7 @@ Describe 'OfflineSync config loading (Get-OSyncConfig)' {
             $config.schemaVersion | Should -Be 1
             $config.role | Should -Be 'A'
             $config.repoRoot | Should -Be '\\10.40.28.151\home\OfflineRepo'
-            $config.stagingRoot | Should -Be '\\10.40.28.151\home\PakageSync-staging'
+            $config.stagingRoot | Should -Be 'C:\PakageSync-staging'
             $config.httpBind | Should -Be '127.0.0.1'
             $config.httpPort | Should -Be 8788
             $config.verdaccioPort | Should -Be 4873

@@ -635,3 +635,27 @@ exit /b %FAKE_NPM_EXIT%
         }
     }
 }
+
+Describe 'RuntimeExport deterministic npm lock identity' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\src\lib\RuntimeExport.ps1')
+    }
+
+    It 'removes the random temp directory from both lockfile names only' {
+        $dir = Join-Path $TestDrive 'verdaccio'
+        New-Item -ItemType Directory -Path (Join-Path $dir 'node_modules') -Force | Out-Null
+        $json = "{`n  `"name`": `"osync-runtime-verdaccio-abc123`",`n  `"lockfileVersion`": 3`n}"
+        foreach ($rel in @('package-lock.json', 'node_modules\.package-lock.json')) {
+            [System.IO.File]::WriteAllText((Join-Path $dir $rel), $json, (New-Object System.Text.UTF8Encoding($false)))
+        }
+
+        Set-OSyncRuntimeLockIdentity -BuildDir $dir
+
+        foreach ($rel in @('package-lock.json', 'node_modules\.package-lock.json')) {
+            $updated = [System.IO.File]::ReadAllText((Join-Path $dir $rel))
+            $updated | Should -Match '"name": "pakage-sync-verdaccio"'
+            $updated | Should -Not -Match 'abc123'
+            $updated | Should -Match '"lockfileVersion": 3'
+        }
+    }
+}

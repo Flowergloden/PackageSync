@@ -1834,3 +1834,40 @@ $report.local.published.Count | Should -Be 1
         @($report.local.failed | Where-Object { $_.Name -eq 'will-fail' -and $_.Error -like '*deps warm failed*' }).Count | Should -Be 1
     }
 }
+
+Describe 'npm stable registry metadata reuse' {
+    BeforeEach {
+        $script:stableRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $script:previousNpm = Join-Path $script:stableRoot 'previous\npm'
+        $script:currentNpm = Join-Path $script:stableRoot 'current\npm'
+        foreach ($npmDir in @($script:previousNpm, $script:currentNpm)) {
+            New-Item -ItemType Directory -Path (Join-Path $npmDir 'storage\demo') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $npmDir 'packages.txt'), 'demo@1.0.0')
+            [System.IO.File]::WriteAllBytes((Join-Path $npmDir 'storage\demo\demo-1.0.0.tgz'), [byte[]]@(1, 2, 3, 4))
+        }
+        [System.IO.File]::WriteAllText((Join-Path $script:previousNpm 'storage\.verdaccio-db.json'), '{"secret":"stable"}')
+        [System.IO.File]::WriteAllText((Join-Path $script:currentNpm 'storage\.verdaccio-db.json'), '{"secret":"random"}')
+        [System.IO.File]::WriteAllText((Join-Path $script:previousNpm 'storage\demo\package.json'), '{"_rev":"stable"}')
+        [System.IO.File]::WriteAllText((Join-Path $script:currentNpm 'storage\demo\package.json'), '{"_rev":"random"}')
+    }
+
+    It 'reuses the database and package metadata when manifests and tarballs are unchanged' {
+        $result = Restore-OSyncNpmStableMetadata -CurrentNpmDir $script:currentNpm -PreviousNpmDir $script:previousNpm
+
+        $result.stabilized | Should -BeTrue
+        $result.restoredFiles | Should -Be 2
+        [System.IO.File]::ReadAllText((Join-Path $script:currentNpm 'storage\.verdaccio-db.json')) | Should -Be '{"secret":"stable"}'
+        [System.IO.File]::ReadAllText((Join-Path $script:currentNpm 'storage\demo\package.json')) | Should -Be '{"_rev":"stable"}'
+    }
+
+    It 'keeps current metadata when a tarball actually changes' {
+        [System.IO.File]::WriteAllBytes((Join-Path $script:currentNpm 'storage\demo\demo-1.0.0.tgz'), [byte[]]@(1, 2, 3, 5))
+
+        $result = Restore-OSyncNpmStableMetadata -CurrentNpmDir $script:currentNpm -PreviousNpmDir $script:previousNpm
+
+        $result.stabilized | Should -BeFalse
+        $result.reason | Should -Match 'tarball changed'
+        [System.IO.File]::ReadAllText((Join-Path $script:currentNpm 'storage\.verdaccio-db.json')) | Should -Be '{"secret":"random"}'
+        [System.IO.File]::ReadAllText((Join-Path $script:currentNpm 'storage\demo\package.json')) | Should -Be '{"_rev":"random"}'
+    }
+}

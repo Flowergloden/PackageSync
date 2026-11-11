@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Pester 5 unit tests for src\lib\WingetExport.ps1.
@@ -385,10 +385,11 @@ Describe 'WingetExport: export loop with a fake winget (no network)' {
         $packagesTxt.Trim() | Should -Be 'synthetic.SampleApp@1.0.0'
 
         # Export report JSON exists and parses.
-        $reportJson = [System.IO.File]::ReadAllText((Join-Path $staging 'winget\export-report.json'), [System.Text.Encoding]::UTF8)
+        $reportJson = [System.IO.File]::ReadAllText((Join-Path $staging 'reports\winget-export-report.json'), [System.Text.Encoding]::UTF8)
         $parsed = $reportJson | ConvertFrom-Json
         $parsed.category | Should -Be 'winget'
         $parsed.failed.Count | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $staging 'winget\export-report.json') | Should -BeFalse
     }
 
     It 'retries a machine-scope no-applicable-installer failure as user scope' {
@@ -594,6 +595,43 @@ Describe 'WingetExport: incremental reuse of unchanged pinned packages (P1)' {
 
         $report.reused.Count | Should -Be 0
         $report.ok.Count | Should -Be 1
+        $report.failed.Count | Should -Be 0
+    }
+
+    It 'reuses from the latest successful local export without reading repoRoot' {
+        $repo = Join-Path $TestDrive 'repo-local-only'
+        $localRoot = Join-Path $TestDrive 'local-generations'
+        $localGen = Join-Path $localRoot '20261101T000000Z'
+        & $script:NewPrevRepo $localGen
+        [System.IO.File]::WriteAllText((Join-Path $localGen 'export-report.json'),
+            (@{ success = $true; stagingDir = $localGen } | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($true)))
+        $cfg = & $script:NewReuseConfig $repo
+        $cfg | Add-Member -NotePropertyName stagingRoot -NotePropertyValue $localRoot
+        $list = @([pscustomobject]@{ Id = 'synthetic.SampleApp'; Version = '1.0.0'; Line = 1 })
+
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir (Join-Path $TestDrive 'staging-local') `
+            -Config $cfg -WingetExePath $script:fakeFailAll
+
+        $report.reused.Count | Should -Be 1
+        $report.failed.Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $repo 'winget') | Should -BeFalse
+    }
+
+    It 'falls back to repoRoot when the latest local export report is damaged' {
+        $repo = Join-Path $TestDrive 'repo-damaged-local'
+        & $script:NewPrevRepo $repo
+        $localRoot = Join-Path $TestDrive 'damaged-local-generations'
+        $localGen = Join-Path $localRoot '20261101T000000Z'
+        New-Item -ItemType Directory -Path $localGen -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $localGen 'export-report.json'), '{broken')
+        $cfg = & $script:NewReuseConfig $repo
+        $cfg | Add-Member -NotePropertyName stagingRoot -NotePropertyValue $localRoot
+        $list = @([pscustomobject]@{ Id = 'synthetic.SampleApp'; Version = '1.0.0'; Line = 1 })
+
+        $report = Export-OSyncWinget -ParsedList $list -StagingDir (Join-Path $TestDrive 'staging-damaged-local') `
+            -Config $cfg -WingetExePath $script:fakeFailAll
+
+        $report.reused.Count | Should -Be 1
         $report.failed.Count | Should -Be 0
     }
 }

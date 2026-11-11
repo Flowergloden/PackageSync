@@ -7,15 +7,10 @@
   dir (cloned config) and asserts the full A-side publish contract:
 
     1. Full-category export -> publish (run 1); Test-OSyncRepoIntegrity all OK.
-    2. Immediate repeat export -> publish (run 2): payload file sha256 maps
-       unchanged (repeat-publish idempotency) and index exportedAtUtc strictly
-       advanced. (Each run is a FRESH staging dir - nothing is reused - so
-       run 2 is a genuine independent re-publish.) The comparison covers
-       PAYLOAD files only; a small set of known non-deterministic OPERATIONAL
-       files is excluded and reported (see Test-OSyncPayloadFile): category
-       export-report.json (timestamps), npm storage .verdaccio-db.json (random
-       secret), npm storage package.json metadata (_rev / presence varies).
-       The npm .tgz payloads are byte-identical across runs (observed in QA).
+    2. Immediate repeat export -> successful no-op (run 2): index bytes,
+       exportedAtUtc and mtime stay unchanged. Run 3 changes exactly one winget
+       file in that staging generation and verifies a winget-only publish,
+       including exact copied-byte statistics and unchanged other categories.
     3. index.json is the newest-mtime file in repoRoot (the logs dir is
        excluded: role A writes <repoRoot>\logs AFTER the publish - todo-11
        learning).
@@ -92,14 +87,12 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 $script:PassCount = 0
 $script:FailCount = 0
-$script:EvidencePath = ''
 $script:EvidenceSeeded = $false
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:ExportScript = ''
 $script:ConfigOut = ''
 $script:RepoRoot = ''
 $script:StagingRoot = ''
-$script:LandingRoot = ''
 
 # ---------------------------------------------------------------------------
 # evidence + assertion helpers
@@ -398,6 +391,7 @@ try {
     $cfg.httpPort = $httpPort
     $cfg.verdaccioPort = $verdaccioPort
     $cfg.npm.aVerdaccioPort = $aVerdaccioPort
+    $cfg.paths.npmLocalDirs = @()
     $newJson = $cfg | ConvertTo-Json -Depth 10
     [System.IO.File]::WriteAllText($script:ConfigOut, $newJson, (New-Object System.Text.UTF8Encoding($true)))
     Write-Evidence "cloned config: $script:ConfigOut"
@@ -423,6 +417,16 @@ try {
     # dir, and Test-OSyncRepoIntegrity ignores un-manifested extra dirs (out
     # of contract scope, RepoContract header).
     Copy-Item -LiteralPath (Join-Path $repo 'manifests') -Destination (Join-Path $script:LandingRoot 'manifests') -Recurse -Force
+    $fixtureManifests = @{
+        'winget-packages.txt' = @('# Small isolated E2E payloads; production manifests are not modified.', 'BurntSushi.ripgrep.MSVC@15.2.0', 'jftuga.less@710')
+        'requirements.txt' = @('# Small isolated E2E payload.', 'six==1.17.0')
+        'npm-packages.txt' = @('# Small isolated E2E payload.', 'is-odd@3.0.1')
+    }
+    foreach ($name in $fixtureManifests.Keys) {
+        $fixturePath = Join-Path $script:LandingRoot "manifests\$name"
+        [System.IO.File]::WriteAllText($fixturePath, (($fixtureManifests[$name] -join "`r`n") + "`r`n"), $script:Utf8NoBom)
+        Write-Evidence "small package fixture: $name = $($fixtureManifests[$name] -join ' | ')"
+    }
     Assert-E2EFatal (Test-Path -LiteralPath (Join-Path $script:LandingRoot 'manifests\winget-packages.txt') -PathType Leaf) 'fixture winget whitelist staged under the test tool root'
     Assert-E2EFatal (Test-Path -LiteralPath (Join-Path $script:LandingRoot 'manifests\requirements.txt') -PathType Leaf) 'fixture requirements staged under the test tool root'
     Assert-E2EFatal (Test-Path -LiteralPath (Join-Path $script:LandingRoot 'manifests\dotfiles') -PathType Container) 'fixture dotfiles source staged under the test tool root'
@@ -472,10 +476,13 @@ try {
     Write-Evidence "run 1 payload file counts: $($counts1 -join ' ')"
 
     # =====================================================================
-    # RUN 2: immediate repeat export -> publish (fresh staging, idempotency)
+    # RUN 2: identical content is a successful NO-OP
     # =====================================================================
     Write-Evidence ""
-    Write-Evidence "=== RUN 2: repeat export -> publish (fresh staging) ==="
+    Write-Evidence "=== RUN 2: repeat export -> NO-OP (formal index must not advance) ==="
+    $indexPath = Join-Path $script:RepoRoot 'index.json'
+    $indexBefore2 = [System.IO.File]::ReadAllBytes($indexPath)
+    $indexMtimeBefore2 = (Get-Item -LiteralPath $indexPath).LastWriteTimeUtc
     $run2Out = Join-Path $runsDir 'run2.out.log'
     $run2Err = Join-Path $runsDir 'run2.err.log'
     $t0 = Get-Date
@@ -483,64 +490,60 @@ try {
     $el2 = (Get-Date) - $t0
     Write-Evidence "run 2 exit code: $code2 (elapsed $([int]$el2.TotalMinutes) min $($el2.Seconds) s)"
     Write-RunLogTail -Path $run2Err
-    Assert-E2EFatal ($code2 -eq 0) 'run 2 exits 0' "(got $code2)"
+    Assert-E2EFatal ($code2 -eq 0) 'run 2 NO-OP exits 0' "(got $code2)"
 
     $report2 = Get-LatestExportReport -StagingRoot $script:StagingRoot
     Assert-E2EFatal (-not [string]::IsNullOrWhiteSpace($report2)) 'run 2 export-report.json produced'
-    if ($report2) {
-        Write-Evidence "--- run 2 export-report.json ---"
-        Write-Evidence $report2
-    }
-
-    $integrity2 = Test-OSyncRepoIntegrity -RepoRoot $script:RepoRoot
-    Write-Evidence "--- run 2 integrity (published repo) ---"
-    Write-Evidence (Format-Integrity -R $integrity2)
-    Assert-E2EFatal ($integrity2.Overall -eq 'OK') 'run 2 integrity Overall = OK' "(got '$($integrity2.Overall)')"
-    $allCatOk2 = $true
-    foreach ($e in $integrity2.Categories.GetEnumerator()) { if ($e.Value.Status -ne 'OK') { $allCatOk2 = $false } }
-    Assert-E2EFatal $allCatOk2 'run 2 all categories OK'
-
+    Write-Evidence "--- run 2 export-report.json ---"
+    Write-Evidence $report2
+    $report2Obj = ConvertFrom-E2EJson -Text $report2
+    Assert-E2E ($true -eq $report2Obj.success) 'run 2 report success=true'
+    Assert-E2E ($false -eq $report2Obj.published) 'run 2 report published=false'
+    Assert-E2E ($true -eq $report2Obj.noOp) 'run 2 report noOp=true'
     $exported2 = Get-IndexExportedAtUtc -RepoRoot $script:RepoRoot
-    Assert-E2EFatal ($exported2 -match '^\d{8}T\d{6}Z$') 'run 2 index exportedAtUtc format' "(got '$exported2')"
-    Write-Evidence "run 2 index exportedAtUtc: $exported2"
+    Assert-E2E ($exported2 -eq $exported1) 'NO-OP preserves exportedAtUtc' "($exported1 -> $exported2)"
+    Assert-E2E ([System.Linq.Enumerable]::SequenceEqual([byte[]]$indexBefore2, [byte[]][System.IO.File]::ReadAllBytes($indexPath))) 'NO-OP preserves index.json bytes'
+    Assert-E2E ((Get-Item -LiteralPath $indexPath).LastWriteTimeUtc -eq $indexMtimeBefore2) 'NO-OP preserves index.json mtime'
+    $integrity2 = Test-OSyncRepoIntegrity -RepoRoot $script:RepoRoot
+    Assert-E2EFatal ($integrity2.Overall -eq 'OK') 'run 2 integrity Overall = OK'
 
-    # --- repeat-publish idempotency: payload sha256 maps unchanged ---
-    $maps2 = Get-CategoryShaMaps -RepoRoot $script:RepoRoot
-    $cmp = Compare-ShaMaps -A $maps1 -B $maps2
-    $diff = @($cmp.Diff)
-    Write-Evidence "--- repeat-publish idempotency ---"
-    if ($cmp.Excluded.Count -gt 0) {
-        Write-Evidence "excluded operational (non-payload) files from the comparison: $($cmp.Excluded -join ', ')"
+    # =====================================================================
+    # RUN 3: one winget file changes -> only winget is published
+    # =====================================================================
+    Write-Evidence ""
+    Write-Evidence "=== RUN 3: one winget file changes -> incremental winget-only publish ==="
+    $currentStaging = [string]$report2Obj.stagingDir
+    $changedWingetFile = Join-Path $currentStaging 'winget\packages.txt'
+    [System.IO.File]::AppendAllText($changedWingetFile, "# incremental-publish-probe $([guid]::NewGuid().ToString('N'))`r`n", $script:Utf8NoBom)
+    $null = New-OSyncFilesManifest -Dir (Join-Path $currentStaging 'winget')
+    $null = Publish-OSyncIndex -StagingDir $currentStaging
+    $oldIndex3 = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($indexPath))
+    $unchangedPip = Join-Path $script:RepoRoot 'pip\requirements.txt'
+    $unchangedPipMtime = (Get-Item -LiteralPath $unchangedPip).LastWriteTimeUtc
+    $publish3 = Invoke-OSyncIncrementalPublish -StagingDir $currentStaging -RepoRoot $script:RepoRoot -Config $c
+    Assert-E2E ($publish3.published -and -not $publish3.noOp) 'run 3 publishes a real change'
+    Assert-E2E ((@($publish3.publishedCategories) -join ',') -eq 'winget') 'run 3 publishes only winget' "($($publish3.publishedCategories -join ','))"
+    Assert-E2E ($publish3.plans.winget.copiedFiles -eq 1) 'run 3 copies exactly one winget payload file'
+    Assert-E2E ($publish3.plans.winget.copiedBytes -eq (Get-Item -LiteralPath $changedWingetFile).Length) 'run 3 copiedBytes equals the changed winget file length'
+    foreach ($cat in @('pip', 'npm', 'dotfiles', 'runtime')) {
+        Assert-E2E ($publish3.plans[$cat].copiedFiles -eq 0 -and $publish3.plans[$cat].deletedFiles -eq 0) "run 3 neither copies nor deletes $cat payload"
     }
-    if ($diff.Count -eq 0) {
-        Write-Evidence "payload sha256 maps identical between run 1 and run 2 (all $($maps1.Keys.Count) categories)"
-    }
-    else {
-        Write-Evidence "payload diff entries: $($diff.Count)"
-        foreach ($d in $diff) { Write-Evidence "  DIFF: $d" }
-    }
-    Assert-E2E ($diff.Count -eq 0) 'repeat-publish idempotency: payload file sha256 unchanged' "(diff entries: $($diff.Count))"
+    Write-Evidence "run 3 winget publish stats: copied=$($publish3.plans.winget.copiedFiles)/$($publish3.plans.winget.copiedBytes) bytes, reused=$($publish3.plans.winget.reusedFiles)/$($publish3.plans.winget.reusedBytes) bytes, deleted=$($publish3.plans.winget.deletedFiles)/$($publish3.plans.winget.deletedBytes) bytes"
+    Assert-E2E ((Get-Item -LiteralPath $unchangedPip).LastWriteTimeUtc -eq $unchangedPipMtime) 'run 3 leaves unchanged pip payload mtime intact'
+    $newIndex3 = ConvertFrom-E2EJson -Text ([System.IO.File]::ReadAllText($indexPath))
+    Assert-E2E ($newIndex3.categories.pip.sha256 -eq $oldIndex3.categories.pip.sha256) 'run 3 preserves the old pip index record'
+    Assert-E2E ($newIndex3.categories.winget.sha256 -ne $oldIndex3.categories.winget.sha256) 'run 3 updates the winget index record'
+    $integrity3 = Test-OSyncRepoIntegrity -RepoRoot $script:RepoRoot
+    Write-Evidence (Format-Integrity -R $integrity3)
+    Assert-E2EFatal ($integrity3.Overall -eq 'OK') 'run 3 integrity Overall = OK'
+    $exported3 = Get-IndexExportedAtUtc -RepoRoot $script:RepoRoot
+    Assert-E2E ($exported3 -gt $exported1) 'run 3 advances exportedAtUtc for a real change' "($exported1 -> $exported3)"
 
-    # --- index exportedAtUtc advanced (fixed-width zero-padded -> ordinal compare) ---
-    Assert-E2E ($exported2 -gt $exported1) 'repeat-publish: index exportedAtUtc updated' "($exported1 -> $exported2)"
-
-    # --- index.json is the newest-mtime file in repoRoot (logs excluded) ---
     $logsDir = Join-Path $script:RepoRoot 'logs'
     $repoFiles = @(Get-ChildItem -LiteralPath $script:RepoRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.FullName -ne $logsDir -and
-            -not $_.FullName.StartsWith($logsDir + '\', [StringComparison]::OrdinalIgnoreCase)
-        })
+        Where-Object { -not $_.FullName.StartsWith($logsDir + '\', [StringComparison]::OrdinalIgnoreCase) })
     $newest = $repoFiles | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-    $indexFile = (Join-Path $script:RepoRoot 'index.json')
-    if ($null -ne $newest) {
-        Write-Evidence "newest file in repoRoot (excl. logs): $($newest.FullName)  mtime=$($newest.LastWriteTimeUtc.ToString('o'))"
-        Write-Evidence "index.json mtime: $((Get-Item -LiteralPath $indexFile).LastWriteTimeUtc.ToString('o'))"
-        Assert-E2E ($newest.FullName -ieq $indexFile) 'index.json is the newest-mtime file in repoRoot (logs excluded)' "(newest: $($newest.Name))"
-    }
-    else {
-        Assert-E2E $false 'index.json is the newest-mtime file in repoRoot' 'no files found in repoRoot'
-    }
+    Assert-E2E ($newest.FullName -ieq $indexPath) 'run 3 writes index.json last' "(newest: $($newest.Name))"
 
     # =====================================================================
     # SCHEDULED TASK QA: PakageSync-Export-QA (S4U context, real /Run)
@@ -611,7 +614,7 @@ try {
             Assert-E2EFatal ($integrityTask.Overall -eq 'OK') 'repo integrity OK after QA task publish' "(got '$($integrityTask.Overall)')"
             $exportedTask = Get-IndexExportedAtUtc -RepoRoot $script:RepoRoot
             Write-Evidence "index exportedAtUtc after QA task: $exportedTask"
-            Assert-E2E ($exportedTask -gt $exported2) 'QA task publish advanced index exportedAtUtc' "($exported2 -> $exportedTask)"
+            Assert-E2E ($exportedTask -eq $exported3) 'QA task with unchanged content preserves index exportedAtUtc' "($exported3 -> $exportedTask)"
         }
         finally {
             # ALWAYS unregister the QA variant (also on failure)
@@ -632,6 +635,9 @@ try {
     if (-not $SkipFailureScenario) {
         Write-Evidence ""
         Write-Evidence "=== FAILURE SCENARIO: icacls DENY-write on repoRoot -> export must fail explicitly ==="
+        $repairTarget = Join-Path $script:RepoRoot 'winget\packages.txt'
+        Remove-Item -LiteralPath $repairTarget -Force -ErrorAction Stop
+        Write-Evidence "removed $repairTarget before the ACL gate so the export has a required repair write"
         Write-Evidence "deny Everyone:(OI)(CI)(WD,AD,DC) on $script:RepoRoot"
         & icacls.exe $script:RepoRoot /deny "*S-1-1-0:(OI)(CI)(WD,AD,DC)" | Out-Null
         Assert-E2EFatal ($LASTEXITCODE -eq 0) 'icacls DENY-write applied' "(exit $LASTEXITCODE)"

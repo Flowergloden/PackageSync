@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   NpmExport.ps1 - A-side npm export: one-shot Verdaccio warm-up + storage snapshot.
 
@@ -1282,6 +1282,100 @@ function Test-ONpmPackageInStorage {
     return (Test-Path -LiteralPath (Join-Path $StorageDir $relative) -PathType Container)
 }
 
+function Restore-OSyncNpmStableMetadata {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$CurrentNpmDir,
+        [Parameter(Mandatory = $true)][string]$PreviousNpmDir
+    )
+
+    $result = [pscustomobject]@{
+        stabilized   = $false
+        reason       = $null
+        restoredFiles = 0
+    }
+    $currentStorage = Join-Path $CurrentNpmDir 'storage'
+    $previousStorage = Join-Path $PreviousNpmDir 'storage'
+    if (-not (Test-Path -LiteralPath $currentStorage -PathType Container) -or
+        -not (Test-Path -LiteralPath $previousStorage -PathType Container)) {
+        $result.reason = 'previous or current npm storage is missing'
+        return $result
+    }
+
+    foreach ($name in @('packages.txt', 'bun-packages.txt', 'local-packages.txt')) {
+        $current = Join-Path $CurrentNpmDir $name
+        $previous = Join-Path $PreviousNpmDir $name
+        $currentExists = Test-Path -LiteralPath $current -PathType Leaf
+        $previousExists = Test-Path -LiteralPath $previous -PathType Leaf
+        if ($currentExists -ne $previousExists) {
+            $result.reason = "package manifest presence changed: $name"
+            return $result
+        }
+        if ($currentExists -and (Get-RcSha256 -Path $current) -ne (Get-RcSha256 -Path $previous)) {
+            $result.reason = "package manifest changed: $name"
+            return $result
+        }
+    }
+
+    $currentTarballs = @(Get-ChildItem -LiteralPath $currentStorage -Recurse -Filter '*.tgz' -File -ErrorAction SilentlyContinue)
+    $previousTarballs = @(Get-ChildItem -LiteralPath $previousStorage -Recurse -Filter '*.tgz' -File -ErrorAction SilentlyContinue)
+    $previousMap = @{}
+    $previousPrefix = [System.IO.Path]::GetFullPath($previousStorage).TrimEnd('\') + '\'
+    foreach ($file in $previousTarballs) {
+        $rel = $file.FullName.Substring($previousPrefix.Length).Replace('\', '/')
+        $previousMap[$rel] = $file
+    }
+    if ($currentTarballs.Count -ne $previousTarballs.Count) {
+        $result.reason = 'tarball count changed'
+        return $result
+    }
+    $currentPrefix = [System.IO.Path]::GetFullPath($currentStorage).TrimEnd('\') + '\'
+    foreach ($file in $currentTarballs) {
+        $rel = $file.FullName.Substring($currentPrefix.Length).Replace('\', '/')
+        if (-not $previousMap.ContainsKey($rel)) {
+            $result.reason = "tarball added: $rel"
+            return $result
+        }
+        $previous = $previousMap[$rel]
+        if ($file.Length -ne $previous.Length -or (Get-RcSha256 -Path $file.FullName) -ne (Get-RcSha256 -Path $previous.FullName)) {
+            $result.reason = "tarball changed: $rel"
+            return $result
+        }
+    }
+
+    $previousDb = Join-Path $previousStorage '.verdaccio-db.json'
+    if (-not (Test-Path -LiteralPath $previousDb -PathType Leaf)) {
+        $result.reason = 'previous Verdaccio database is missing'
+        return $result
+    }
+
+    $previousMetadata = @(Get-ChildItem -LiteralPath $previousStorage -Recurse -Filter 'package.json' -File -ErrorAction SilentlyContinue)
+    $previousMetadataMap = @{}
+    foreach ($file in $previousMetadata) {
+        $rel = $file.FullName.Substring($previousPrefix.Length).Replace('\', '/')
+        $previousMetadataMap[$rel] = $file
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $currentStorage -Recurse -Filter 'package.json' -File -ErrorAction SilentlyContinue)) {
+        $rel = $file.FullName.Substring($currentPrefix.Length).Replace('\', '/')
+        if (-not $previousMetadataMap.ContainsKey($rel)) {
+            Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+        }
+    }
+    foreach ($rel in @($previousMetadataMap.Keys)) {
+        $source = $previousMetadataMap[$rel].FullName
+        $target = Join-Path $currentStorage ($rel.Replace('/', '\'))
+        $targetDir = Split-Path -Parent $target
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        Copy-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+        $result.restoredFiles++
+    }
+    Copy-Item -LiteralPath $previousDb -Destination (Join-Path $currentStorage '.verdaccio-db.json') -Force -ErrorAction Stop
+    $result.restoredFiles++
+    $result.stabilized = $true
+    $result.reason = 'package manifests and tarballs match the previous successful local export'
+    return $result
+}
+
 function Export-OSyncNpm {
     [CmdletBinding()]
     param(
@@ -1871,6 +1965,17 @@ function Export-OSyncNpm {
         Write-OSyncLog -Category 'npm' -Level Info -Message "local package list delivered to '$localListPath' ($($localPublished.Count) published, $localDepsOkCount deps entries)." -Config $Config | Out-Null
     }
 
+    $metadataStability = [pscustomobject]@{ stabilized = $false; reason = 'no previous successful local export'; restoredFiles = 0 }
+    $previousExport = Get-OSyncLatestSuccessfulExport -StagingRoot ([string]$Config.stagingRoot)
+    if (-not [string]::IsNullOrWhiteSpace($previousExport)) {
+        $previousNpmDir = Join-Path $previousExport 'npm'
+        if (Test-Path -LiteralPath $previousNpmDir -PathType Container) {
+            $metadataStability = Restore-OSyncNpmStableMetadata -CurrentNpmDir $npmDir -PreviousNpmDir $previousNpmDir
+            $metadataStability | Add-Member -NotePropertyName source -NotePropertyValue $previousNpmDir
+        }
+    }
+    Write-OSyncLog -Category 'npm' -Level Info -Message "npm metadata stabilization: stabilized=$($metadataStability.stabilized), restored=$($metadataStability.restoredFiles), reason=$($metadataStability.reason)." -Config $config | Out-Null
+
     # --- 6. export-time leak assertion (Oracle M5) ---
     if (-not (Test-OSyncVerdaccioBYaml -Content $bYaml)) {
         throw "Export-OSyncNpm: verdaccio-b.yml failed the leak assertion - it must not contain uplinks/proxy keys and storage must be the relative path './storage'."
@@ -1908,6 +2013,7 @@ function Export-OSyncNpm {
         warmed            = @($ok)
         failed            = @($failed)
         tarballCount      = $tarballCount
+        metadataStability = $metadataStability
         bun               = [pscustomobject]@{
             enabled      = $bunEnabled
             listPath     = $bunListPath

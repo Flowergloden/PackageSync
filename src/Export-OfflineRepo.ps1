@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   Export-OfflineRepo.ps1 - A-side export orchestrator entry point.
 
@@ -21,9 +21,9 @@
 
   -SkipRuntime skips the runtime re-export (VC_redist/bun downloads,
   Python/Node winget downloads, portable Verdaccio build, tool snapshot)
-  and reuses the payloads already published in <repoRoot> - the reused
-  files are re-manifested into the new generation, so the trust chain is
-  unchanged. Requires a previous full export; fails fast otherwise.
+  and reuses the latest successful local generation, falling back to
+  <repoRoot> when no complete local source exists. Reused files are
+  re-manifested, so the trust chain is unchanged.
 
   Registered as the daily 02:00 scheduled task 'PakageSync-Export' by
   src\Register-SyncTasks.ps1 -Role A.
@@ -39,8 +39,8 @@ param(
     [Parameter(Mandatory = $false)]
     [switch]$Quiet,
 
-    # Skips the runtime re-export and reuses the payloads already published
-    # in <repoRoot> (see Invoke-OSyncExport -SkipRuntime).
+    # Skips the runtime re-export and reuses the latest successful local
+    # generation, with repoRoot as fallback (see Invoke-OSyncExport).
     [Parameter(Mandatory = $false)]
     [switch]$SkipRuntime
 )

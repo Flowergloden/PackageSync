@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Pester 5 unit tests for src\lib\PipExport.ps1 - the A-side pip wheel-repo
@@ -463,7 +463,8 @@ Describe 'PipExport' {
             $report.status | Should -Be 'ok'
             $report.wheelCount | Should -Be 2
             ($report.ok -join ',') | Should -Be 'isodate-0.7.2-py3-none-any.whl,six-1.17.0-py2.py3-none-any.whl'
-            (Test-Path -LiteralPath (Join-Path $staging 'pip\export-report.json')) | Should -BeTrue
+            (Test-Path -LiteralPath (Join-Path $staging 'reports\pip-export-report.json')) | Should -BeTrue
+            (Test-Path -LiteralPath (Join-Path $staging 'pip\export-report.json')) | Should -BeFalse
             # requirements.txt copied byte-identical
             (Get-FileHash -LiteralPath (Join-Path $staging 'pip\requirements.txt') -Algorithm SHA256).Hash |
                 Should -Be (Get-FileHash -LiteralPath $script:RequirementsPath -Algorithm SHA256).Hash
@@ -512,7 +513,7 @@ Describe 'PipExport' {
             { Export-OSyncPip -Config (New-OTestConfig) -StagingDir $staging } |
                 Should -Throw -ExpectedMessage "*pip download failed*exit code 1*"
 
-            $reportPath = Join-Path $staging 'pip\export-report.json'
+            $reportPath = Join-Path $staging 'reports\pip-export-report.json'
             (Test-Path -LiteralPath $reportPath) | Should -BeTrue
             $saved = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
             $saved.status | Should -Be 'failed'

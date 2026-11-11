@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   ApplyOrchestrator.ps1 - B-side apply orchestration (Invoke-OfflineApply).
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
@@ -39,17 +39,19 @@
           (retry next cycle). The SYSTEM auto path is a safety net only -
           QA does not cover the full chain (Momus m4). dotfiles mode:
           unbootstrapped -> skip + log (Oracle m11).
-      [3] Whole-repo snapshot work copy: when ANY enabled category is newer
-          than its lastApplied, the packages task robocopies ALL OK enabled
-          categories + runtime into <stateDir>\work\<exportedAtUtc>\ (runtime
-          Incomplete -> whole round skipped - chezmoi.exe/tools live there),
-          RE-HASHES every copied file (verify failure -> DELETE the whole
-          generation, the round fails - a bad generation must never remain
-          "newest", Momus r4-B1), then writes <ts>\.verified and applies the
-          requested categories with -WorkDir <gen>.
+      [3] Content-aware work copy: each enabled category independently resolves
+          its lastApplied verified baseline. Content-equivalent categories are
+          skip; winget with a usable changed baseline is delta; other pending
+          categories are full. Only pending categories + runtime enter
+          <stateDir>\work\<exportedAtUtc>\ (runtime Incomplete -> whole round
+          skipped). winget delta hard-links unchanged baseline files with copy
+          fallbacks. RE-HASH every delivered file; verification failure deletes
+          the generation. Write .verified only after the complete work copy
+          passes, then apply the requested pending categories.
       [4] Per-category apply: success -> state.lastApplied.<cat> =
           exportedAtUtc; failure -> lastApplied untouched (retry next round);
-          one category's failure never blocks the others (Metis m1).
+          one category's failure never blocks the others (Metis m1). skip never
+          advances lastApplied to a generation that does not contain that cat.
       [5] At orchestration end (regardless of per-category outcome; packages
           task only): self-refresh the tool copy (re-verify C:\PakageSync
           owner/ACL first - abnormal -> abandon + alert, Momus r7-MAJOR-1;
@@ -57,7 +59,8 @@
           .new -> current - exact order, Oracle m9; refresh failure logged
           only + retried next cycle, Oracle m5; next cycle takes effect,
           Momus B1) and clean <stateDir>\work\ (incl. work\bootstrap\
-          subtree, keeping the newest 2 generations per tree, Momus M4/m3).
+          subtree, keeping the newest 2 plus every verified lastApplied
+          baseline referenced by system/user state).
       Refresh source: the VERIFIED generation built this round (never
       unverified/partially-synced repo content lands into the live tool
       copy). When the round built no generation (nothing pending), refresh
@@ -71,20 +74,18 @@
   Round flow (dotfiles mode):
       [1] Trust root: index must parse (whole round skipped otherwise).
       [2] Unbootstrapped -> skip dotfiles + log (Oracle m11).
-      [3] dotfiles not newer than lastApplied.dotfiles -> skip.
-      [4] Newest .verified generation: none (or older than the current index
-          export - the packages task has not produced one for this index yet)
-          -> skip dotfiles + log (the next cycle catches up, Momus r4-B1).
+      [3] The shared category planner returns skip for an already-applied or
+          content-equivalent dotfiles baseline; skip never advances state.
+      [4] Newest .verified generation: none, older than the current index, or
+          lacking pending dotfiles -> skip and wait for the packages task.
       [5] Invoke-OSyncDotfilesApply -WorkDir <gen>; ok/skipped -> stamp
-          lastApplied.dotfiles = exportedAtUtc (a source-hash-unchanged
-          'skipped' still proves the content is applied - stamping prevents
-          retrying every cycle); failed -> lastApplied untouched.
+          lastApplied.dotfiles = exportedAtUtc; failed -> lastApplied untouched.
 
   The result object shape (the entry script maps it to an exit code):
       { mode, whatIf, outcome ('skipped'|'ok'|'failed'), skipReason, error,
-        exportedAtUtc, bootstrapped, bootstrapRan, pendingCategories,
+        exportedAtUtc, bootstrapped, bootstrapRan, pendingCategories, copyPlans,
         generation, verified, categories{cat -> {status,message,lastApplied}},
-        refreshed, refreshSkippedReason, cleaned }
+        copyPlanPath, refreshed, refreshSkippedReason, cleaned }
 
   Must NOT: take the apply.lock (entry scripts only); apply/refresh from the
   <repoRoot> sync dir directly (always the verified work copy); let dotfiles
@@ -216,21 +217,214 @@ function Test-OSyncRuntimeDrift {
     return $drift
 }
 
+function New-OApplyTransferStats {
+    return [pscustomobject]@{
+        copiedFiles         = 0
+        copiedBytes         = [int64]0
+        reusedFiles         = 0
+        reusedBytes         = [int64]0
+        deletedFiles        = 0
+        deletedBytes        = [int64]0
+        repoCopiedFiles     = 0
+        repoCopiedBytes     = [int64]0
+        hardLinkedFiles     = 0
+        hardLinkedBytes     = [int64]0
+        baselineCopiedFiles = 0
+        baselineCopiedBytes = [int64]0
+    }
+}
+
+function Get-OSyncApplyCategoryPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('winget', 'pip', 'npm', 'dotfiles')][string]$Category,
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)]$Integrity,
+        [Parameter(Mandatory = $true)][string]$ExportedAtUtc,
+        [Parameter(Mandatory = $true)][string]$RepoRoot
+    )
+
+    $plan = [pscustomobject]@{
+        category          = $Category
+        mode              = 'full'
+        baseExportedAtUtc = $null
+        baseDir           = $null
+        fallbackReason    = $null
+        currentManifest   = $null
+        baselineManifest  = $null
+        stats             = New-OApplyTransferStats
+    }
+    $state = Get-OSyncState -Category $Category -Config $Config
+    $last = $state.lastApplied[$Category]
+    if (-not (Test-OSyncCategoryNewer -Category $Category -ExportedAtUtc $ExportedAtUtc -Config $Config)) {
+        $plan.mode = 'skip'
+        $plan.fallbackReason = 'already applied'
+        $plan.baseExportedAtUtc = $last
+        return $plan
+    }
+    if ($null -eq $last -or [string]::IsNullOrWhiteSpace([string]$last)) {
+        $plan.fallbackReason = 'no lastApplied baseline'
+        return $plan
+    }
+    $plan.baseExportedAtUtc = [string]$last
+    if ([string]$last -notmatch '^\d{8}T\d{6}Z$') {
+        $plan.fallbackReason = 'lastApplied baseline has an invalid generation id'
+        return $plan
+    }
+    $baseDir = Join-Path (Join-Path ([string]$Config.stateDir) 'work') ([string]$last)
+    $plan.baseDir = $baseDir
+    if (-not (Test-Path -LiteralPath $baseDir -PathType Container)) {
+        $plan.fallbackReason = 'lastApplied work directory is missing'
+        return $plan
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $baseDir '.verified') -PathType Leaf)) {
+        $plan.fallbackReason = 'lastApplied work directory is not verified'
+        return $plan
+    }
+    $baselineFiles = Join-Path (Join-Path $baseDir $Category) 'files.json'
+    if (-not (Test-Path -LiteralPath $baselineFiles -PathType Leaf)) {
+        $plan.fallbackReason = 'baseline files.json is missing'
+        return $plan
+    }
+    try {
+        $baselineManifest = ConvertFrom-OApplyJson -Text ([System.IO.File]::ReadAllText($baselineFiles))
+        if ($null -eq $baselineManifest -or $baselineManifest -isnot [System.Collections.IDictionary]) {
+            throw 'baseline files.json is not a JSON object'
+        }
+        $plan.baselineManifest = $baselineManifest
+    }
+    catch {
+        $plan.fallbackReason = "baseline files.json is unreadable: $($_.Exception.Message)"
+        return $plan
+    }
+
+    $currentRecord = $Integrity.Categories[$Category]
+    $currentManifestPath = Join-Path (Join-Path $RepoRoot $Category) 'files.json'
+    try {
+        $currentManifest = ConvertFrom-OApplyJson -Text ([System.IO.File]::ReadAllText($currentManifestPath))
+        if ($null -eq $currentManifest -or $currentManifest -isnot [System.Collections.IDictionary]) {
+            throw 'current files.json is not a JSON object'
+        }
+        $plan.currentManifest = $currentManifest
+    }
+    catch {
+        $plan.fallbackReason = "current files.json is unreadable: $($_.Exception.Message)"
+        return $plan
+    }
+    if ((Get-OSyncFileSha256 -Path $baselineFiles) -eq [string]$currentRecord.ExpectedSha256) {
+        $plan.mode = 'skip'
+        $plan.fallbackReason = 'content equivalent to the verified baseline'
+        return $plan
+    }
+    if ($Category -eq 'winget') { $plan.mode = 'delta' }
+    return $plan
+}
+
+function Get-OApplyPlanReport {
+    param([Parameter(Mandatory = $true)]$Plan)
+    return [pscustomobject]@{
+        category          = $Plan.category
+        mode              = $Plan.mode
+        baseExportedAtUtc = $Plan.baseExportedAtUtc
+        fallbackReason    = $Plan.fallbackReason
+        stats             = $Plan.stats
+    }
+}
+
+function New-OSyncWingetDeltaWorkCopy {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$BaseDir,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)]$CurrentManifest,
+        [Parameter(Mandatory = $true)]$BaselineManifest
+    )
+
+    $stats = New-OApplyTransferStats
+    $sourceDir = Join-Path $RepoRoot 'winget'
+    $baselineDir = Join-Path $BaseDir 'winget'
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    foreach ($entry in $CurrentManifest.GetEnumerator()) {
+        $rel = [string]$entry.Key
+        $meta = $entry.Value
+        $bytes = [int64]$meta['bytes']
+        $sha = [string]$meta['sha256']
+        $target = Join-Path $Destination ($rel.Replace('/', '\'))
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        $unchanged = $BaselineManifest.ContainsKey($rel)
+        if ($unchanged) {
+            $old = $BaselineManifest[$rel]
+            $unchanged = ($old -is [System.Collections.IDictionary]) -and
+                ([int64]$old['bytes'] -eq $bytes) -and
+                ([string]::Equals([string]$old['sha256'], $sha, [System.StringComparison]::OrdinalIgnoreCase))
+        }
+        if (-not $unchanged) {
+            Copy-Item -LiteralPath (Join-Path $sourceDir ($rel.Replace('/', '\'))) -Destination $target -Force -ErrorAction Stop
+            $stats.copiedFiles++
+            $stats.copiedBytes += $bytes
+            $stats.repoCopiedFiles++
+            $stats.repoCopiedBytes += $bytes
+            continue
+        }
+
+        $baselineFile = Join-Path $baselineDir ($rel.Replace('/', '\'))
+        $linked = $false
+        if (Test-Path -LiteralPath $baselineFile -PathType Leaf) {
+            try {
+                New-Item -ItemType HardLink -Path $target -Target $baselineFile -Force -ErrorAction Stop | Out-Null
+                $linked = $true
+                $stats.hardLinkedFiles++
+                $stats.hardLinkedBytes += $bytes
+            }
+            catch {
+                $linked = $false
+            }
+        }
+        if (-not $linked) {
+            if (Test-Path -LiteralPath $baselineFile -PathType Leaf) {
+                Copy-Item -LiteralPath $baselineFile -Destination $target -Force -ErrorAction Stop
+                $stats.baselineCopiedFiles++
+                $stats.baselineCopiedBytes += $bytes
+            }
+            else {
+                Copy-Item -LiteralPath (Join-Path $sourceDir ($rel.Replace('/', '\'))) -Destination $target -Force -ErrorAction Stop
+                $stats.copiedFiles++
+                $stats.copiedBytes += $bytes
+                $stats.repoCopiedFiles++
+                $stats.repoCopiedBytes += $bytes
+                continue
+            }
+        }
+        $stats.reusedFiles++
+        $stats.reusedBytes += $bytes
+    }
+    foreach ($entry in $BaselineManifest.GetEnumerator()) {
+        $rel = [string]$entry.Key
+        if (-not $CurrentManifest.ContainsKey($rel)) {
+            $stats.deletedFiles++
+            $stats.deletedBytes += [int64]$entry.Value['bytes']
+        }
+    }
+    $currentFiles = Join-Path $sourceDir 'files.json'
+    Copy-Item -LiteralPath $currentFiles -Destination (Join-Path $Destination 'files.json') -Force -ErrorAction Stop
+    $controlBytes = (Get-Item -LiteralPath $currentFiles -Force).Length
+    $stats.copiedFiles++
+    $stats.copiedBytes += $controlBytes
+    $stats.repoCopiedFiles++
+    $stats.repoCopiedBytes += $controlBytes
+    return $stats
+}
+
 function New-OSyncApplyGeneration {
-    <#
-      Robocopies runtime + every OK enabled category into
-      <stateDir>\work\<exportedAtUtc>\. Returns the generation root. The
-      caller verifies the copy afterwards (Momus M3 / Oracle M4). Callers
-      pipe Invoke-OSyncRobocopy to Out-Null (it returns the robocopy exit
-      code - leak class, learnings.md).
-    #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [Parameter(Mandatory = $true)]$Config,
         [Parameter(Mandatory = $true)][string]$RepoRoot,
         [Parameter(Mandatory = $true)][string]$ExportedAtUtc,
-        [Parameter(Mandatory = $true)][string[]]$OkCategories
+        [Parameter(Mandatory = $true)][string[]]$OkCategories,
+        [Parameter(Mandatory = $false)]$Plans = $null
     )
     $workRoot = Join-Path ([string]$Config.stateDir) 'work'
     if (-not (Test-Path -LiteralPath $workRoot -PathType Container)) {
@@ -238,16 +432,69 @@ function New-OSyncApplyGeneration {
     }
     $gen = Join-Path $workRoot $ExportedAtUtc
     if (Test-Path -LiteralPath $gen -PathType Container) {
-        # A generation id is a second-granularity UTC stamp; a collision means
-        # a re-export within the same second - rebuild from scratch.
         Remove-Item -LiteralPath $gen -Recurse -Force -ErrorAction Stop
     }
     New-Item -ItemType Directory -Path $gen -Force | Out-Null
-    foreach ($cat in (@('runtime') + @($OkCategories))) {
+    $categories = @($OkCategories)
+    if ($null -ne $Plans) {
+        $categories = @($script:OApplyCategories | Where-Object { $Plans.Contains($_) -and $Plans[$_].mode -in @('full', 'delta') })
+    }
+    $reportPlans = [ordered]@{}
+    foreach ($cat in (@('runtime') + $categories)) {
         $src = Join-Path $RepoRoot $cat
-        if (Test-Path -LiteralPath $src -PathType Container) {
-            Invoke-OSyncRobocopy -Source $src -Destination (Join-Path $gen $cat) -ExtraArgs @('/E') | Out-Null
+        if (-not (Test-Path -LiteralPath $src -PathType Container)) { continue }
+        $destination = Join-Path $gen $cat
+        $plan = $null
+        if ($cat -ne 'runtime' -and $null -ne $Plans) { $plan = $Plans[$cat] }
+        if ($null -ne $plan -and $plan.mode -eq 'delta') {
+            $plan.stats = New-OSyncWingetDeltaWorkCopy -RepoRoot $RepoRoot -BaseDir $plan.baseDir -Destination $destination -CurrentManifest $plan.currentManifest -BaselineManifest $plan.baselineManifest
         }
+        else {
+            Invoke-OSyncRobocopy -Source $src -Destination $destination -ExtraArgs @('/E') | Out-Null
+            if ($null -ne $Plans) {
+                $stats = New-OApplyTransferStats
+                $filesJson = Join-Path $src 'files.json'
+                $manifest = ConvertFrom-OApplyJson -Text ([System.IO.File]::ReadAllText($filesJson))
+                foreach ($entry in $manifest.GetEnumerator()) {
+                    $stats.copiedFiles++
+                    $stats.copiedBytes += [int64]$entry.Value['bytes']
+                    $stats.repoCopiedFiles++
+                    $stats.repoCopiedBytes += [int64]$entry.Value['bytes']
+                }
+                $controlBytes = (Get-Item -LiteralPath $filesJson -Force).Length
+                $stats.copiedFiles++
+                $stats.copiedBytes += $controlBytes
+                $stats.repoCopiedFiles++
+                $stats.repoCopiedBytes += $controlBytes
+                if ($null -ne $plan) { $plan.stats = $stats }
+            }
+        }
+        if ($null -ne $plan) { $reportPlans[$cat] = Get-OApplyPlanReport -Plan $plan }
+    }
+    if ($null -ne $Plans) {
+        $runtimePlan = [pscustomobject]@{
+            category = 'runtime'; mode = 'full'; baseExportedAtUtc = $null
+            fallbackReason = 'runtime is always delivered in a packages work copy'
+            stats = New-OApplyTransferStats
+        }
+        $runtimeFiles = Join-Path $gen 'runtime\files.json'
+        if (Test-Path -LiteralPath $runtimeFiles -PathType Leaf) {
+            $runtimeManifest = ConvertFrom-OApplyJson -Text ([System.IO.File]::ReadAllText($runtimeFiles))
+            foreach ($entry in $runtimeManifest.GetEnumerator()) {
+                $runtimePlan.stats.copiedFiles++
+                $runtimePlan.stats.copiedBytes += [int64]$entry.Value['bytes']
+                $runtimePlan.stats.repoCopiedFiles++
+                $runtimePlan.stats.repoCopiedBytes += [int64]$entry.Value['bytes']
+            }
+            $runtimeBytes = (Get-Item -LiteralPath $runtimeFiles -Force).Length
+            $runtimePlan.stats.copiedFiles++
+            $runtimePlan.stats.copiedBytes += $runtimeBytes
+            $runtimePlan.stats.repoCopiedFiles++
+            $runtimePlan.stats.repoCopiedBytes += $runtimeBytes
+        }
+        $reportPlans['runtime'] = $runtimePlan
+        $copyPlanPath = Join-Path $gen 'copy-plan.json'
+        [System.IO.File]::WriteAllText($copyPlanPath, (ConvertTo-OSyncJson -InputObject $reportPlans), (New-Object System.Text.UTF8Encoding($true)))
     }
     return $gen
 }
@@ -345,24 +592,38 @@ function Get-OSyncApplyNewestVerifiedGeneration {
 }
 
 function Invoke-OSyncApplyWorkCleanup {
-    <#
-      Keeps the newest -Keep generations per tree in <stateDir>\work\ and
-      <stateDir>\work\bootstrap\ (the bootstrap subtree is cleaned with the
-      same policy, Momus M4/m3). Returns the number of removed directories.
-    #>
     [CmdletBinding()]
     [OutputType([int])]
     param(
         [Parameter(Mandatory = $true)][string]$StateDir,
         [Parameter(Mandatory = $false)][int]$Keep = 2
     )
+    $workRoot = Join-Path $StateDir 'work'
+    $protected = @{}
+    foreach ($statePath in @((Join-Path $StateDir 'state\system-state.json'), (Join-Path $StateDir 'run\user-state.json'))) {
+        if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { continue }
+        try {
+            $state = ConvertFrom-OApplyJson -Text ([System.IO.File]::ReadAllText($statePath))
+            if ($null -eq $state['lastApplied'] -or $state['lastApplied'] -isnot [System.Collections.IDictionary]) { continue }
+            foreach ($entry in $state['lastApplied'].GetEnumerator()) {
+                $ts = [string]$entry.Value
+                if ($ts -notmatch '^\d{8}T\d{6}Z$') { continue }
+                $marker = Join-Path (Join-Path $workRoot $ts) '.verified'
+                if (Test-Path -LiteralPath $marker -PathType Leaf) { $protected[$ts] = $true }
+            }
+        }
+        catch {
+            continue
+        }
+    }
     $removed = 0
-    foreach ($root in @((Join-Path $StateDir 'work'), (Join-Path (Join-Path $StateDir 'work') 'bootstrap'))) {
+    foreach ($root in @($workRoot, (Join-Path $workRoot 'bootstrap'))) {
         if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
         $gens = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match '^\d{8}T\d{6}Z$' } |
             Sort-Object { [string]$_.Name } -Descending)
         for ($i = $Keep; $i -lt $gens.Count; $i++) {
+            if ($root -eq $workRoot -and $protected.ContainsKey($gens[$i].Name)) { continue }
             Remove-Item -LiteralPath $gens[$i].FullName -Recurse -Force -ErrorAction SilentlyContinue
             $removed++
         }
@@ -671,24 +932,29 @@ function Invoke-OSyncApplyPackagesRound {
     # work copy is built when any of them is newer, not only the requested
     # ones - a dotfiles-only config still gets a packages-task work copy.
     $pending = @()
+    $plans = [ordered]@{}
     foreach ($cat in $enabled) {
         $catResult = $null
         if ($Integrity.Categories.ContainsKey($cat)) { $catResult = $Integrity.Categories[$cat] }
         $catOk = ($null -ne $catResult) -and ($catResult.Status -eq 'OK')
         if (-not $catOk) { continue }
-        $isNewer = $false
         try {
-            $isNewer = Test-OSyncCategoryNewer -Category $cat -ExportedAtUtc $ExportedAtUtc -Config $Config
+            $plan = Get-OSyncApplyCategoryPlan -Category $cat -Config $Config -Integrity $Integrity -ExportedAtUtc $ExportedAtUtc -RepoRoot $RepoRoot
         }
         catch {
-            # A malformed marker or store must not block the round; treating
-            # the category as newer is the safe direction.
-            $isNewer = $true
-            Write-OSyncLog -Category 'apply' -Level Warning -Message "category '$cat' newer-check failed ($($_.Exception.Message)); treating as pending." -Config $Config | Out-Null
+            $plan = [pscustomobject]@{
+                category = $cat; mode = 'full'; baseExportedAtUtc = $null; baseDir = $null
+                fallbackReason = "category planning failed: $($_.Exception.Message)"
+                currentManifest = $null; baselineManifest = $null; stats = New-OApplyTransferStats
+            }
         }
-        if ($isNewer) { $pending += $cat }
+        $plans[$cat] = $plan
+        if ($plan.mode -in @('full', 'delta')) { $pending += $cat }
+        Write-OSyncLog -Category 'apply' -Level Info -Message ("copy plan '{0}': mode={1}, base={2}, reason={3}." -f $cat, $plan.mode, $plan.baseExportedAtUtc, $plan.fallbackReason) -Data (Get-OApplyPlanReport -Plan $plan) -Config $Config | Out-Null
     }
     $result.pendingCategories = @($pending)
+    $result | Add-Member -NotePropertyName copyPlans -NotePropertyValue ([ordered]@{}) -Force
+    foreach ($cat in $plans.Keys) { $result.copyPlans[$cat] = Get-OApplyPlanReport -Plan $plans[$cat] }
 
     # WhatIf report (Metis m3): zero changes - no bootstrap, no generation,
     # no apply, no refresh, no cleanup.
@@ -716,10 +982,10 @@ function Invoke-OSyncApplyPackagesRound {
         return $result
     }
 
-    # Whole-repo snapshot work copy - only when something is pending.
+    # Pending-only category work copy; runtime remains complete.
     if ($pending.Count -eq 0) {
         $result.outcome = 'skipped'
-        $result.skipReason = 'nothing pending - all enabled categories are at generation ' + $ExportedAtUtc + '.'
+        $result.skipReason = 'nothing pending - all enabled categories are already applied or content-equivalent to their verified baselines (repository generation ' + $ExportedAtUtc + ').'
         Write-OSyncLog -Category 'apply' -Level Info -Message "round skipped: $($result.skipReason)" -Config $Config | Out-Null
         # No generation this round -> no verified source to refresh from.
         $result.refreshSkippedReason = 'no generation built this round (nothing pending) - tool-only changes are covered by the bootstrap drift path.'
@@ -746,8 +1012,17 @@ function Invoke-OSyncApplyPackagesRound {
 
     $gen = Join-Path (Join-Path $stateDir 'work') $ExportedAtUtc
     $markerExisting = Join-Path $gen '.verified'
+    $existingComplete = Test-Path -LiteralPath $markerExisting -PathType Leaf
+    if ($existingComplete) {
+        foreach ($cat in $pending) {
+            if (-not (Test-Path -LiteralPath (Join-Path $gen "$cat\files.json") -PathType Leaf)) {
+                $existingComplete = $false
+                break
+            }
+        }
+    }
 
-    if (Test-Path -LiteralPath $markerExisting -PathType Leaf) {
+    if ($existingComplete) {
         # A verified generation for THIS exact export already exists (a
         # previous round built it; the dotfiles task may still be consuming
         # it). Reuse it instead of re-copying + re-hashing the whole repo
@@ -759,7 +1034,7 @@ function Invoke-OSyncApplyPackagesRound {
     }
     else {
         try {
-            $gen = New-OSyncApplyGeneration -Config $Config -RepoRoot $RepoRoot -ExportedAtUtc $ExportedAtUtc -OkCategories $okCategories
+            $gen = New-OSyncApplyGeneration -Config $Config -RepoRoot $RepoRoot -ExportedAtUtc $ExportedAtUtc -OkCategories $okCategories -Plans $plans
         }
         catch {
             $result.outcome = 'failed'
@@ -768,6 +1043,8 @@ function Invoke-OSyncApplyPackagesRound {
             return $result
         }
         $result.generation = $gen
+        foreach ($cat in $plans.Keys) { $result.copyPlans[$cat] = Get-OApplyPlanReport -Plan $plans[$cat] }
+        $result | Add-Member -NotePropertyName copyPlanPath -NotePropertyValue (Join-Path $gen 'copy-plan.json') -Force
 
         # Re-verify EVERY copied file (Momus M3/Oracle M4). Verify failure ->
         # DELETE the whole generation and fail the round - a bad generation
@@ -789,6 +1066,10 @@ function Invoke-OSyncApplyPackagesRound {
         $marker = Write-OSyncApplyVerifiedMarker -Bw $gen -ExportedAtUtc $ExportedAtUtc
         $result.verified = $true
         Write-OSyncLog -Category 'apply' -Level Info -Message "verified marker written: '$marker'." -Data @{ marker = $marker } -Config $Config | Out-Null
+        foreach ($cat in $pending) {
+            $stats = $plans[$cat].stats
+            Write-OSyncLog -Category 'apply' -Level Info -Message ("materialized '{0}': mode={1}, copied={2}/{3} bytes, reused={4}/{5} bytes, deleted={6}/{7} bytes, repoCopied={8}/{9} bytes." -f $cat, $plans[$cat].mode, $stats.copiedFiles, $stats.copiedBytes, $stats.reusedFiles, $stats.reusedBytes, $stats.deletedFiles, $stats.deletedBytes, $stats.repoCopiedFiles, $stats.repoCopiedBytes) -Data (Get-OApplyPlanReport -Plan $plans[$cat]) -Config $Config | Out-Null
+        }
     }
 
     # [4] Per-category apply - one category's failure never blocks the others
@@ -890,19 +1171,22 @@ function Invoke-OSyncApplyDotfilesRound {
         return $result
     }
 
-    # Pending? A source-hash-unchanged export may still bump the index ts; a
-    # not-newer dotfiles round is a clean skip.
-    $isNewer = $false
+    if (-not $Integrity.Categories.ContainsKey('dotfiles') -or $Integrity.Categories['dotfiles'].Status -ne 'OK') {
+        $result.outcome = 'skipped'
+        $result.skipReason = 'dotfiles category is not OK in the repository.'
+        return $result
+    }
     try {
-        $isNewer = Test-OSyncCategoryNewer -Category 'dotfiles' -ExportedAtUtc $ExportedAtUtc -Config $Config
+        $dotfilesPlan = Get-OSyncApplyCategoryPlan -Category 'dotfiles' -Config $Config -Integrity $Integrity -ExportedAtUtc $ExportedAtUtc -RepoRoot $RepoRoot
     }
     catch {
-        $isNewer = $true
-        Write-OSyncLog -Category 'apply' -Level Warning -Message "dotfiles newer-check failed ($($_.Exception.Message)); treating as pending." -Config $Config | Out-Null
+        $dotfilesPlan = [pscustomobject]@{ mode = 'full'; fallbackReason = $_.Exception.Message; baseExportedAtUtc = $null; stats = New-OApplyTransferStats }
     }
-    if (-not $isNewer) {
+    $result | Add-Member -NotePropertyName copyPlans -NotePropertyValue ([ordered]@{ dotfiles = (Get-OApplyPlanReport -Plan $dotfilesPlan) }) -Force
+    if ($dotfilesPlan.mode -eq 'skip') {
         $result.outcome = 'skipped'
-        $result.skipReason = "dotfiles already at generation $ExportedAtUtc."
+        $result.skipReason = if ($dotfilesPlan.fallbackReason -eq 'already applied') { "dotfiles already at generation $ExportedAtUtc." } else { "dotfiles content does not require apply: $($dotfilesPlan.fallbackReason)." }
+        $result.categories['dotfiles'] = New-OApplyCategoryResult -Category 'dotfiles' -Status 'not-pending' -Message $result.skipReason -LastApplied $dotfilesPlan.baseExportedAtUtc
         Write-OSyncLog -Category 'apply' -Level Info -Message "dotfiles round skipped: $($result.skipReason)" -Config $Config | Out-Null
         return $result
     }
@@ -922,6 +1206,12 @@ function Invoke-OSyncApplyDotfilesRound {
     if ([string]::CompareOrdinal($gen.Ts, $ExportedAtUtc) -lt 0) {
         $result.outcome = 'skipped'
         $result.skipReason = "dotfiles pending but the newest verified generation ($($gen.Ts)) predates the current index ($ExportedAtUtc) - waiting for the packages task to verify the new export."
+        Write-OSyncLog -Category 'apply' -Level Info -Message "dotfiles round skipped: $($result.skipReason)" -Config $Config | Out-Null
+        return $result
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $gen.Path 'dotfiles\files.json') -PathType Leaf)) {
+        $result.outcome = 'skipped'
+        $result.skipReason = "dotfiles is pending but verified generation '$($gen.Ts)' does not contain that category - waiting for the packages task."
         Write-OSyncLog -Category 'apply' -Level Info -Message "dotfiles round skipped: $($result.skipReason)" -Config $Config | Out-Null
         return $result
     }

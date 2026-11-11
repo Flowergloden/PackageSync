@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   PipExport.ps1 - A-side pip wheel-repo export for PakageSync.
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
@@ -30,8 +30,8 @@
      5. Post-export assertion: <staging>\pip must contain NO *.tar.gz sdist
         unless config.pip.allowSdist is true (default false - an sdist fails
         the export and the error names the offending file).
-     6. Records pip failures into <staging>\pip\export-report.json and logs
-        via Write-OSyncLog; a pip failure rethrows (non-zero exit).
+     6. Records pip failures into <staging>\reports\pip-export-report.json and
+        logs via Write-OSyncLog; a pip failure rethrows (non-zero exit).
 
   Returns the export report as a PSCustomObject.
 
@@ -554,7 +554,9 @@ function Export-OSyncPip {
     # mid-download failure can leave partial artifacts) - reported truthfully.
     $wheels = @(Get-ChildItem -LiteralPath $pipDir -File -Filter '*.whl' -ErrorAction SilentlyContinue |
         Sort-Object Name | ForEach-Object { $_.Name })
-    $reportPath = Join-Path $pipDir 'export-report.json'
+    $reportsDir = Join-Path $StagingDir 'reports'
+    New-Item -ItemType Directory -Path $reportsDir -Force | Out-Null
+    $reportPath = Join-Path $reportsDir 'pip-export-report.json'
 
     if ($result.ExitCode -ne 0) {
         $failures = Get-OSyncPipFailures -PipOutput ([string]$result.Output)
