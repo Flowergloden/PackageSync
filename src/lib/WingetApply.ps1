@@ -53,9 +53,8 @@
         package was retried with user scope)
     satisfied entries:    { Id, Version, Sha256, ExitCode }
     skipped entries:      { Id, Version, Sha256, Reason='state-match' }
-        (P2 incremental: state record EXACTLY matches the work copy manifest,
-        so winget is never invoked for the package - see README 5.8 for the
-        manual-uninstall trade-off)
+        (P2 incremental: state record EXACTLY matches the work copy manifest
+        and winget list confirms that the package is still installed)
     failed entries:       { Id, ExitCode, Output } and, when a scope fallback
         was attempted, optional { ScopeAttempts = [ {Scope,ExitCode}, ... ] }
         (always retains the machine and user attempts with their exit codes)
@@ -249,6 +248,93 @@ function Invoke-OSyncWingetInstall {
         TimedOut = $timedOut
         Output   = ($outText + $errText)
     }
+}
+
+<#
+.SYNOPSIS
+    Checks winget's local installed-package view before trusting a state match.
+
+.DESCRIPTION
+    A non-zero exit, timeout, or output without the exact package ID cannot
+    prove installation and returns false so the caller falls back to install.
+#>
+function Test-OSyncWingetPackageInstalled {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WingetExe,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PackageId
+    )
+
+    $result = Invoke-OSyncWingetInstall -WingetExe $WingetExe -Arguments @(
+        'list', '--id', $PackageId, '--exact',
+        '--accept-source-agreements', '--disable-interactivity'
+    ) -TimeoutMs 30000
+    if ($result.TimedOut -or $result.ExitCode -ne 0) { return $false }
+
+    $idPattern = '(?im)^[^\r\n]*(?<![A-Za-z0-9])' + [regex]::Escape($PackageId) + '(?![A-Za-z0-9])[^\r\n]*$'
+    return [bool]([string]$result.Output -match $idPattern)
+}
+
+function Get-OSyncWingetMissingStatePackages {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$WorkDir,
+
+        [Parameter(Mandatory = $true)]
+        $Config,
+
+        [Parameter(Mandatory = $false)]
+        [string]$WingetExePath
+    )
+
+    $state = Get-OSyncState -Category 'winget' -Config $Config
+    $records = $state['winget']
+    if ($null -eq $records -or $records -isnot [System.Collections.IDictionary] -or $records.Count -eq 0) { return @() }
+
+    $packagesTxt = Join-Path $WorkDir 'winget\packages.txt'
+    if (-not (Test-Path -LiteralPath $packagesTxt -PathType Leaf)) {
+        throw "Get-OSyncWingetMissingStatePackages: packages.txt not found: $packagesTxt"
+    }
+
+    $entries = @(Read-OSyncWingetList -Path $packagesTxt)
+    $runtimeTxt = Join-Path $WorkDir 'runtime\runtime-winget.txt'
+    if (Test-Path -LiteralPath $runtimeTxt -PathType Leaf) {
+        $runtimeIds = @(Read-OSyncWingetList -Path $runtimeTxt | ForEach-Object { $_.Id.ToLowerInvariant() })
+        $entries = @($entries | Where-Object { $runtimeIds -notcontains $_.Id.ToLowerInvariant() })
+    }
+
+    $recordedEntries = @()
+    foreach ($entry in $entries) {
+        foreach ($key in $records.Keys) {
+            if ([string]::Equals([string]$key, $entry.Id, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $recordedEntries += $entry
+                break
+            }
+        }
+    }
+    if ($recordedEntries.Count -eq 0) { return @() }
+
+    $wingetExe = $WingetExePath
+    if ([string]::IsNullOrWhiteSpace($wingetExe)) {
+        $wingetExe = Resolve-OSyncWingetExePath
+    }
+    if ([string]::IsNullOrWhiteSpace($wingetExe)) {
+        return @($recordedEntries | ForEach-Object { $_.Id })
+    }
+
+    $missing = @()
+    foreach ($entry in $recordedEntries) {
+        if (-not (Test-OSyncWingetPackageInstalled -WingetExe $wingetExe -PackageId $entry.Id)) {
+            $missing += $entry.Id
+        }
+    }
+    return $missing
 }
 
 <#
@@ -717,18 +803,10 @@ function Invoke-OSyncWingetApply {
         }
     }
 
-    # INCREMENTAL (P2): skip a package when its state record EXACTLY matches
-    # the work copy manifest (PackageVersion + first InstallerSha256, both
-    # from Get-OSyncWingetManifestInfo - the same values Add-OSyncStateRecord
-    # persists). The record is written ONLY after a real successful/satisfied
-    # install, so a match proves "B already runs precisely this payload" and
-    # winget would only echo a satisfied exit code. A null/absent field on
-    # either side cannot prove the match and falls through to a real install.
-    #
-    # Trade-off (documented in README 5.8): a package MANUALLY uninstalled on
-    # B is not reinstalled while its state record still matches - winget is
-    # never invoked for it. Remediation: delete the winget/<Id> record from
-    # system-state.json (or bump the pinned version) and re-run apply.
+    # INCREMENTAL (P2): skip a package only when its state record EXACTLY
+    # matches the work copy manifest AND winget still reports it installed.
+    # A null/absent field, a failed presence query, or a missing package all
+    # fall through to a real install.
     $applyState = Get-OSyncState -Category 'winget' -Config $Config
     $wingetRecords = $applyState['winget']
     if ($null -eq $wingetRecords -or $wingetRecords -isnot [System.Collections.IDictionary]) {
@@ -763,16 +841,22 @@ function Invoke-OSyncWingetApply {
                    ([string]::Equals([string]$record['version'], [string]$info.PackageVersion, [System.StringComparison]::OrdinalIgnoreCase)) -and
                    ([string]::Equals(([string]$record['sha256']).ToLowerInvariant(), [string]$info.InstallerSha256, [System.StringComparison]::Ordinal))
         if ($isMatch) {
-            $skipped += [pscustomobject]@{
-                Id      = $entry.Id
-                Version = $info.PackageVersion
-                Sha256  = $info.InstallerSha256
-                Reason  = 'state-match'
+            $installed = Test-OSyncWingetPackageInstalled -WingetExe $wingetExe -PackageId $entry.Id
+            if ($installed) {
+                $skipped += [pscustomobject]@{
+                    Id      = $entry.Id
+                    Version = $info.PackageVersion
+                    Sha256  = $info.InstallerSha256
+                    Reason  = 'state-match'
+                }
+                Write-OSyncLog -Category 'winget' -Level 'Info' `
+                    -Message ("winget package {0}@{1} already applied and still installed (state match) - install skipped" -f $entry.Id, $info.PackageVersion) `
+                    -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256 } -Config $Config | Out-Null
+                continue
             }
-            Write-OSyncLog -Category 'winget' -Level 'Info' `
-                -Message ("winget package {0}@{1} already applied (state match) - install skipped" -f $entry.Id, $info.PackageVersion) `
+            Write-OSyncLog -Category 'winget' -Level 'Warning' `
+                -Message ("winget package {0}@{1} has a matching state record but is not installed - reinstalling" -f $entry.Id, $info.PackageVersion) `
                 -Data @{ Id = $entry.Id; Version = $info.PackageVersion; Sha256 = $info.InstallerSha256 } -Config $Config | Out-Null
-            continue
         }
         $pendingInstall += $entry
     }

@@ -97,11 +97,11 @@ Describe 'Bootstrap: repository-integrity subset precondition' {
         $result.Categories['winget'].Status | Should -Be 'OK'
     }
 
-    It 'throws when a required category is Incomplete' {
+    It 'throws when a required category manifest is Missing' {
         $repo = Join-Path $TestDrive 'repo-bad'
         & $script:NewRepo $repo @('runtime', 'winget')
-        # Corrupt a manifest-listed file AFTER publishing -> winget Incomplete.
-        [System.IO.File]::WriteAllText((Join-Path $repo 'winget\packages.txt'), "tampered`r`n")
+        # Corrupt files.json AFTER publishing -> winget Missing.
+        [System.IO.File]::WriteAllText((Join-Path $repo 'winget\files.json'), "tampered`r`n")
         $cfg = & $script:NewConfig (Join-Path $TestDrive 's2')
 
         $err = $null
@@ -1299,8 +1299,8 @@ Describe 'Bootstrap: step 7 + orchestration invariants' {
     It 'orchestration: corrupt repository aborts before any step, bootstrapped=false' {
         $repo = Join-Path $TestDrive 'repo-corrupt'
         & $script:NewRepo $repo
-        # Tamper a manifest-listed file -> winget category Incomplete.
-        [System.IO.File]::WriteAllText((Join-Path $repo 'winget\packages.txt'), "tampered`r`n")
+        # Tamper the signed-by-index manifest -> winget category Missing.
+        [System.IO.File]::WriteAllText((Join-Path $repo 'winget\files.json'), "tampered`r`n")
         $stateDir = Join-Path $TestDrive 'oc-state'
         $cfg = & $script:NewConfig $stateDir
         $cfg.repoRoot = $repo
@@ -1313,6 +1313,26 @@ Describe 'Bootstrap: step 7 + orchestration invariants' {
         $result.Success | Should -Be $false
         $result.Bootstrapped | Should -Be $false
         $result.Error | Should -BeLike '*winget*'
+        $stepCalled | Should -Be $false
+    }
+
+    It 'orchestration: payload corruption fails local work-copy verification before any step' {
+        $repo = Join-Path $TestDrive 'repo-payload-corrupt'
+        & $script:NewRepo $repo
+        [System.IO.File]::WriteAllText((Join-Path $repo 'winget\packages.txt'), "tampered`r`n")
+        $stateDir = Join-Path $TestDrive 'oc-payload-state'
+        $cfg = & $script:NewConfig $stateDir
+        $cfg.repoRoot = $repo
+        $cfg.categories.npm = $false
+        & $script:MockAllSteps
+        $stepCalled = $false
+        Mock Invoke-OSyncBootstrapStepVcRuntime { $stepCalled = $true }
+
+        $result = Invoke-OSyncBootstrap -Config $cfg -VerdaccioTaskName 'PakageSync-Verdaccio-QA'
+
+        $result.Success | Should -Be $false
+        $result.Bootstrapped | Should -Be $false
+        $result.Error | Should -BeLike '*work copy re-verification FAILED*'
         $stepCalled | Should -Be $false
     }
 

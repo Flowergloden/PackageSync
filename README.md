@@ -35,8 +35,8 @@
 
 核心不变量：
 
-- 仓库由 `index.json`（信任根）+ 每类别 `files.json`（SHA256 完整性清单）+ 实际载荷构成；校验顺序严格为 index → 各类 files.json 哈希 → 逐文件哈希。
-- B 端 apply 一律「先校验 → 复制到本地工作副本 → 再校验 → 才安装」，**绝不直接从同步目录安装**（防 SMB 镜像中途改写/删除）。
+- 仓库由 `index.json`（信任根）+ 每类别 `files.json`（SHA256 完整性清单）+ 实际载荷构成；A 端 staging 发布前按 index → 各类 files.json 哈希 → 逐文件哈希完整校验。
+- B 端在 SMB 仓库侧只校验 index 与各类 files.json 的预计算 SHA256，不读取清单所列载荷；apply/bootstrap 一律「清单校验 → 复制到本地工作副本 → 本地逐文件 bytes/SHA256 复核 → 才安装」，**绝不直接从同步目录安装**（防 SMB 镜像中途改写/删除）。
 - 工具本体随仓库自举进 `runtime\tool\`，B 端 bootstrap 落位固定本地路径 `C:\PakageSync\`，计划任务与手动命令一律从该本地副本执行。
 - B 端不做任何 A↔B 回传：状态与日志只留在 B。
 - 单类失败不阻断其他类别，也不误标已应用（`state.json` 按类别单调记录 `lastApplied`）。
@@ -250,7 +250,7 @@ pip 清单（4.2）之外的**私有 wheel 通道**：把运维人员预先备�
 ### 5.2 手动运行：-WhatIf 与 -Category
 
 ```powershell
-# 预演：零变更——只读 index+state，输出每类"将安装/更新"差异报告；不起服务、不复制、不改任何文件
+# 预演：零变更——只读 index/state 并查询 winget 实际安装状态，输出每类"将安装/更新"差异报告；不起服务、不复制、不改任何文件
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\PakageSync\src\Invoke-OfflineApply.ps1 -WhatIf
 
 # 只跑某类（-Category 取值：winget,pip,npm,dotfiles，逗号分隔）
@@ -308,7 +308,7 @@ chezmoi、bun 与 VC_redist（App Installer 链不再导出/安装，见 3.2）�
 
 ### 5.8 winget 增量同步（跳过未变包）
 
-winget 类别在两端各有一层增量跳过，实际导出、复制与安装仍遵循完整信任根链（index.json → files.json → 逐文件 SHA256）。此外，B 端非 WhatIf 轮次若确认当前 `index.json` 同代已全部应用且已完成 bootstrap，会因不消费任何仓库载荷而直接 NO-OP，不再重复全仓逐文件哈希；packages 轮次还要求无 runtime 漂移。新代、状态不确定或需要 runtime 自愈时仍执行完整校验。
+winget 类别在两端各有一层增量跳过，实际导出、复制与安装仍遵循完整信任根链。B 端仓库侧只读取 `index.json` 与 `files.json` 的预计算 SHA256，即使新代需要处理也不会为完整性预检逐个读取远端载荷；载荷只在复制到本地工作副本后逐文件复核。此外，B 端非 WhatIf 轮次若确认当前 `index.json` 同代已全部应用且已完成 bootstrap，会直接 NO-OP，连清单检查也跳过；packages 轮次还要求无 runtime 漂移。
 
 **A 端导出（P1，复用先前成功代）**：钉版条目 `Id@version` 满足以下全部条件时，优先从本地最新成功代的 `winget\<Id>\` 复制载荷进 staging，本地代缺失/损坏或包不可复用时才检查共享 `repoRoot`，**不调用 `winget download`**（导出报告 `reused` 数组记录）：
 
@@ -326,9 +326,9 @@ winget delta 仅从现在 repo 复制新增/变化文件及当前 `files.json`�
 
 **校验与保留策略不变的安全边界**：新 work 写入 `.verified` 前仍逐文件执行全量 bytes/SHA256 复核；任一变化文件损坏会删除新代且不推进该类 `lastApplied`。清理除保留最新两代外，还保护 system/user state 中各类 `lastApplied` 引用的已验证基线。首次 bootstrap 与 runtime 漂移 self-heal 的独立工作副本仍走原有全量路径，不在本轮 delta 优化范围内。
 
-**B 端包级安装跳过（P2，state 匹配）**：安装循环前，比较工作副本 YAML 的 `PackageVersion` + 首个 `InstallerSha256` 与 `system-state.json` 的 `winget[<Id>]` 记录；两者**完全一致**则跳过该包的 `winget install`（记入 apply 报告 `skipped` 数组；全部命中时连本地 HTTP 服务都不启动）。state 记录只在真实安装成功/已满足后写入，因此匹配即证明「B 正运行 exactly 这份载荷」。
+**B 端包级安装跳过（P2，state + 实际安装状态匹配）**：安装循环前，比较工作副本 YAML 的 `PackageVersion` + 首个 `InstallerSha256` 与 `system-state.json` 的 `winget[<Id>]` 记录；两者一致时再执行 `winget list --id <Id> --exact` 核实包仍已安装，确认后才跳过 `winget install`（记入 apply 报告 `skipped` 数组；全部命中时连本地 HTTP 服务都不启动）。类别级同代/内容等价跳过也会先检查已记录包的实际安装状态。
 
-> **取舍须知**：B 上**手动卸载**的包在其 state 记录仍匹配时不会自动重装（winget 根本不会被调用）。恢复方法：删除 `C:\ProgramData\PakageSync\state\system-state.json` 中对应的 `winget.<Id>` 记录（或升级钉版版本）后重跑 apply。
+B 上**手动卸载**后，state 记录无需手工清理：下一次 apply 会发现包已不存在并重装；presence 查询失败或超时同样回退为安装，不会仅凭旧 state 记录跳过。
 
 ## 六、已知限制
 

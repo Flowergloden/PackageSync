@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   RepoContract.Tests.ps1 - Pester 5 tests for src\lib\RepoContract.ps1.
 
@@ -324,6 +324,20 @@ Describe 'Test-OSyncRepoIntegrity' {
         $r.Categories.big.Status | Should -Be 'Incomplete'
         $r.Categories.big.MissingFiles.Count | Should -Be $entryCount
         $r.Categories.big.CorruptFiles.Count | Should -Be 0
+    }
+
+    It 'manifest-only uses precomputed hashes without inspecting payload files' {
+        $repo = New-RcFullRepo -Root (New-RcTestDir)
+        Remove-Item -LiteralPath (Join-Path $repo 'winget\installer.exe') -Force
+        [System.IO.File]::WriteAllText((Join-Path $repo 'pip\six-1.17.0.whl'), 'corrupt')
+
+        $r = Test-OSyncRepoIntegrity -RepoRoot $repo -ManifestOnly
+
+        $r.Overall | Should -Be 'OK'
+        $r.Categories.winget.Status | Should -Be 'OK'
+        $r.Categories.pip.Status | Should -Be 'OK'
+        $r.Categories.winget.MissingFiles.Count | Should -Be 0
+        $r.Categories.pip.CorruptFiles.Count | Should -Be 0
     }
 
     It 'writes stage timings and per-category progress when Config is supplied' {

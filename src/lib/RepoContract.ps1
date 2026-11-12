@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   RepoContract.ps1 - the repository trust root (files.json / index.json).
 
@@ -36,7 +36,9 @@
                             2. per category: files.json exists AND its sha256
                                matches the index record
                             3. files.json parses as JSON
-                            4. per file listed in files.json: sha256 recheck
+                            4. by default, per file listed in files.json: sha256 recheck;
+                               -ManifestOnly stops after step 3 and reads no payload
+                               metadata or content (B-side SMB precheck).
                             Returns a result object with per-category status
                             'OK' | 'Incomplete' | 'Missing' plus the lists of
                             missing / corrupt files.
@@ -254,15 +256,18 @@ function Test-OSyncRepoIntegrity {
         Validates a repository against its index.json trust root.
         Returns a result object (not a bool): Overall + per-category status
         'OK' | 'Incomplete' | 'Missing' with missing/corrupt file lists.
-        When Config is supplied, writes stage timings and periodic progress
-        to the apply log.
+        -ManifestOnly validates only index.json/files.json; payload verification
+        is deferred to the caller's local work copy. When Config is supplied,
+        writes stage timings and periodic progress to the apply log.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string]$RepoRoot,
         [Parameter(Mandatory = $false)]
-        $Config
+        $Config,
+        [Parameter(Mandatory = $false)]
+        [switch]$ManifestOnly
     )
 
     $repoFull = [System.IO.Path]::GetFullPath($RepoRoot)
@@ -387,7 +392,12 @@ function Test-OSyncRepoIntegrity {
                     $anyNotOk = $true
                     continue
                 }
-                Write-RcIntegrityLog -Config $Config -Message ("category manifest validated (category='{0}', files={1}, elapsed={2}s); starting per-file hashes." -f $catName, $manifest.Count, [Math]::Round($catSw.Elapsed.TotalSeconds, 2)) -Data @{ category = $catName; files = $manifest.Count; elapsedSeconds = [Math]::Round($catSw.Elapsed.TotalSeconds, 2) }
+                if ($ManifestOnly) {
+                    Write-RcIntegrityLog -Config $Config -Message ("category manifest validated (category='{0}', files={1}, elapsed={2}s); payload hashes deferred to the local work copy." -f $catName, $manifest.Count, [Math]::Round($catSw.Elapsed.TotalSeconds, 2)) -Data @{ category = $catName; files = $manifest.Count; manifestOnly = $true; elapsedSeconds = [Math]::Round($catSw.Elapsed.TotalSeconds, 2) }
+                    $result.Categories[$catName] = $catResult
+                    continue
+                }
+                Write-RcIntegrityLog -Config $Config -Message ("category manifest validated (category='{0}', files={1}, elapsed={2}s); starting per-file hashes." -f $catName, $manifest.Count, [Math]::Round($catSw.Elapsed.TotalSeconds, 2)) -Data @{ category = $catName; files = $manifest.Count; manifestOnly = $false; elapsedSeconds = [Math]::Round($catSw.Elapsed.TotalSeconds, 2) }
 
                 # 4) per-file recheck. Paths in files.json are relative to the
                 #    directory CONTAINING files.json (i.e. the category dir).

@@ -22,8 +22,9 @@
   (incl. omitting -Category) runs the PACKAGES/SYSTEM round. The two
   scheduled tasks pin their -Category accordingly (todo 17).
 
-  -WhatIf performs ZERO changes: the repository and state are only read, a
-  per-category "would install/update" report is produced, and no bootstrap /
+  -WhatIf performs ZERO changes: the repository and state are read, winget
+  installation presence is queried, a per-category "would install/update"
+  report is produced, and no bootstrap /
   work copy / apply / self-refresh / cleanup happens (the log directory is
   created as an operational artifact - same convention as the bootstrap).
 

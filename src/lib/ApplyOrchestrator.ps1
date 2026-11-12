@@ -24,12 +24,15 @@
       applies dotfiles from it, never bootstraps/refreshes/cleans.
 
   Round flow (packages mode):
-      [1] Trust root: Test-OSyncRepoIntegrity. Index invalid / unparseable ->
-          whole round skipped (Metis B2). exportedAtUtc is the generation id.
+      [1] Trust root: Test-OSyncRepoIntegrity -ManifestOnly validates index.json
+          and files.json without reading listed payloads over SMB. Index invalid /
+          unparseable -> whole round skipped (Metis B2). exportedAtUtc is the
+          generation id. Payload bytes/SHA256 are checked after the local copy.
           A non-WhatIf round whose current generation is already applied for
-          every enabled category, with bootstrap complete and no runtime drift,
-          skips per-file repository hashing because it consumes no repo payload.
-          Any uncertainty falls back to the full check.
+          every enabled category, with bootstrap complete, no runtime drift,
+          and every state-recorded winget package still installed, skips the
+          manifest check too because it consumes no repo payload. Any uncertainty
+          falls back to the manifest trust-root check.
       [2] Bootstrap self-heal: when state.bootstrapped != true (needs the
           runtime payload - chezmoi.exe/tools - Momus r4-M2) OR the runtime
           content hashes (runtimeWingetHash / runtimeFilesHash) drifted vs
@@ -70,8 +73,9 @@
       copy). When the round built no generation (nothing pending), refresh
       is skipped - tool-only changes are covered by the bootstrap drift
       path (runtime\files.json includes runtime\tool\).
-      -WhatIf (Metis m3): read-only index + state; per-category "would
-      install/update" report; no services, no copies, no file changes, no
+      -WhatIf (Metis m3): read-only index + state plus winget installation
+      presence queries; per-category "would install/update" report; no
+      services, no copies, no file changes, no
       self-refresh, no cleanup. The log dir is created as an operational
       artifact (same convention as the bootstrap, todo-12 learning).
 
@@ -261,9 +265,18 @@ function Get-OSyncApplyCategoryPlan {
     $state = Get-OSyncState -Category $Category -Config $Config
     $last = $state.lastApplied[$Category]
     if (-not (Test-OSyncCategoryNewer -Category $Category -ExportedAtUtc $ExportedAtUtc -Config $Config)) {
+        $plan.baseExportedAtUtc = $last
+        if ($Category -eq 'winget') {
+            $baseDir = Join-Path (Join-Path ([string]$Config.stateDir) 'work') ([string]$last)
+            $missing = @(Get-OSyncWingetMissingStatePackages -WorkDir $baseDir -Config $Config)
+            if ($missing.Count -gt 0) {
+                $plan.baseDir = $baseDir
+                $plan.fallbackReason = 'recorded package(s) not installed: ' + ($missing -join ', ')
+                return $plan
+            }
+        }
         $plan.mode = 'skip'
         $plan.fallbackReason = 'already applied'
-        $plan.baseExportedAtUtc = $last
         return $plan
     }
     if ($null -eq $last -or [string]::IsNullOrWhiteSpace([string]$last)) {
@@ -316,6 +329,13 @@ function Get-OSyncApplyCategoryPlan {
         return $plan
     }
     if ((Get-OSyncFileSha256 -Path $baselineFiles) -eq [string]$currentRecord.ExpectedSha256) {
+        if ($Category -eq 'winget') {
+            $missing = @(Get-OSyncWingetMissingStatePackages -WorkDir $baseDir -Config $Config)
+            if ($missing.Count -gt 0) {
+                $plan.fallbackReason = 'recorded package(s) not installed despite content-equivalent baseline: ' + ($missing -join ', ')
+                return $plan
+            }
+        }
         $plan.mode = 'skip'
         $plan.fallbackReason = 'content equivalent to the verified baseline'
         return $plan
@@ -791,6 +811,11 @@ function Get-OApplyAlreadyAppliedGeneration {
         foreach ($cat in $categories) {
             if (Test-OSyncCategoryNewer -Category $cat -ExportedAtUtc $exportedAtUtc -Config $Config) { return $null }
         }
+        if ($Mode -eq 'packages' -and $categories -contains 'winget') {
+            $baseline = Join-Path (Join-Path ([string]$Config.stateDir) 'work') $exportedAtUtc
+            $missing = @(Get-OSyncWingetMissingStatePackages -WorkDir $baseline -Config $Config)
+            if ($missing.Count -gt 0) { return $null }
+        }
         return $exportedAtUtc
     }
     catch {
@@ -920,7 +945,7 @@ function Invoke-OSyncApply {
     # skipped - nothing downstream is trusted.
     $integrity = $null
     try {
-        $integrity = Test-OSyncRepoIntegrity -RepoRoot $repoRoot -Config $Config
+        $integrity = Test-OSyncRepoIntegrity -RepoRoot $repoRoot -Config $Config -ManifestOnly
     }
     catch {
         $result.outcome = 'skipped'

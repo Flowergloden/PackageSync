@@ -604,11 +604,14 @@ Describe 'WingetApply: state-match skip (P2 incremental)' {
         Mock Start-OSyncHttpServer { return [pscustomobject]@{ IsStopped = $false } }
         Mock Stop-OSyncHttpServer { }
         Mock Invoke-OSyncWingetInstall {
+            if ($Arguments[0] -eq 'list') {
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = '7-Zip 26.02 (x64) 7zip.7zip 26.02' }
+            }
             return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = 'mocked' }
         }
     }
 
-    It 'skips install when the state record matches version+sha256 exactly (no winget call, no HTTP server)' {
+    It 'skips install when the state record matches and winget still reports the package installed' {
         $work = Join-Path $TestDrive 'work-skip'
         & $script:NewWorkCopy $work
         $stateDir = Join-Path $TestDrive 'state-skip'
@@ -623,8 +626,31 @@ Describe 'WingetApply: state-match skip (P2 incremental)' {
         $report.ok.Count | Should -Be 0
         $report.satisfied.Count | Should -Be 0
         $report.failed.Count | Should -Be 0
-        Should -Invoke Invoke-OSyncWingetInstall -Times 0 -Scope It
+        Should -Invoke Invoke-OSyncWingetInstall -Times 0 -Scope It -ParameterFilter { $Arguments[0] -eq 'install' }
+        Should -Invoke Invoke-OSyncWingetInstall -Times 1 -Scope It -ParameterFilter { $Arguments[0] -eq 'list' }
         Should -Invoke Start-OSyncHttpServer -Times 0 -Scope It
+    }
+
+    It 'reinstalls when the state record matches but winget reports the package uninstalled' {
+        $work = Join-Path $TestDrive 'work-uninstalled'
+        & $script:NewWorkCopy $work
+        $stateDir = Join-Path $TestDrive 'state-uninstalled'
+        Add-OSyncStateRecord -Category winget -Name '7zip.7zip' -Version '26.02' -Sha256 $script:goldenSha -StateDir $stateDir | Out-Null
+        Mock Invoke-OSyncWingetInstall {
+            if ($Arguments[0] -eq 'list') {
+                return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = 'No installed package found matching input criteria.' }
+            }
+            return [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = 'reinstalled' }
+        }
+
+        $report = Invoke-OSyncWingetApply -WorkDir $work -Config (& $script:NewConfig $stateDir)
+
+        $report.skipped.Count | Should -Be 0
+        $report.ok.Count | Should -Be 1
+        $report.ok[0].Id | Should -Be '7zip.7zip'
+        Should -Invoke Invoke-OSyncWingetInstall -Times 1 -Scope It -ParameterFilter { $Arguments[0] -eq 'list' }
+        Should -Invoke Invoke-OSyncWingetInstall -Times 1 -Scope It -ParameterFilter { $Arguments[0] -eq 'install' }
+        Should -Invoke Start-OSyncHttpServer -Times 1 -Scope It
     }
 
     It 'installs normally when the recorded sha256 differs' {

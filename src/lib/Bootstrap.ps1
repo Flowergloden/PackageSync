@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   Bootstrap.ps1 - B-side runtime bootstrap (Install-OfflineBootstrap).
   Windows PowerShell 5.1 compatible: no PS7-only syntax.
@@ -12,9 +12,10 @@
       Momus r7-m3).
 
   Precondition:
-      <repoRoot> must pass Test-OSyncRepoIntegrity for the runtime category
-      AND for every enabled winget/npm category (a disabled category skips
-      its requirement - Momus r4-m7). The required categories are then
+      <repoRoot> must pass Test-OSyncRepoIntegrity -ManifestOnly for the runtime
+      category AND for every enabled winget/npm category (a disabled category
+      skips its requirement - Momus r4-m7); no listed payload is read from SMB.
+      The required categories are then
       robocopied into <stateDir>\work\bootstrap\<exportedAtUtc>\ and EVERY
       file hash is RE-VERIFIED against the copied files.json (same work-copy
       semantics as the apply path, Momus M3 / Oracle M4). All subsequent
@@ -438,7 +439,7 @@ function Test-OSyncBootstrapRepoCategories {
         [Parameter(Mandatory = $true)]$Config,
         [Parameter(Mandatory = $true)][string]$RepoRoot
     )
-    $integrity = Test-OSyncRepoIntegrity -RepoRoot $RepoRoot
+    $integrity = Test-OSyncRepoIntegrity -RepoRoot $RepoRoot -ManifestOnly
     if ($integrity.Overall -eq 'Invalid') {
         throw "Install-OfflineBootstrap: repository trust root is INVALID: $($integrity.IndexError)"
     }

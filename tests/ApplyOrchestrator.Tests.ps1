@@ -219,6 +219,55 @@ Describe 'ApplyOrchestrator: packages round - work copy + apply' {
         $gens.Count | Should -Be 1
     }
 
+    It 'reapplies winget in the same repository generation when a recorded package was uninstalled' {
+        $repo = Join-Path $TestDrive 'r2-uninstalled'
+        $ts = & $script:NewRepo $repo
+        $stateDir = Join-Path $TestDrive 's2-uninstalled'
+        $cfg = & $script:NewConfig $stateDir @{ repoRoot = $repo }
+        & $script:SeedBootstrapped $cfg $repo
+        $null = Invoke-OSyncApply -Config $cfg -Category @('winget', 'pip', 'npm')
+        $null = Invoke-OSyncApply -Config $cfg -Category @('dotfiles')
+        Add-OSyncStateRecord -Category winget -Name '7zip.7zip' -Version '26.02' `
+            -Sha256 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -Config $cfg | Out-Null
+        Mock Resolve-OSyncWingetExePath { 'C:\fake\winget.exe' }
+        Mock Test-OSyncWingetPackageInstalled { $false }
+        $script:ApplyCalls = @()
+
+        $result = Invoke-OSyncApply -Config $cfg -Category @('winget')
+
+        $result.outcome | Should -Be 'ok'
+        $result.pendingCategories | Should -Be @('winget')
+        $result.generation | Should -Be (Join-Path $stateDir ("work\{0}" -f $ts))
+        $script:ApplyCalls | Should -Contain "winget:$($result.generation)"
+        $result.copyPlans.winget.mode | Should -Be 'full'
+        $result.copyPlans.winget.fallbackReason | Should -BeLike '*not installed*'
+    }
+
+    It 'reapplies winget when a new index generation has equivalent content but a recorded package was uninstalled' {
+        $repo = Join-Path $TestDrive 'r2-equivalent-uninstalled'
+        & $script:NewRepo $repo
+        $stateDir = Join-Path $TestDrive 's2-equivalent-uninstalled'
+        $cfg = & $script:NewConfig $stateDir @{ repoRoot = $repo }
+        & $script:SeedBootstrapped $cfg $repo
+        $null = Invoke-OSyncApply -Config $cfg -Category @('winget', 'pip', 'npm')
+        $null = Invoke-OSyncApply -Config $cfg -Category @('dotfiles')
+        Add-OSyncStateRecord -Category winget -Name '7zip.7zip' -Version '26.02' `
+            -Sha256 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -Config $cfg | Out-Null
+        Start-Sleep -Milliseconds 1100
+        $null = Publish-OSyncIndex -StagingDir $repo
+        Mock Resolve-OSyncWingetExePath { 'C:\fake\winget.exe' }
+        Mock Test-OSyncWingetPackageInstalled { $false }
+        $script:ApplyCalls = @()
+
+        $result = Invoke-OSyncApply -Config $cfg -Category @('winget')
+
+        $result.outcome | Should -Be 'ok'
+        $result.pendingCategories | Should -Be @('winget')
+        $script:ApplyCalls | Should -Contain "winget:$($result.generation)"
+        $result.copyPlans.winget.mode | Should -Be 'full'
+        $result.copyPlans.winget.fallbackReason | Should -BeLike '*not installed*content-equivalent*'
+    }
+
     It 'judges ALL enabled categories when building the work copy (narrow -Category)' {
         $repo = Join-Path $TestDrive 'r3'
         $ts = & $script:NewRepo $repo
@@ -265,8 +314,8 @@ Describe 'ApplyOrchestrator: packages round - work copy + apply' {
     It 'skips the whole round when the runtime category is not OK' {
         $repo = Join-Path $TestDrive 'r5'
         $null = & $script:NewRepo $repo
-        # Corrupt a runtime file AFTER publishing -> runtime Incomplete.
-        [System.IO.File]::WriteAllText((Join-Path $repo 'runtime\runtime-winget.txt'), "tampered`r`n")
+        # Remove the runtime trust manifest AFTER publishing -> runtime Missing.
+        Remove-Item -LiteralPath (Join-Path $repo 'runtime\files.json') -Force
         $stateDir = Join-Path $TestDrive 's5'
         $cfg = & $script:NewConfig $stateDir @{ repoRoot = $repo }
         & $script:SeedBootstrapped $cfg $repo
